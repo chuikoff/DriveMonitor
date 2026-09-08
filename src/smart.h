@@ -109,21 +109,21 @@ typedef enum _USB_BRIDGE_TYPE {
  * ============================================================ */
 typedef enum _DRIVE_HEALTH_STATUS {
     HEALTH_STATUS_UNKNOWN  = 0,
-    HEALTH_STATUS_GOOD     = 1,   /* All attributes within thresholds */
-    HEALTH_STATUS_CAUTION  = 2,   /* One or more attributes near threshold or raw > 0 for critical */
-    HEALTH_STATUS_BAD      = 3,   /* Attribute at or below threshold, or NVMe critical warning */
-    HEALTH_STATUS_WARNING  = 4,   /* SMART predictive failure — displays as ПЛОХО */
-    HEALTH_STATUS_OBSERVE  = 5,   /* Watch: risk factors, no confirmed media damage */
-    HEALTH_STATUS_CRITICAL = 6    /* Self-test failed / rapid deterioration */
+    HEALTH_STATUS_GOOD     = 1,   /* No prefail-now, no media RAW, no self-test fail */
+    HEALTH_STATUS_CAUTION  = 2,   /* Media RAW > 0 (05/197/198/187) */
+    HEALTH_STATUS_BAD      = 3,   /* Prefail Value<=thresh now, or serious media RAW */
+    HEALTH_STATUS_WARNING  = 4,   /* SMART RETURN STATUS fail — displays as ПЛОХО */
+    HEALTH_STATUS_OBSERVE  = 5,   /* Prefail In the past, or old-age at threshold */
+    HEALTH_STATUS_CRITICAL = 6    /* Self-test failed */
 } DRIVE_HEALTH_STATUS;
 
-/* SSD-focused temperature bands (ATA + NVMe current composite temp). */
+/* Temperature bands. ATA: 50/60/70 °C. NVMe: Identify WCTEMP/CCTEMP. */
 typedef enum _TEMP_BAND {
     TEMP_BAND_UNKNOWN  = 0,
-    TEMP_BAND_NORMAL   = 1,   /* 1-49 C: not a failure */
-    TEMP_BAND_ELEVATED = 2,   /* 50-59 C: show band, do not flip overall */
-    TEMP_BAND_HIGH     = 3,   /* 60-69 C: overall CAUTION via existing rule */
-    TEMP_BAND_CRITICAL = 4    /* >= 70 C */
+    TEMP_BAND_NORMAL   = 1,
+    TEMP_BAND_ELEVATED = 2,   /* approaching warning */
+    TEMP_BAND_HIGH     = 3,   /* at/above warning (WCTEMP or ~60 °C) */
+    TEMP_BAND_CRITICAL = 4    /* at/above critical (CCTEMP or ~70 °C) */
 } TEMP_BAND;
 
 /* How useful normalized SMART Value/Worst/Threshold numbers are. */
@@ -469,7 +469,10 @@ typedef struct _DRIVE_INFO {
     int         nUncorrectable;       /* attr C6 RAW, -1 if absent */
     int         nRemapEvents;         /* attr C4 RAW, -1 if absent */
     int         nCrcErrors;           /* attr C7 RAW, -1 if absent */
-    BOOL        bThresholdViolation;  /* any attr with thresh>0 and value<=thresh */
+    BOOL        bThresholdViolation;  /* prefail Value<=thresh now (ATA-3); same as bPrefailNow */
+    BOOL        bPrefailNow;          /* prefail current <= thresh, thresh != 0 */
+    BOOL        bPrefailPast;         /* prefail worst <= thresh, current still above */
+    BOOL        bUsageFailed;         /* old-age current <= thresh, thresh != 0 */
     char        szEvidence[384];      /* one-line Russian evidence for UI */
     DRIVE_VENDOR     eVendor;            /* Drive brand from model string */
     DRIVE_CONTROLLER eController;        /* SSD ASIC / HDD MCU */
@@ -589,6 +592,9 @@ void        IdentifyDriveParts(DRIVE_INFO* pInfo);
 
 BOOL  OpenDrive(int nDrive, HANDLE* phDrive);
 BOOL  OpenDriveReadOnly(int nDrive, HANDLE* phDrive);
+/* Flush mounted volumes and CM_Request_Device_Eject the USB parent.
+ * nDrive is PhysicalDriveN. On failure writes a Russian message to szErr. */
+BOOL  SafeEjectPhysicalDrive(int nDrive, char* szErr, int nErrLen);
 BYTE  GetStorageBusType(HANDLE hDrive);
 BOOL  IsUSBDrive(HANDLE hDrive);
 BOOL  IsNVMeDrive(HANDLE hDrive);
@@ -644,6 +650,8 @@ void  FormatHealthLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
 void  FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen);
 void  FormatHddObservePrompt(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen);
 const char* GetTempBandName(TEMP_BAND eBand, BOOL bLowercase);
+/* Identify WCTEMP/CCTEMP (Kelvin) → °C, or -1 if the drive omitted the field. */
+int NvmeIdentifyTempC(USHORT kelvin);
 void  FormatPowerOnHours(DWORD dwHours, char* szBuf, int nBufLen);
 BOOL  DriveTreatsC0AsPowerLoss(const DRIVE_INFO* pInfo);
 BOOL  IsShockSensorAttr(BYTE bID);

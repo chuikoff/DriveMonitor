@@ -504,6 +504,8 @@ static void DoSaveDriveReport(HWND hWnd)
     GetLocalTime(&st);
 
     ReportCat(buf, kCap, &len, "DriveMonitor — отчёт по диску\r\n");
+    safe_snprintf(szLine, "Версия: %s\r\n", DRIVEMONITOR_VERSION);
+    ReportCat(buf, kCap, &len, szLine);
     safe_snprintf(szLine, "Дата: %04d-%02d-%02d %02d:%02d:%02d\r\n\r\n",
                   (int)st.wYear, (int)st.wMonth, (int)st.wDay,
                   (int)st.wHour, (int)st.wMinute, (int)st.wSecond);
@@ -700,6 +702,60 @@ static void DoSaveDriveReport(HWND hWnd)
         safe_snprintf(szMsg, "Отчёт сохранён\n\n%s", szPathU8);
         MessageBoxU8(hWnd, szMsg, "DriveMonitor", MB_OK | MB_ICONINFORMATION);
     }
+}
+
+static void SetActionButtonsEnabled(HWND hWnd, BOOL on)
+{
+    HWND hReread = GetDlgItem(hWnd, IDC_REREAD_BTN);
+    HWND hReport = GetDlgItem(hWnd, IDC_REPORT_BTN);
+    HWND hEject  = GetDlgItem(hWnd, IDC_EJECT_BTN);
+    BOOL usb = FALSE;
+    if (on && g_nSelectedDrive >= 0 && g_nSelectedDrive < g_nDriveCount)
+        usb = g_Drives[g_nSelectedDrive].bIsUSB;
+    if (hReread) EnableWindow(hReread, on);
+    if (hReport) EnableWindow(hReport, on);
+    if (hEject)  EnableWindow(hEject, on && usb);
+}
+
+static void DoSafeEject(HWND hWnd)
+{
+    DRIVE_INFO* pInfo;
+    char szErr[320];
+    char szAsk[384];
+    const char* szModel;
+
+    if (g_nSelectedDrive < 0 || g_nSelectedDrive >= g_nDriveCount) {
+        MessageBoxU8(hWnd, "Нет выбранного диска.", "DriveMonitor",
+                     MB_OK | MB_ICONWARNING);
+        return;
+    }
+    pInfo = &g_Drives[g_nSelectedDrive];
+    if (!pInfo->bIsUSB) {
+        MessageBoxU8(hWnd,
+            "Извлечение доступно только для USB-дисков.\n"
+            "Внутренний SATA/NVMe так отключить нельзя.",
+            "DriveMonitor", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    szModel = pInfo->szModel[0] ? pInfo->szModel : "диск";
+    safe_snprintf(szAsk,
+        "Отключить «%s» и извлечь USB-устройство?\n\n"
+        "Закройте файлы на этом диске.",
+        szModel);
+    if (MessageBoxU8(hWnd, szAsk, "DriveMonitor",
+                     MB_OKCANCEL | MB_ICONQUESTION) != IDOK)
+        return;
+    szErr[0] = '\0';
+    if (!SafeEjectPhysicalDrive(pInfo->nDriveIndex, szErr, (int)sizeof(szErr))) {
+        MessageBoxU8(hWnd,
+            szErr[0] ? szErr :
+                "Не удалось извлечь диск. Закройте файлы и повторите.",
+            "DriveMonitor", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    MessageBoxU8(hWnd, "Диск отключён. Шнур можно вынуть.",
+                 "DriveMonitor", MB_OK | MB_ICONINFORMATION);
+    RefreshData(hWnd);
 }
 
 static void Snapshot_Save(void)
@@ -978,10 +1034,21 @@ LRESULT CALLBACK DriveBtnWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPa
                 COLORREF clrH = GetHealthStatusColor(pD->eHealthStatus);
 
                 COLORREF clrTemp;
-                if      (pD->nTemperatureC <= 0)  clrTemp = CLR_TEXT_DIM;
-                else if (pD->nTemperatureC < 50)  clrTemp = CLR_GREEN;
-                else if (pD->nTemperatureC < 60)  clrTemp = CLR_YELLOW;
-                else                              clrTemp = CLR_RED;
+                if (pD->nTemperatureC <= 0)
+                    clrTemp = CLR_TEXT_DIM;
+                else if (pD->eTempBand == TEMP_BAND_NORMAL)
+                    clrTemp = CLR_GREEN;
+                else if (pD->eTempBand == TEMP_BAND_ELEVATED)
+                    clrTemp = CLR_YELLOW;
+                else if (pD->eTempBand == TEMP_BAND_HIGH ||
+                         pD->eTempBand == TEMP_BAND_CRITICAL)
+                    clrTemp = CLR_RED;
+                else if (pD->nTemperatureC < 50)
+                    clrTemp = CLR_GREEN;
+                else if (pD->nTemperatureC < 60)
+                    clrTemp = CLR_YELLOW;
+                else
+                    clrTemp = CLR_RED;
 
                 HFONT hOldFont;
 
@@ -1171,6 +1238,7 @@ void UpdateDriveInfo(HWND hWnd, int nDriveIdx)
 
         SetDlgItemTextU8(hWnd, IDC_PREDICT_STATIC,     "");
         SetDlgItemTextU8(hWnd, IDC_AXIS_STATIC,        "");
+        SetActionButtonsEnabled(hWnd, TRUE);
         return;
     }
 
@@ -1373,6 +1441,7 @@ void UpdateDriveInfo(HWND hWnd, int nDriveIdx)
         SetDlgItemTextU8(hWnd, IDC_AXIS_STATIC, szAxis);
     }
 
+    SetActionButtonsEnabled(hWnd, TRUE);
     RepaintHealthBar();
 }
 
@@ -1946,8 +2015,13 @@ static const char* AtaRowStatus(const DRIVE_INFO* p, const SMART_ATTRIBUTE* a,
     int n = -1;
     DWORD raw;
 
-    if (bFailed)
-        return "СБОЙ";
+    if (bFailed) {
+        if (a->wStatusFlags & 0x0001)
+            return "СБОЙ";
+        return "Внимание";
+    }
+    if (bThresh > 0 && worst != 0 && worst != 255 && worst <= bThresh)
+        return "было";
 
     if (ssd && (id == 0xE7 || id == 0xA9)) {
         int nLeft = p->nEndurancePercent;
@@ -1978,12 +2052,8 @@ static const char* AtaRowStatus(const DRIVE_INFO* p, const SMART_ATTRIBUTE* a,
     if (id == 0xC3 && !ssd) {
         if (p->eVendor == VENDOR_SEAGATE) {
             if (SeagateRateErrs(a->bRawValue) > 0) return "Внимание";
-            if (bThresh > 0 && (val <= bThresh + 10 || worst <= bThresh + 20))
-                return "Внимание";
             return "ОК";
         }
-        if (val <= 10) return "ПЛОХО";
-        if (val < 70 || worst < 70) return "Внимание";
         return "ОК";
     }
 
@@ -1997,13 +2067,8 @@ static const char* AtaRowStatus(const DRIVE_INFO* p, const SMART_ATTRIBUTE* a,
     if (id == 0xC8 || id == 0x01 || id == 0x07) {
         if (p->eVendor == VENDOR_SEAGATE && (id == 0x01 || id == 0x07)) {
             if (SeagateRateErrs(a->bRawValue) > 0) return "Внимание";
-            if (bThresh > 0 && val <= bThresh + 10) return "Внимание";
-            if (bThresh > 0 && worst <= bThresh + 20) return "Внимание";
             return "ОК";
         }
-        if (val > 0 && val <= 1) return "СБОЙ";
-        if (val > 0 && val <= 10) return "Внимание";
-        if (val < 70 || worst < 70) return "Внимание";
         return "ОК";
     }
 
@@ -2024,8 +2089,8 @@ static const char* AtaRowStatus(const DRIVE_INFO* p, const SMART_ATTRIBUTE* a,
     if ((id == 0xC2 || id == 0xBE) && p->nTemperatureC > 70)
         return "Жарко";
 
-    /* High vendor thresholds (Seagate 10=97, 184=99) are not "near fail". */
-    if (bThresh > 0 && bThresh < 50 && val < bThresh + 10)
+    if ((a->wStatusFlags & 0x0001) && bThresh > 0 && bThresh < 50 &&
+        val > bThresh && val < bThresh + 10)
         return "Внимание";
     return "ОК";
 }
@@ -2087,6 +2152,8 @@ void UpdateAttrList(HWND hWnd, int nDriveIdx)
         unsigned __int64 qwErrLog      = NVMeRead128Lo(pLog->NumErrLogEntries);
         WORD wTempK = ReadLE16(pLog->CompositeTemperature);
         int  nTempC = (wTempK > 273) ? (int)wTempK - 273 : 0;
+        int  nWarnC = NvmeIdentifyTempC(pInfo->wNVMeWarnTempThreshold);
+        int  nCritC = NvmeIdentifyTempC(pInfo->wNVMeCritTempThreshold);
 
         #define NVME_ROW(id_, name_, val_, stat_) \
         { \
@@ -2102,8 +2169,21 @@ void UpdateAttrList(HWND hWnd, int nDriveIdx)
         else safe_snprintf(szCrit, "0x%02X (!)", pLog->CriticalWarning);
         NVME_ROW("01h","Критическое предупреждение",szCrit,(pLog->CriticalWarning?"ПЛОХО":"ОК"));
 
-        safe_snprintf(szVBuf,"%d C (%d K)",nTempC,(int)wTempK);
-        NVME_ROW("02h","Температура",szVBuf,(nTempC>70?"Жарко":"ОК"));
+        if (nWarnC > 0 && nCritC > 0)
+            safe_snprintf(szVBuf, "%d C (пред. %d, крит. %d)", nTempC, nWarnC, nCritC);
+        else if (nWarnC > 0)
+            safe_snprintf(szVBuf, "%d C (пред. %d)", nTempC, nWarnC);
+        else if (nCritC > 0)
+            safe_snprintf(szVBuf, "%d C (крит. %d)", nTempC, nCritC);
+        else
+            safe_snprintf(szVBuf, "%d C (%d K)", nTempC, (int)wTempK);
+        {
+            const char* szTstat = "ОК";
+            if (pInfo->eTempBand == TEMP_BAND_CRITICAL) szTstat = "Жарко";
+            else if (pInfo->eTempBand == TEMP_BAND_HIGH) szTstat = "Внимание";
+            else if (pInfo->eTempBand == TEMP_BAND_ELEVATED) szTstat = "Риск";
+            NVME_ROW("02h","Температура",szVBuf,szTstat);
+        }
 
         safe_snprintf(szSpare,"%d %%",(int)pLog->AvailableSpare);
         NVME_ROW("03h","Запас блоков",szSpare,
@@ -2170,8 +2250,14 @@ void UpdateAttrList(HWND hWnd, int nDriveIdx)
                     safe_snprintf(szId, "T%d", ts + 1);
                     safe_snprintf(szName, "Датчик температуры %d", ts + 1);
                     safe_snprintf(szVal, "%d C", pInfo->nTempSensor[ts]);
-                    NVME_ROW(szId, szName, szVal,
-                             (pInfo->nTempSensor[ts] > 70 ? "Жарко" : "ОК"));
+                    {
+                        const char* szSt = "ОК";
+                        int t = pInfo->nTempSensor[ts];
+                        if (nCritC > 0 && t >= nCritC) szSt = "Жарко";
+                        else if (nWarnC > 0 && t >= nWarnC) szSt = "Внимание";
+                        else if (nWarnC < 0 && nCritC < 0 && t > 70) szSt = "Жарко";
+                        NVME_ROW(szId, szName, szVal, szSt);
+                    }
                 }
             }
         }
@@ -2343,12 +2429,9 @@ static DWORD WINAPI RefreshThreadProc(LPVOID lpParam)
 
 void RefreshData(HWND hWnd)
 {
-    HWND hReread = GetDlgItem(hWnd, IDC_REREAD_BTN);
-    HWND hReport = GetDlgItem(hWnd, IDC_REPORT_BTN);
     if (InterlockedCompareExchange(&g_bScanBusy, 1, 0) != 0)
         return;
-    if (hReread) EnableWindow(hReread, FALSE);
-    if (hReport) EnableWindow(hReport, FALSE);
+    SetActionButtonsEnabled(hWnd, FALSE);
 
     HANDLE hThread = CreateThread(NULL, 0, RefreshThreadProc, hWnd, 0, NULL);
     if (hThread)
@@ -2416,7 +2499,7 @@ static LRESULT CALLBACK AboutDlgProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM
                 DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                 CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
             SetPropA(hDlg, PROP_ABOUT_FONT_BOLD, (HANDLE)hFontBold);
-            HWND hName = CreateWindowExU8(0, "STATIC", "DriveMonitor 1.5.2-beta",
+            HWND hName = CreateWindowExU8(0, "STATIC", "DriveMonitor " DRIVEMONITOR_VERSION,
                 WS_CHILD | WS_VISIBLE | SS_CENTER,
                 20, 58, cx - 40, 22,
                 hDlg, (HMENU)0, g_hInst, NULL);
@@ -2790,6 +2873,7 @@ static void CreateMenuBar(HWND hWnd)
 
     HMENU hFile = CreatePopupMenu();
     AppendMenuU8(hFile, MF_STRING, IDM_REPORT,     "Сохранить отчёт");
+    AppendMenuU8(hFile, MF_STRING, IDM_EJECT,      "Извлечь USB-диск");
     AppendMenuU8(hFile, MF_STRING, IDM_SCREENSHOT, "Сохранить снимок\tCtrl+S");
     AppendMenuU8(hFile, MF_SEPARATOR, 0, NULL);
     AppendMenuU8(hFile, MF_STRING, IDM_EXIT,       "Выход");
@@ -2844,11 +2928,17 @@ void CreateControls(HWND hWnd)
         nRightX + 100, 110, 90, 24,
         hWnd, (HMENU)IDC_REPORT_BTN, g_hInst, NULL);
       SendMessage(h, WM_SETFONT, (WPARAM)g_hFontSmall, TRUE); }
+    { HWND h = CreateWindowExU8(0, "BUTTON", "Извлечь",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        nRightX, 138, nBarsW, 24,
+        hWnd, (HMENU)IDC_EJECT_BTN, g_hInst, NULL);
+      SendMessage(h, WM_SETFONT, (WPARAM)g_hFontSmall, TRUE);
+      EnableWindow(h, FALSE); }
 
     {
         HWND hAxis = CreateWindowExU8(0, "STATIC", "",
             WS_CHILD | WS_VISIBLE | SS_LEFT,
-            nRightX, 140, nBarsW, 64,
+            nRightX, 166, nBarsW, 64,
             hWnd, (HMENU)IDC_AXIS_STATIC, g_hInst, NULL);
         SendMessage(hAxis, WM_SETFONT, (WPARAM)g_hFontSmall, TRUE);
     }
@@ -3232,6 +3322,9 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             else if (nCtrl == IDC_REPORT_BTN || nCtrl == IDM_REPORT) {
                 DoSaveDriveReport(hWnd);
             }
+            else if (nCtrl == IDC_EJECT_BTN || nCtrl == IDM_EJECT) {
+                DoSafeEject(hWnd);
+            }
             else if (nCtrl == IDM_SCREENSHOT) {
                 DoSaveScreenshot(hWnd);
             }
@@ -3260,12 +3353,7 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             Snapshot_Diff();
 
             InterlockedExchange(&g_bScanBusy, 0);
-            {
-                HWND hReread = GetDlgItem(hWnd, IDC_REREAD_BTN);
-                HWND hReport = GetDlgItem(hWnd, IDC_REPORT_BTN);
-                if (hReread) EnableWindow(hReread, TRUE);
-                if (hReport) EnableWindow(hReport, TRUE);
-            }
+            SetActionButtonsEnabled(hWnd, TRUE);
 
             UpdateDriveButtons(hWnd);
 
@@ -3329,10 +3417,12 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             {
                 HWND hReread = GetDlgItem(hWnd, IDC_REREAD_BTN);
                 HWND hReport = GetDlgItem(hWnd, IDC_REPORT_BTN);
+                HWND hEject  = GetDlgItem(hWnd, IDC_EJECT_BTN);
                 if (hReread) SetWindowPos(hReread, NULL, nRightX, 110, 90, 24, SWP_NOZORDER);
                 if (hReport) SetWindowPos(hReport, NULL, nRightX + 100, 110, 90, 24, SWP_NOZORDER);
+                if (hEject)  SetWindowPos(hEject,  NULL, nRightX, 138, nBarsW, 24, SWP_NOZORDER);
                 HWND hAxis = GetDlgItem(hWnd, IDC_AXIS_STATIC);
-                if (hAxis) SetWindowPos(hAxis, NULL, nRightX, 140, nBarsW, 64, SWP_NOZORDER);
+                if (hAxis) SetWindowPos(hAxis, NULL, nRightX, 166, nBarsW, 64, SWP_NOZORDER);
             }
 
             int nLblW2  = 100;

@@ -33,12 +33,14 @@
 #define IDC_PROTOCOL_LABEL     1024
 #define IDC_REREAD_BTN         1026
 #define IDC_REPORT_BTN         1035
+#define IDC_EJECT_BTN          1039
 #define IDC_DRIVE_BTN_BASE   1100
 #define IDM_ABOUT            2001
 #define IDM_EXIT             2002
 #define IDM_REPORT           2003
 #define IDM_SCREENSHOT       2004
 #define IDM_DONATE           2006
+#define IDM_EJECT            2007
 #define IDT_HOTPLUG          3002
 #define WM_APP_REFRESH_DONE  (WM_APP + 1)
 #define DRIVE_BTN_H    56

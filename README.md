@@ -4,7 +4,7 @@
 
 English: a one-shot Windows SMART viewer. No tray, no live polling, no Health% formula. Russian UI.
 
-**Текущий выпуск:** [1.5.2-beta](https://github.com/chuikoff/DriveMonitor/releases/tag/1.5.2-beta) — скачать `DriveMonitor.exe`, запустить от администратора.
+**Текущий выпуск:** [1.6](https://github.com/chuikoff/DriveMonitor/releases/tag/1.6) — скачать `DriveMonitor.exe`, запустить от администратора.
 
 Windows 10 / 11. Не CrystalDiskInfo и не Victoria: один снимок SMART (старт, hotplug, «Перечитать»), без трея, графика и теста поверхности.
 
@@ -20,12 +20,9 @@ Windows 10 / 11. Не CrystalDiskInfo и не Victoria: один снимок SM
 
 Имя USB-переходника берётся из VID/PID (например Realtek `0BDA:9201`), не из модели диска.
 
-Здоровье — пятиуровневая шкала **ХОРОШО → РИСК → ТРЕБУЕТ ВНИМАНИЯ → ПЛОХО → КРИТИЧЕСКОЕ**. Overall = худший канал:
+**Диск** — SMART RETURN STATUS / NVMe Critical Warning. **Оценка** — ATA-3 как в smartctl (без GPL-кода): prefail Value≤порог сейчас, In the past, usage на пороге, RAW носителя (05/197/198/187), self-test. Механика, температура и CRC — в таблице и лекции, не в overall. Шкала **ХОРОШО → РИСК → ТРЕБУЕТ ВНИМАНИЯ → ПЛОХО → КРИТИЧЕСКОЕ**.
 
-- HDD: носитель / механика / интерфейс / температура
-- SSD / NVMe: носитель / ресурс / интерфейс / температура
-
-Не формула Health%. Неизвестный vendor RAW не оценивается как поломка. Наработка — контекст, не штраф. ~48 °C — норма.
+Не формула Health%. Неизвестный vendor RAW не оценивается как поломка. Наработка — контекст, не штраф. Для NVMe пороги температуры — WCTEMP/CCTEMP диска, иначе ~50/60/70 °C. USB-диск можно извлечь кнопкой «Извлечь». В текстовом отчёте есть версия программы.
 
 Имена и RAW атрибутов зависят от производителя (Seagate, WD, Samsung, Kingston/Phison, ADATA, Toshiba, Micron, Hynix, Intel).
 
