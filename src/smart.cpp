@@ -513,6 +513,19 @@ unsigned __int64 GetRawValue48(const BYTE* pRaw)
             (unsigned __int64)pRaw[0];
 }
 
+DWORD SeagateRateOps(const BYTE* pRaw)
+{
+    if (!pRaw) return 0;
+    return ((DWORD)pRaw[3] << 24) | ((DWORD)pRaw[2] << 16) |
+           ((DWORD)pRaw[1] <<  8) |  (DWORD)pRaw[0];
+}
+
+unsigned SeagateRateErrs(const BYTE* pRaw)
+{
+    if (!pRaw) return 0;
+    return (unsigned)pRaw[4] | ((unsigned)pRaw[5] << 8);
+}
+
 static WORD GetRawValue16Lo(BYTE* pRaw)
 {
     return ((WORD)pRaw[1] << 8) | (WORD)pRaw[0];
@@ -1448,6 +1461,8 @@ static DRIVE_CONTROLLER ControllerFromNvmeVid(USHORT vid)
     case 0xC0A9: return CONTROLLER_MICRON;
     case 0x1E4B: return CONTROLLER_MAXIO;
     case 0x1DDC: return CONTROLLER_INNOGRIT;
+    /* 0x1CC1 is ADATA's OEM PCI VID, not a controller. SX8200 etc. are SMI
+     * in the model table below — same as Hard Disk Sentinel. */
     default:     return CONTROLLER_UNKNOWN;
     }
 }
@@ -1495,6 +1510,13 @@ static DRIVE_CONTROLLER DetectDriveController(const DRIVE_INFO* p)
         strstr(szModelU, "SM232") || strstr(szModelU, "SM250") ||
         strstr(szFwU, "SM226") || strstr(szFwU, "SM225") ||
         strstr(szFwU, "SM232"))
+        return CONTROLLER_SMI;
+
+    /* ADATA/XPG on Silicon Motion (HDS: SX8200PNP → SM2262EN).
+     * PCI VID is ADATA 1CC1, so model/firmware is the fingerprint. */
+    if (strstr(szModelU, "SX8200") || strstr(szModelU, "SX8100") ||
+        strstr(szModelU, "SX7000") || strstr(szModelU, "GAMMIX S11") ||
+        strstr(szFwU, "SANA"))
         return CONTROLLER_SMI;
 
     if (strstr(szModelU, "MAP120") || strstr(szModelU, "MAP160") ||
@@ -2314,7 +2336,7 @@ BOOL GetSMARTPredictFailure(HANDLE hDrive, int nDrive, BOOL* pbFail)
     DWORD dwBytes = 0;
     ZeroMemory(&cip, sizeof(cip));
     ZeroMemory(&cop, sizeof(cop));
-    *pbFail = FALSE;
+    if (!pbFail) return FALSE;
 
     cip.cBufferSize                 = 0;
     cip.irDriveRegs.bFeaturesReg    = SMART_RETURN_STATUS;
@@ -2330,11 +2352,12 @@ BOOL GetSMARTPredictFailure(HANDLE hDrive, int nDrive, BOOL* pbFail)
         &cip, sizeof(SENDCMDINPARAMS) - 1,
         &cop, sizeof(MY_OUTPARAMS), &dwBytes, NULL);
 
+    /* Leave *pbFail unchanged unless RETURN STATUS succeeded (LOG SENSE may have set it). */
     if (bOK && cop.DriverStatus.bDriverError == 0) {
-        if (cop.bBuffer[3] == 0xF4 && cop.bBuffer[4] == 0x2C)
-            *pbFail = TRUE;
+        *pbFail = (cop.bBuffer[3] == 0xF4 && cop.bBuffer[4] == 0x2C);
+        return TRUE;
     }
-    return bOK;
+    return FALSE;
 }
 
 /* ============================================================
@@ -2922,6 +2945,7 @@ BOOL GetSMARTViaLogSense(HANDLE hDrive, DRIVE_INFO* pInfo)
                      * shows the calculated health % even when
                      * predictive failure is detected. */
                 }
+                pInfo->bGotReturnStatus = TRUE;
                 bAny = TRUE;
             }
         }
@@ -3464,6 +3488,17 @@ static int AttrWorstOrNeg1(const DRIVE_INFO* pInfo, BYTE id)
     return -1;
 }
 
+static const SMART_ATTRIBUTE* FindAttr(const DRIVE_INFO* pInfo, BYTE id)
+{
+    int i;
+    if (!pInfo) return NULL;
+    for (i = 0; i < 30; i++) {
+        if (pInfo->attrData.stAttributes[i].bAttrID == id)
+            return &pInfo->attrData.stAttributes[i];
+    }
+    return NULL;
+}
+
 /* Last G-Sense/C0/POH snapshot per serial. Growth needs a later sample. */
 #define MECH_STORE_MAX 48
 typedef struct {
@@ -3821,6 +3856,107 @@ static BOOL SelfTestFailed(const DRIVE_INFO* p)
     return (s >= 3 && s <= 8);
 }
 
+/* Seagate/ATA: warn when Value/Worst approach the official threshold,
+ * or when the high-16 error field is non-zero. Do NOT use Value<70 —
+ * Seagate ID 1 threshold is 6, Value 75 is still a pass. */
+static BOOL HddRateNearThresh(int val, int worst, BYTE thresh)
+{
+    if (val < 0 || thresh == 0)
+        return FALSE;
+    if (val <= (int)thresh + 10)
+        return TRUE;
+    if (worst >= 0 && worst <= (int)thresh + 20)
+        return TRUE;
+    return FALSE;
+}
+
+static unsigned HddRateErrs(const DRIVE_INFO* p, BYTE id)
+{
+    const SMART_ATTRIBUTE* a = FindAttr(p, id);
+    if (!a) return 0;
+    if (p && p->eVendor == VENDOR_SEAGATE)
+        return SeagateRateErrs(a->bRawValue);
+    return 0;
+}
+
+typedef struct {
+    BOOL bId1;
+    BOOL bId7;
+    BOOL bId193Val;
+    BOOL bId193Raw;
+    BOOL bId195;
+} HDD_WEAR;
+
+static void HddWearFlags(const DRIVE_INFO* p, HDD_WEAR* w)
+{
+    int v1, w1, v7, w7, v193, v195, w195;
+    if (!w) return;
+    ZeroMemory(w, sizeof(*w));
+    if (!p) return;
+    v1   = AttrValueOrNeg1(p, 0x01);
+    w1   = AttrWorstOrNeg1(p, 0x01);
+    v7   = AttrValueOrNeg1(p, 0x07);
+    w7   = AttrWorstOrNeg1(p, 0x07);
+    v193 = AttrValueOrNeg1(p, 0xC1);
+    v195 = AttrValueOrNeg1(p, 0xC3);
+    w195 = AttrWorstOrNeg1(p, 0xC3);
+    w->bId1      = HddRateNearThresh(v1, w1, FindThreshold(p, 0x01)) ||
+                   HddRateErrs(p, 0x01) > 0;
+    w->bId7      = HddRateNearThresh(v7, w7, FindThreshold(p, 0x07)) ||
+                   HddRateErrs(p, 0x07) > 0;
+    w->bId193Val = (v193 >= 0 && v193 <= 15);
+    w->bId193Raw = (p->nLoadUnload >= 300000);
+    w->bId195    = HddRateNearThresh(v195, w195, FindThreshold(p, 0xC3)) ||
+                   HddRateErrs(p, 0xC3) > 0;
+}
+
+void FormatHddObservePrompt(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen)
+{
+    HDD_WEAR wear;
+    const char* part[4];
+    int n = 0;
+    char ids[24];
+
+    if (!szBuf || nBufLen <= 0) return;
+    szBuf[0] = '\0';
+    if (!pInfo) return;
+
+    HddWearFlags(pInfo, &wear);
+    if (wear.bId1) part[n++] = "1";
+    if (wear.bId7) part[n++] = "7";
+    if (wear.bId193Val || wear.bId193Raw) part[n++] = "193";
+    if (wear.bId195) part[n++] = "195";
+
+    ids[0] = '\0';
+    if (n == 1)
+        safe_snprintf(ids, "%s", part[0]);
+    else if (n == 2)
+        safe_snprintf(ids, "%s/%s", part[0], part[1]);
+    else if (n == 3)
+        safe_snprintf(ids, "%s/%s/%s", part[0], part[1], part[2]);
+    else if (n >= 4)
+        safe_snprintf(ids, "%s/%s/%s/%s", part[0], part[1], part[2], part[3]);
+
+    if (ids[0]) {
+        safe_snprintf_n(szBuf, nBufLen,
+            "Диск ещё считает себя исправным. Есть износ %s — следить.", ids);
+        return;
+    }
+    if (pInfo->eTempStatus == HEALTH_STATUS_OBSERVE ||
+        pInfo->eTempStatus == HEALTH_STATUS_CAUTION) {
+        safe_snprintf_n(szBuf, nBufLen,
+            "Диск ещё считает себя исправным. Повышена температура — следить.");
+        return;
+    }
+    if (pInfo->nGSenseEvents > 0) {
+        safe_snprintf_n(szBuf, nBufLen,
+            "Диск ещё считает себя исправным. Есть события G-Sense — следить.");
+        return;
+    }
+    safe_snprintf_n(szBuf, nBufLen,
+        "Есть факторы риска. Нажмите на состояние.");
+}
+
 /* HDD-only: four channels, overall = worst significant channel + correlation. */
 static void AssessHddHealth(DRIVE_INFO* pInfo)
 {
@@ -3881,7 +4017,17 @@ static void AssessHddHealth(DRIVE_INFO* pInfo)
         MechSaveSnap(&now);
     }
 
-    /* Media: 05 / 196 / 197 / 198 / self-test. */
+    {
+        HDD_WEAR wear;
+        int v193 = AttrValueOrNeg1(pInfo, 0xC1);
+        BOOL bReadWorn, bSeekWorn, bParkLow, bParkBad;
+        HddWearFlags(pInfo, &wear);
+        bReadWorn = wear.bId1 || wear.bId195;
+        bSeekWorn = wear.bId7;
+        bParkLow  = wear.bId193Val || wear.bId193Raw;
+        bParkBad  = (v193 >= 0 && v193 <= 5);
+
+    /* Media: 05 / 196 / 197 / 198 / self-test. 01/195 = read-channel wear. */
     if (SelfTestFailed(pInfo) || (bMediaUp && pInfo->nUncorrectable > 0 && bGsenseUp))
         pInfo->eReliability = HEALTH_STATUS_CRITICAL;
     else if (pInfo->bPredictFailure || pInfo->bThresholdViolation ||
@@ -3895,6 +4041,8 @@ static void AssessHddHealth(DRIVE_INFO* pInfo)
     else if (pInfo->nPendingSectors > 0 || pInfo->nReallocated > 0 ||
              pInfo->nRemapEvents > 0 || bWriteWarn)
         pInfo->eReliability = HEALTH_STATUS_CAUTION;
+    else if (bReadWorn)
+        pInfo->eReliability = HEALTH_STATUS_OBSERVE;
     else
         pInfo->eReliability = HEALTH_STATUS_GOOD;
 
@@ -3933,9 +4081,11 @@ static void AssessHddHealth(DRIVE_INFO* pInfo)
         pInfo->eMechanics = HEALTH_STATUS_CAUTION;
     else if (pInfo->nGSenseDelta >= 100 && bMediaClean)
         pInfo->eMechanics = HEALTH_STATUS_CAUTION;
-    else if (pInfo->nGSenseEvents > 0 && bMediaClean)
+    else if (bParkBad)
+        pInfo->eMechanics = HEALTH_STATUS_CAUTION;
+    else if (bParkLow || bSeekWorn)
         pInfo->eMechanics = HEALTH_STATUS_OBSERVE;
-    else if (pInfo->nEmergencyRetract > 0 && bMediaClean && pInfo->nGSenseEvents <= 0)
+    else if (pInfo->nGSenseEvents > 0 && bMediaClean)
         pInfo->eMechanics = HEALTH_STATUS_OBSERVE;
     else if (pInfo->nGSenseEvents >= 0 || pInfo->nEmergencyRetract >= 0 ||
              pInfo->nLoadUnload >= 0)
@@ -3945,10 +4095,17 @@ static void AssessHddHealth(DRIVE_INFO* pInfo)
 
     pInfo->eHealthStatus = HEALTH_STATUS_GOOD;
     pInfo->eHealthStatus = WorstHealth(pInfo->eHealthStatus, pInfo->eReliability);
-    pInfo->eHealthStatus = WorstHealth(pInfo->eHealthStatus, pInfo->eMechanics);
     pInfo->eHealthStatus = WorstHealth(pInfo->eHealthStatus, pInfo->eInterface);
     if (pInfo->eTempStatus != HEALTH_STATUS_UNKNOWN)
         pInfo->eHealthStatus = WorstHealth(pInfo->eHealthStatus, pInfo->eTempStatus);
+    /* C0 (power-off retract) alone does not raise overall — cheap PSU.
+     * 193 low remaining / 7 seek wear / G-Sense+media do. */
+    if (pInfo->eMechanics == HEALTH_STATUS_OBSERVE ||
+        pInfo->eMechanics == HEALTH_STATUS_CAUTION ||
+        pInfo->eMechanics == HEALTH_STATUS_BAD ||
+        pInfo->eMechanics == HEALTH_STATUS_CRITICAL)
+        pInfo->eHealthStatus = WorstHealth(pInfo->eHealthStatus, pInfo->eMechanics);
+    }
 
     if (SelfTestFailed(pInfo))
         pInfo->eHealthStatus = HEALTH_STATUS_CRITICAL;
@@ -4082,6 +4239,7 @@ void AssessDriveHealth(DRIVE_INFO* pInfo)
     pInfo->szEvidence[0]       = '\0';
     pInfo->nHealthPercent      = -1;
     pInfo->eHealthStatus       = HEALTH_STATUS_UNKNOWN;
+    pInfo->eDiskStatus         = HEALTH_STATUS_UNKNOWN;
 
     if (!pInfo->bSMART_Supported) {
         safe_snprintf(pInfo->szEvidence, "SMART недоступен");
@@ -4156,6 +4314,23 @@ void AssessDriveHealth(DRIVE_INFO* pInfo)
     } else {
         AssessSsdHealth(pInfo);
     }
+
+    /* Drive's own verdict: SMART RETURN STATUS / NVMe Critical Warning.
+     * Separate from our assessment (Victoria: disk Good vs Unideal). */
+    if (pInfo->bIsNVMe) {
+        BYTE nCw = pInfo->nvmeHealth.CriticalWarning;
+        if (nCw & (NVME_CRIT_WARN_READ_ONLY | NVME_CRIT_WARN_RELIABILITY_DEGRADED))
+            pInfo->eDiskStatus = HEALTH_STATUS_CRITICAL;
+        else if (nCw)
+            pInfo->eDiskStatus = HEALTH_STATUS_BAD;
+        else
+            pInfo->eDiskStatus = HEALTH_STATUS_GOOD;
+    } else if (!pInfo->bGotReturnStatus)
+        pInfo->eDiskStatus = HEALTH_STATUS_UNKNOWN;
+    else if (pInfo->bPredictFailure)
+        pInfo->eDiskStatus = HEALTH_STATUS_WARNING;
+    else
+        pInfo->eDiskStatus = HEALTH_STATUS_GOOD;
 
     nUnknown = CountUnknownAttrs(pInfo);
     nAttr    = CountPresentAttrs(pInfo);
@@ -4423,15 +4598,22 @@ static const char* HealthStatusMark(DRIVE_HEALTH_STATUS e)
     }
 }
 
+static void LectureAddDualStatus(char* szBuf, int nBufLen, const DRIVE_INFO* pInfo)
+{
+    LectureAddF(szBuf, nBufLen, "Диск: %s%s\r\nОценка: %s%s\r\n\r\n",
+                HealthStatusMark(pInfo->eDiskStatus),
+                GetHealthStatusName(pInfo->eDiskStatus),
+                HealthStatusMark(pInfo->eHealthStatus),
+                GetHealthStatusName(pInfo->eHealthStatus));
+}
+
 static void FormatHddLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen)
 {
     int r, pend, u;
 
     if (!szBuf || nBufLen <= 0) return;
     szBuf[0] = '\0';
-    LectureAddF(szBuf, nBufLen, "Состояние: %s%s\r\n\r\n",
-                HealthStatusMark(pInfo->eHealthStatus),
-                GetHealthStatusName(pInfo->eHealthStatus));
+    LectureAddDualStatus(szBuf, nBufLen, pInfo);
 
     if (!pInfo->bSMART_Supported) {
         LectureAdd(szBuf, nBufLen,
@@ -4451,17 +4633,75 @@ static void FormatHddLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
         break;
     case HEALTH_STATUS_OBSERVE:
         LectureAdd(szBuf, nBufLen, "Причина:\r\n");
-        if (pInfo->nGSenseEvents > 0)
-            LectureAddF(szBuf, nBufLen,
-                "Обнаружен повышенный механический риск. G-Sense: %d событий.\r\n\r\n",
-                pInfo->nGSenseEvents);
-        else if (pInfo->eTempStatus == HEALTH_STATUS_OBSERVE ||
-                 pInfo->eTempStatus == HEALTH_STATUS_CAUTION)
-            LectureAdd(szBuf, nBufLen,
-                "Повышенная температура. Повреждение поверхности не подтверждено.\r\n\r\n");
-        else
-            LectureAdd(szBuf, nBufLen,
-                "Есть факторы риска, повреждение поверхности не подтверждено.\r\n\r\n");
+        {
+            HDD_WEAR wear;
+            int v1 = AttrValueOrNeg1(pInfo, 0x01);
+            int w1 = AttrWorstOrNeg1(pInfo, 0x01);
+            int v7 = AttrValueOrNeg1(pInfo, 0x07);
+            int w7 = AttrWorstOrNeg1(pInfo, 0x07);
+            int v193 = AttrValueOrNeg1(pInfo, 0xC1);
+            int v195 = AttrValueOrNeg1(pInfo, 0xC3);
+            int w195 = AttrWorstOrNeg1(pInfo, 0xC3);
+            BOOL bSaid = FALSE;
+            HddWearFlags(pInfo, &wear);
+            if (wear.bId193Val) {
+                if (pInfo->nLoadUnload >= 0)
+                    LectureAddF(szBuf, nBufLen,
+                        "Парковки (193): Value %d, циклов %d. "
+                        "Нормализованное значение низкое "
+                        "(типичный рейтинг десктопных HDD — 600 000 циклов; "
+                        "это не исчерпание бюджета). SMART FAIL диск не ставит.\r\n",
+                        v193, pInfo->nLoadUnload);
+                else
+                    LectureAddF(szBuf, nBufLen,
+                        "Парковки (193): Value %d. "
+                        "Нормализованное значение низкое, SMART FAIL диск не ставит.\r\n",
+                        v193);
+                bSaid = TRUE;
+            } else if (wear.bId193Raw) {
+                LectureAddF(szBuf, nBufLen,
+                    "Парковки (193): %d циклов "
+                    "(≥ 300 000 при типичном рейтинге 600 000). "
+                    "SMART FAIL диск не ставит.\r\n",
+                    pInfo->nLoadUnload);
+                bSaid = TRUE;
+            }
+            if (wear.bId1) {
+                LectureAddF(szBuf, nBufLen,
+                    "Чтение (1): Value %d, худший %d, порог %u, ошибок в RAW %u. "
+                    "У Seagate RAW = операции + ошибки в старших 16 битах, не «миллионы сбоев».\r\n",
+                    v1, w1, (unsigned)FindThreshold(pInfo, 0x01),
+                    HddRateErrs(pInfo, 0x01));
+                bSaid = TRUE;
+            }
+            if (wear.bId7) {
+                LectureAddF(szBuf, nBufLen,
+                    "Позиционирование (7): Value %d, худший %d, порог %u, ошибок в RAW %u.\r\n",
+                    v7, w7, (unsigned)FindThreshold(pInfo, 0x07),
+                    HddRateErrs(pInfo, 0x07));
+                bSaid = TRUE;
+            }
+            if (wear.bId195) {
+                LectureAddF(szBuf, nBufLen,
+                    "ECC on-the-fly (195): Value %d, худший %d. "
+                    "По спецификации Seagate это не pre-fail (порог 0).\r\n",
+                    v195, w195);
+                bSaid = TRUE;
+            }
+            if (pInfo->nGSenseEvents > 0) {
+                LectureAddF(szBuf, nBufLen,
+                    "G-Sense: %d событий.\r\n", pInfo->nGSenseEvents);
+                bSaid = TRUE;
+            }
+            if (!bSaid && (pInfo->eTempStatus == HEALTH_STATUS_OBSERVE ||
+                           pInfo->eTempStatus == HEALTH_STATUS_CAUTION))
+                LectureAdd(szBuf, nBufLen,
+                    "Повышенная температура. Повреждение поверхности не подтверждено.\r\n");
+            else if (!bSaid)
+                LectureAdd(szBuf, nBufLen,
+                    "Есть факторы риска, повреждение поверхности не подтверждено.\r\n");
+            LectureAdd(szBuf, nBufLen, "\r\n");
+        }
         LectureAdd(szBuf, nBufLen, "Признаков повреждения поверхности:\r\n");
         LectureAddF(szBuf, nBufLen, "  %s Reallocated: %d\r\n",
                     (r <= 0) ? "\xE2\x9C\x93" : "\xE2\x9C\x97", r < 0 ? 0 : r);
@@ -4533,9 +4773,7 @@ static void FormatSsdLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
 {
     if (!szBuf || nBufLen <= 0) return;
     szBuf[0] = 0;
-    LectureAddF(szBuf, nBufLen, "Состояние: %s%s\r\n\r\n",
-                HealthStatusMark(pInfo->eHealthStatus),
-                GetHealthStatusName(pInfo->eHealthStatus));
+    LectureAddDualStatus(szBuf, nBufLen, pInfo);
 
     if (!pInfo->bSMART_Supported) {
         LectureAdd(szBuf, nBufLen,
@@ -4641,7 +4879,7 @@ void FormatHealthLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen)
         return;
     }
 
-    LectureAddF(szBuf, nBufLen, "Состояние: %s\r\n\r\n", GetHealthStatusName(pInfo->eHealthStatus));
+    LectureAddDualStatus(szBuf, nBufLen, pInfo);
 
     if (!pInfo->bSMART_Supported) {
         if (pInfo->bIsUSB && IsLikelyUsbFlashDrive(pInfo)) {
@@ -4881,7 +5119,8 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
     }
 
     szState = GetHealthStatusName(pInfo->eHealthStatus);
-    LectureAddF(szBuf, nBufLen, "Состояние: %s\r\n", szState);
+    LectureAddDualStatus(szBuf, nBufLen, pInfo);
+    LectureAddF(szBuf, nBufLen, "Сводка: %s\r\n", szState);
 
     if (!pInfo->bSMART_Supported) {
         if (pInfo->bIsUSB && IsLikelyUsbFlashDrive(pInfo)) {
@@ -5054,6 +5293,8 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
         LectureAdd(szBuf, nBufLen, "\r\nИтог:\r\n");
         if (pInfo->eHealthStatus == HEALTH_STATUS_GOOD) {
             LectureAdd(szBuf, nBufLen, "  GOOD because:\r\n");
+        } else if (pInfo->eHealthStatus == HEALTH_STATUS_OBSERVE) {
+            LectureAdd(szBuf, nBufLen, "  OBSERVE because:\r\n");
         } else if (pInfo->eHealthStatus == HEALTH_STATUS_CAUTION) {
             LectureAdd(szBuf, nBufLen, "  CAUTION because:\r\n");
         } else {
@@ -5258,6 +5499,8 @@ if (pInfo->nEndurancePercent >= 0) {
         LectureAdd(szBuf, nBufLen, "\r\nИтог:\r\n");
         if (pInfo->eHealthStatus == HEALTH_STATUS_GOOD)
             LectureAdd(szBuf, nBufLen, "  GOOD because:\r\n");
+        else if (pInfo->eHealthStatus == HEALTH_STATUS_OBSERVE)
+            LectureAdd(szBuf, nBufLen, "  OBSERVE because:\r\n");
         else if (pInfo->eHealthStatus == HEALTH_STATUS_CAUTION)
             LectureAdd(szBuf, nBufLen, "  CAUTION because:\r\n");
         else
@@ -5597,7 +5840,8 @@ static BOOL AcquireATASMART(HANDLE hDrive, int nDrive, DRIVE_INFO* pInfo, BOOL b
             /* Data may be invalid — but still try to use what we have */
         }
 
-        GetSMARTPredictFailure(hDrive, nDrive, &pInfo->bPredictFailure);
+        if (GetSMARTPredictFailure(hDrive, nDrive, &pInfo->bPredictFailure))
+            pInfo->bGotReturnStatus = TRUE;
         ExtractTemperatureFromATA(pInfo);
         ExtractCommonATACounters(pInfo);
         ExtractSSDIndicators(pInfo);

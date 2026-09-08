@@ -695,16 +695,10 @@ static void DoSaveDriveReport(HWND hWnd)
 
     {
         char szPathU8[MAX_PATH * 3];
-        char szMsg[MAX_PATH * 3 + 128];
+        char szMsg[MAX_PATH * 3 + 64];
         WToU8(ofn.lpstrFile, szPathU8, (int)sizeof(szPathU8));
-        safe_snprintf(szMsg, "Отчёт сохранён\n\n%s\n\nОткрыть папку?", szPathU8);
-        if (MessageBoxU8(hWnd, szMsg, "DriveMonitor",
-                         MB_YESNO | MB_ICONINFORMATION) == IDYES) {
-            WCHAR wzCmd[MAX_PATH + 32];
-            _snwprintf(wzCmd, MAX_PATH + 32, L"/select,\"%s\"", ofn.lpstrFile);
-            wzCmd[MAX_PATH + 31] = 0;
-            ShellExecuteW(NULL, L"open", L"explorer.exe", wzCmd, NULL, SW_SHOWNORMAL);
-        }
+        safe_snprintf(szMsg, "Отчёт сохранён\n\n%s", szPathU8);
+        MessageBoxU8(hWnd, szMsg, "DriveMonitor", MB_OK | MB_ICONINFORMATION);
     }
 }
 
@@ -800,14 +794,17 @@ LRESULT CALLBACK HealthBarWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lP
             HBITMAP hbmBuf = CreateCompatibleBitmap(hdcReal, w, h);
             HBITMAP hbmOldBuf = (HBITMAP)SelectObject(hdc, hbmBuf);
 
-            DRIVE_HEALTH_STATUS eSt = HEALTH_STATUS_UNKNOWN;
+            DRIVE_HEALTH_STATUS eOurs = HEALTH_STATUS_UNKNOWN;
+            DRIVE_HEALTH_STATUS eDisk = HEALTH_STATUS_UNKNOWN;
             BOOL bHaveDrive = (g_nDriveCount > 0 && g_nSelectedDrive >= 0 &&
                                g_nSelectedDrive < g_nDriveCount);
-            if (bHaveDrive)
-                eSt = g_Drives[g_nSelectedDrive].eHealthStatus;
+            if (bHaveDrive) {
+                eOurs = g_Drives[g_nSelectedDrive].eHealthStatus;
+                eDisk = g_Drives[g_nSelectedDrive].eDiskStatus;
+            }
 
             {
-                HBRUSH hbrFill = CreateSolidBrush(GetHealthStatusColor(eSt));
+                HBRUSH hbrFill = CreateSolidBrush(GetHealthStatusColor(eOurs));
                 FillRect(hdc, &rc, hbrFill);
                 DeleteObject(hbrFill);
             }
@@ -823,14 +820,20 @@ LRESULT CALLBACK HealthBarWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lP
             }
 
             {
-                const char* szName = GetHealthStatusName(eSt);
-                HFONT hUseFont = g_hFontBig ? g_hFontBig :
-                    (g_hFontTitle ? g_hFontTitle : (HFONT)GetStockObject(DEFAULT_GUI_FONT));
+                char szDisk[64], szOurs[64];
+                HFONT hUseFont = g_hFontTitle ? g_hFontTitle :
+                    (g_hFontNormal ? g_hFontNormal : (HFONT)GetStockObject(DEFAULT_GUI_FONT));
                 HFONT hOldFont = (HFONT)SelectObject(hdc, hUseFont);
                 SetBkMode(hdc, TRANSPARENT);
                 SetTextColor(hdc, RGB(255, 255, 255));
-                RECT rcText = { 0, 0, w, h };
-                DrawTextU8(hdc, szName, &rcText, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                safe_snprintf(szDisk, "Диск: %s", GetHealthStatusName(eDisk));
+                safe_snprintf(szOurs, "Оценка: %s", GetHealthStatusName(eOurs));
+                {
+                    RECT rc1 = { 4, 2, w - 4, h / 2 };
+                    RECT rc2 = { 4, h / 2 - 1, w - 4, h - 2 };
+                    DrawTextU8(hdc, szDisk, &rc1, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                    DrawTextU8(hdc, szOurs, &rc2, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                }
                 SelectObject(hdc, hOldFont);
                 if (GetFocus() == hWnd)
                     DrawFocusRect(hdc, &rc);
@@ -1295,15 +1298,17 @@ void UpdateDriveInfo(HWND hWnd, int nDriveIdx)
     } else {
         /* SMART present: prompt to open the lecture. No NVMe field dump, no %. */
         {
+            char szObs[192];
             const char* szPred = "Нажмите на состояние, чтобы узнать подробности.";
             switch (pInfo->eHealthStatus) {
             case HEALTH_STATUS_GOOD:
                 szPred = "Критических проблем не обнаружено.";
                 break;
             case HEALTH_STATUS_OBSERVE:
-                if (pInfo->eType == DRIVE_TYPE_HDD && !pInfo->bIsNVMe)
-                    szPred = "Повышенный механический риск. Повреждение поверхности не подтверждено.";
-                else
+                if (pInfo->eType == DRIVE_TYPE_HDD && !pInfo->bIsNVMe) {
+                    FormatHddObservePrompt(pInfo, szObs, (int)sizeof(szObs));
+                    szPred = szObs;
+                } else
                     szPred = "Есть факторы риска. Нажмите на состояние.";
                 break;
             case HEALTH_STATUS_CAUTION:
@@ -1643,7 +1648,19 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
         break;
 
     case 0xBB:
+        if (dw32 == 0)
+            safe_snprintf(szMain, "0  (ОК)");
+        else
+            safe_snprintf(szMain, "%lu неисправимых", (unsigned long)dw32);
+        break;
+
     case 0xC3:
+        if (eVendor == VENDOR_SEAGATE) {
+            unsigned nErr = SeagateRateErrs(pRaw);
+            DWORD nOps = SeagateRateOps(pRaw);
+            safe_snprintf(szMain, "%u ош. ECC / %lu секторов", nErr, (unsigned long)nOps);
+            break;
+        }
         if (dw32 == 0)
             safe_snprintf(szMain, "0  (ОК)");
         else
@@ -1705,9 +1722,9 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
     case 0x01:
     {
         if (eVendor == VENDOR_SEAGATE) {
-            safe_snprintf(szMain, "%02X%02X%02X%02X%02X%02X  регистр частоты, мл. 16 бит: %u",
-                          pRaw[5], pRaw[4], pRaw[3], pRaw[2], pRaw[1], pRaw[0],
-                          (unsigned)w16);
+            unsigned nErr = SeagateRateErrs(pRaw);
+            DWORD nOps = SeagateRateOps(pRaw);
+            safe_snprintf(szMain, "%u ошибок чтения / %lu секторов", nErr, (unsigned long)nOps);
             break;
         }
         DWORD dwErrHi = (((DWORD)pRaw[5] << 8) | (DWORD)pRaw[4]);
@@ -1723,9 +1740,9 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
     case 0x07:
     {
         if (eVendor == VENDOR_SEAGATE) {
-            safe_snprintf(szMain, "%02X%02X%02X%02X%02X%02X  регистр частоты, мл. 16 бит: %u",
-                          pRaw[5], pRaw[4], pRaw[3], pRaw[2], pRaw[1], pRaw[0],
-                          (unsigned)w16);
+            unsigned nErr = SeagateRateErrs(pRaw);
+            DWORD nOps = SeagateRateOps(pRaw);
+            safe_snprintf(szMain, "%u ошибок позиц. / %lu seeks", nErr, (unsigned long)nOps);
             break;
         }
         DWORD dwErrHi = (((DWORD)pRaw[5] << 8) | (DWORD)pRaw[4]);
@@ -1959,15 +1976,34 @@ static const char* AtaRowStatus(const DRIVE_INFO* p, const SMART_ATTRIBUTE* a,
     }
 
     if (id == 0xC3 && !ssd) {
+        if (p->eVendor == VENDOR_SEAGATE) {
+            if (SeagateRateErrs(a->bRawValue) > 0) return "Внимание";
+            if (bThresh > 0 && (val <= bThresh + 10 || worst <= bThresh + 20))
+                return "Внимание";
+            return "ОК";
+        }
         if (val <= 10) return "ПЛОХО";
-        if (val < 70 || worst < 50) return "Внимание";
+        if (val < 70 || worst < 70) return "Внимание";
+        return "ОК";
+    }
+
+    if (id == 0xC1 && !ssd) {
+        if (val > 0 && val <= 5) return "Внимание";
+        if (val > 0 && val <= 15) return "Риск";
+        if (GetRawValue(a->bRawValue) >= 300000) return "Риск";
         return "ОК";
     }
 
     if (id == 0xC8 || id == 0x01 || id == 0x07) {
+        if (p->eVendor == VENDOR_SEAGATE && (id == 0x01 || id == 0x07)) {
+            if (SeagateRateErrs(a->bRawValue) > 0) return "Внимание";
+            if (bThresh > 0 && val <= bThresh + 10) return "Внимание";
+            if (bThresh > 0 && worst <= bThresh + 20) return "Внимание";
+            return "ОК";
+        }
         if (val > 0 && val <= 1) return "СБОЙ";
         if (val > 0 && val <= 10) return "Внимание";
-        if (worst > 0 && worst < 70) return "Внимание";
+        if (val < 70 || worst < 70) return "Внимание";
         return "ОК";
     }
 
@@ -1975,6 +2011,8 @@ static const char* AtaRowStatus(const DRIVE_INFO* p, const SMART_ATTRIBUTE* a,
         return "INFO";
 
     if (!ssd && IsShockSensorAttr(id)) {
+        if (p->nGSenseEvents <= 0)
+            return "ОК";
         if (p->eMechanics == HEALTH_STATUS_CAUTION ||
             p->eMechanics == HEALTH_STATUS_BAD)
             return "Внимание";
@@ -1986,7 +2024,8 @@ static const char* AtaRowStatus(const DRIVE_INFO* p, const SMART_ATTRIBUTE* a,
     if ((id == 0xC2 || id == 0xBE) && p->nTemperatureC > 70)
         return "Жарко";
 
-    if (bThresh > 0 && val < bThresh + 10)
+    /* High vendor thresholds (Seagate 10=97, 184=99) are not "near fail". */
+    if (bThresh > 0 && bThresh < 50 && val < bThresh + 10)
         return "Внимание";
     return "ОК";
 }
@@ -2091,38 +2130,38 @@ void UpdateAttrList(HWND hWnd, int nDriveIdx)
         NVME_ROW("07h","Записано (host)",szDUW,"ОК");
 
         {
+            char szHR[64], szHW[64], szBT[64];
+            safe_snprintf(szHR, "%llu", (unsigned long long)pInfo->qwNVMeHostReads);
+            NVME_ROW("08h", "Команды чтения хоста", szHR, "ОК");
+            safe_snprintf(szHW, "%llu", (unsigned long long)pInfo->qwNVMeHostWrites);
+            NVME_ROW("09h", "Команды записи хоста", szHW, "ОК");
+            safe_snprintf(szBT, "%llu мин", (unsigned long long)pInfo->qwNVMeControllerBusyTime);
+            NVME_ROW("0Ah", "Занятость контроллера", szBT, "ОК");
+        }
+
+        safe_snprintf(szPC,"%llu",(unsigned long long)qwPowerCycles);
+        NVME_ROW("0Bh","Циклы включения",szPC,"ОК");
+
+        {
             DWORD dwPoh = (qwPOH > 0xFFFFFFFFULL) ? 0xFFFFFFFFUL : (DWORD)qwPOH;
             FormatPowerOnHours(dwPoh, szPOH, (int)sizeof(szPOH));
         }
-        NVME_ROW("09h","Наработка",szPOH,"ОК");
-
-        safe_snprintf(szPC,"%llu",(unsigned long long)qwPowerCycles);
-        NVME_ROW("0Ch","Циклы включения",szPC,"ОК");
+        NVME_ROW("0Ch","Наработка",szPOH,"ОК");
 
         safe_snprintf(szUS,"%llu",(unsigned long long)qwUnsafeSDs);
-        NVME_ROW("10h","Аварийные выключения",szUS,"ОК");
+        NVME_ROW("0Dh","Небезопасные выключения",szUS,"ОК");
 
         safe_snprintf(szME,"%llu",(unsigned long long)qwMediaErr);
-        NVME_ROW("11h","Ошибки носителя",szME,(qwMediaErr>0?"ПЛОХО":"ОК"));
+        NVME_ROW("0Eh","Ошибки носителя",szME,(qwMediaErr>0?"ПЛОХО":"ОК"));
 
         safe_snprintf(szEL,"%llu",(unsigned long long)qwErrLog);
-        NVME_ROW("12h","Записи в журнале ошибок",szEL,(qwErrLog>0?"Внимание":"ОК"));
+        NVME_ROW("0Fh","Записи в журнале ошибок",szEL,(qwErrLog>0?"Внимание":"ОК"));
 
         safe_snprintf(szWCT,"%lu мин",(unsigned long)pLog->WarningCompTempTime);
-        NVME_ROW("13h","Время при высокой температуре",szWCT,(pLog->WarningCompTempTime>0?"Внимание":"ОК"));
+        NVME_ROW("--","Время при высокой температуре",szWCT,(pLog->WarningCompTempTime>0?"Внимание":"ОК"));
 
         safe_snprintf(szCCT,"%lu мин",(unsigned long)pLog->CriticalCompTempTime);
-        NVME_ROW("14h","Время при критической температуре",szCCT,(pLog->CriticalCompTempTime>0?"ПЛОХО":"ОК"));
-
-        {
-            char szHR[64], szHW[64], szBT[64];
-            safe_snprintf(szHR, "%llu", (unsigned long long)pInfo->qwNVMeHostReads);
-            NVME_ROW("--", "Команды чтения хоста", szHR, "ОК");
-            safe_snprintf(szHW, "%llu", (unsigned long long)pInfo->qwNVMeHostWrites);
-            NVME_ROW("--", "Команды записи хоста", szHW, "ОК");
-            safe_snprintf(szBT, "%llu мин", (unsigned long long)pInfo->qwNVMeControllerBusyTime);
-            NVME_ROW("--", "Занятость контроллера", szBT, "ОК");
-        }
+        NVME_ROW("--","Время при критической температуре",szCCT,(pLog->CriticalCompTempTime>0?"ПЛОХО":"ОК"));
         {
             int ts;
             for (ts = 0; ts < 8; ts++) {
@@ -2377,7 +2416,7 @@ static LRESULT CALLBACK AboutDlgProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM
                 DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                 CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
             SetPropA(hDlg, PROP_ABOUT_FONT_BOLD, (HANDLE)hFontBold);
-            HWND hName = CreateWindowExU8(0, "STATIC", "DriveMonitor 1.5.1-beta",
+            HWND hName = CreateWindowExU8(0, "STATIC", "DriveMonitor 1.5.2-beta",
                 WS_CHILD | WS_VISIBLE | SS_CENTER,
                 20, 58, cx - 40, 22,
                 hDlg, (HMENU)0, g_hInst, NULL);
@@ -2784,7 +2823,7 @@ void CreateControls(HWND hWnd)
     int nRightX = DRIVE_BTN_PANEL_W + 10;
     int nBarsW  = 190;
 
-    HWND hLabel = CreateWindowExU8(0, "STATIC", "СОСТОЯНИЕ ДИСКА",
+    HWND hLabel = CreateWindowExU8(0, "STATIC", "ДИСК / ОЦЕНКА",
         WS_CHILD | WS_VISIBLE | SS_LEFT,
         nRightX, 40, nBarsW, 14,
         hWnd, (HMENU)IDC_HEALTH_LABEL, g_hInst, NULL);
@@ -2792,24 +2831,24 @@ void CreateControls(HWND hWnd)
 
     g_hHealthBar = CreateWindowExU8(WS_EX_CLIENTEDGE, "LLHDHealthBar", "",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-        nRightX, 56, nBarsW, 40,
+        nRightX, 56, nBarsW, 48,
         hWnd, (HMENU)IDC_HEALTH_BAR_FRAME, g_hInst, NULL);
 
     { HWND h = CreateWindowExU8(0, "BUTTON", "Перечитать",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        nRightX, 102, 90, 24,
+        nRightX, 110, 90, 24,
         hWnd, (HMENU)IDC_REREAD_BTN, g_hInst, NULL);
       SendMessage(h, WM_SETFONT, (WPARAM)g_hFontSmall, TRUE); }
     { HWND h = CreateWindowExU8(0, "BUTTON", "Отчёт",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        nRightX + 100, 102, 90, 24,
+        nRightX + 100, 110, 90, 24,
         hWnd, (HMENU)IDC_REPORT_BTN, g_hInst, NULL);
       SendMessage(h, WM_SETFONT, (WPARAM)g_hFontSmall, TRUE); }
 
     {
         HWND hAxis = CreateWindowExU8(0, "STATIC", "",
             WS_CHILD | WS_VISIBLE | SS_LEFT,
-            nRightX, 132, nBarsW, 72,
+            nRightX, 140, nBarsW, 64,
             hWnd, (HMENU)IDC_AXIS_STATIC, g_hInst, NULL);
         SendMessage(hAxis, WM_SETFONT, (WPARAM)g_hFontSmall, TRUE);
     }
@@ -3286,14 +3325,14 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
             HWND hHl = GetDlgItem(hWnd, IDC_HEALTH_LABEL);
             if (hHl) SetWindowPos(hHl, NULL, nRightX, 40, nBarsW, 14, SWP_NOZORDER);
-            if (g_hHealthBar) SetWindowPos(g_hHealthBar, NULL, nRightX, 56, nBarsW, 40, SWP_NOZORDER);
+            if (g_hHealthBar) SetWindowPos(g_hHealthBar, NULL, nRightX, 56, nBarsW, 48, SWP_NOZORDER);
             {
                 HWND hReread = GetDlgItem(hWnd, IDC_REREAD_BTN);
                 HWND hReport = GetDlgItem(hWnd, IDC_REPORT_BTN);
-                if (hReread) SetWindowPos(hReread, NULL, nRightX, 102, 90, 24, SWP_NOZORDER);
-                if (hReport) SetWindowPos(hReport, NULL, nRightX + 100, 102, 90, 24, SWP_NOZORDER);
+                if (hReread) SetWindowPos(hReread, NULL, nRightX, 110, 90, 24, SWP_NOZORDER);
+                if (hReport) SetWindowPos(hReport, NULL, nRightX + 100, 110, 90, 24, SWP_NOZORDER);
                 HWND hAxis = GetDlgItem(hWnd, IDC_AXIS_STATIC);
-                if (hAxis) SetWindowPos(hAxis, NULL, nRightX, 132, nBarsW, 72, SWP_NOZORDER);
+                if (hAxis) SetWindowPos(hAxis, NULL, nRightX, 140, nBarsW, 64, SWP_NOZORDER);
             }
 
             int nLblW2  = 100;

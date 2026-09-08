@@ -409,6 +409,7 @@ typedef struct _DRIVE_INFO {
     BOOL        bSMART_Enabled;
     int         nHealthPercent;  /* remaining life 0-100, or -1; not a fake Health% */
     BOOL        bPredictFailure;
+    BOOL        bGotReturnStatus; /* SMART RETURN STATUS / SCSI INFO EXCEPTIONS */
     int         nDriveIndex;
     BOOL        bIsUSB;
     DRIVE_TYPE  eType;
@@ -437,7 +438,8 @@ typedef struct _DRIVE_INFO {
     DWORD       dwErrLogSense;
 
     /* ---- New fields  ---- */
-    DRIVE_HEALTH_STATUS eHealthStatus;   /* Good / Caution / Bad */
+    DRIVE_HEALTH_STATUS eHealthStatus;   /* our assessment */
+    DRIVE_HEALTH_STATUS eDiskStatus;     /* drive's own SMART: RETURN STATUS / NVMe Critical Warning */
     int         nConfidence;          /* 0-100 overall weighted blend, 0 if no SMART */
     int         nConfCompleteness;    /* SMART + thresh + temp + media counters */
     int         nConfTransport;       /* native 100, USB SMART-ok 90, USB-no-SMART 40 */
@@ -640,6 +642,7 @@ void  AssessDriveHealth(DRIVE_INFO* pInfo);
 void  FormatHealthLecture(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen);
 void  FormatHealthLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen);
 void  FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen);
+void  FormatHddObservePrompt(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen);
 const char* GetTempBandName(TEMP_BAND eBand, BOOL bLowercase);
 void  FormatPowerOnHours(DWORD dwHours, char* szBuf, int nBufLen);
 BOOL  DriveTreatsC0AsPowerLoss(const DRIVE_INFO* pInfo);
@@ -659,6 +662,9 @@ BOOL  IsLikelyUsbFlashDrive(const DRIVE_INFO* pInfo);
 void  FormatSize(DWORD dwMB, char* szBuf, int nBufLen);
 DWORD GetRawValue(const BYTE* pRaw);
 unsigned __int64 GetRawValue48(const BYTE* pRaw);
+/* Seagate ID 1/7/195: low 32 = operations, high 16 = errors (SMART attrib spec). */
+DWORD    SeagateRateOps(const BYTE* pRaw);
+unsigned SeagateRateErrs(const BYTE* pRaw);
 
 #ifdef __cplusplus
 }
