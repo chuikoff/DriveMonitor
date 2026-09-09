@@ -1534,7 +1534,8 @@ enum {
     ATTRST_DIM,
     ATTRST_SKIP,
     ATTRST_INFO,
-    ATTRST_RISK
+    ATTRST_RISK,
+    ATTRST_PAST
 };
 
 static LPARAM AttrStatusParam(const char* s)
@@ -1559,6 +1560,8 @@ static LPARAM AttrStatusParam(const char* s)
         return (LPARAM)ATTRST_INFO;
     if (strcmp(s, "Риск") == 0)
         return (LPARAM)ATTRST_RISK;
+    if (strcmp(s, "было") == 0)
+        return (LPARAM)ATTRST_PAST;
     return (LPARAM)ATTRST_NONE;
 }
 
@@ -3358,6 +3361,10 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                         case ATTRST_SKIP:
                             clrBadgeBg = RGB(148, 163, 184);
                             psz = "Не оценивается";
+                            break;
+                        case ATTRST_PAST:
+                            clrBadgeBg = RGB(100, 116, 139);
+                            psz = "было";
                             break;
                         case ATTRST_INFO:
                             clrBadgeBg = RGB(71, 99, 128);

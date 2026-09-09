@@ -6218,14 +6218,18 @@ void ExtractSSDIndicators(DRIVE_INFO* pInfo)
             if (pInfo->nSSDTotalWritesGB < 0)
                 pInfo->nSSDTotalWritesGB = (int)GetRawValue(pA->bRawValue);
             break;
-        /* Host writes: 48-bit LBA count (512 B). Skip tiny RAWs (vendor packing). */
+        /* Host writes. Phison 241/242 RAW is already host GB, not LBA. */
         case 0xF1:
         case 0xF3: {
-            unsigned __int64 nLBA, nGiB;
+            unsigned __int64 nRaw, nGiB;
             if (pInfo->nSSDTotalWritesGB >= 0) break;
-            nLBA = GetRawValue48(pA->bRawValue);
-            if (nLBA < 2048ULL) break;
-            nGiB = nLBA / (1024ULL * 1024ULL * 2ULL);
+            nRaw = GetRawValue48(pA->bRawValue);
+            if (IsPhisonFamily(pInfo) && (pA->bAttrID == 0xF1 || pA->bAttrID == 0xF2)) {
+                nGiB = nRaw;
+            } else {
+                if (nRaw < 2048ULL) break;
+                nGiB = nRaw / (1024ULL * 1024ULL * 2ULL);
+            }
             if (nGiB > 4000000ULL) nGiB = 4000000ULL;
             pInfo->nSSDTotalWritesGB = (int)nGiB;
             break;
