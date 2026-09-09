@@ -152,6 +152,7 @@ static BOOL NVMeOverUSBTryAll(HANDLE hDrive, DRIVE_INFO* pInfo);
 static BOOL NvmeIntelRstAdmin(HANDLE hDrive, DWORD opcode, DWORD nsid, DWORD cdw10, BYTE* pOut, DWORD dwOut);
 static BOOL IsRealtekNvmeUsbBridge(const DRIVE_INFO* pInfo);
 static void CopyNvmeIdentBuf(DRIVE_INFO* pInfo, const BYTE* pBuf, DWORD nAvail);
+static void TryNvmeLifetimeTemp(HANDLE hDrive, DRIVE_INFO* pInfo);
 
 #pragma pack(push, 1)
 typedef struct _CDI_NVME_QUERY_BUF {
@@ -164,9 +165,56 @@ typedef struct _CDI_NVME_QUERY_BUF {
 
 static DWORD g_dwLastNvmeQueryErr;
 
-/* NVMe Identify Controller byte offset 80 is VER (spec):
- * bits 31:16 major, 15:8 minor, 7:0 tertiary. Named fields of
- * NVME_IDENTIFY_CONTROLLER are misaligned — read the raw copy. */
+/* NVMe Identify Controller spec offsets. Named NVME_IDENTIFY_CONTROLLER
+ * fields after byte 75 are misaligned (OACS is spec 256, WCTEMP 266) —
+ * always read the raw Identify copy. */
+#define NVME_IDENT_VER_OFF     80
+#define NVME_IDENT_WCTEMP_OFF  266
+#define NVME_IDENT_CCTEMP_OFF  268
+
+static DWORD NvmeIdentVerDword(const BYTE* id, DWORD n)
+{
+    if (!id || n < (NVME_IDENT_VER_OFF + 4)) return 0;
+    return (DWORD)id[NVME_IDENT_VER_OFF] |
+           ((DWORD)id[NVME_IDENT_VER_OFF + 1] << 8) |
+           ((DWORD)id[NVME_IDENT_VER_OFF + 2] << 16) |
+           ((DWORD)id[NVME_IDENT_VER_OFF + 3] << 24);
+}
+
+/* Higher is better. VER present (~1000) beats a 72-byte SN/MN/FR stub. */
+static DWORD NvmeIdentQuality(const BYTE* p, DWORD n)
+{
+    DWORD q = 0, ver;
+    WORD wctemp;
+    if (!p || n < 8) return 0;
+    if (IsBufferAllZero(p, n > 16 ? 16 : (int)n)) return 0;
+    if (n >= 72) q += 10;
+    if (n >= 84) {
+        ver = NvmeIdentVerDword(p, n);
+        if (ver != 0) q += 1000;
+        q += 10;
+    }
+    if (n >= (NVME_IDENT_CCTEMP_OFF + 2)) {
+        wctemp = (WORD)p[NVME_IDENT_WCTEMP_OFF] |
+                 ((WORD)p[NVME_IDENT_WCTEMP_OFF + 1] << 8);
+        if (wctemp >= 274 && wctemp <= 400) q += 100;
+        q += 10;
+    }
+    return q;
+}
+
+static void FillNvmeTempThresholdsFromIdent(DRIVE_INFO* pInfo, DWORD nCopied)
+{
+    const BYTE* id;
+    if (!pInfo) return;
+    id = (const BYTE*)&pInfo->nvmeIdent;
+    if (nCopied < (NVME_IDENT_CCTEMP_OFF + 2)) return;
+    pInfo->wNVMeWarnTempThreshold =
+        (WORD)id[NVME_IDENT_WCTEMP_OFF] | ((WORD)id[NVME_IDENT_WCTEMP_OFF + 1] << 8);
+    pInfo->wNVMeCritTempThreshold =
+        (WORD)id[NVME_IDENT_CCTEMP_OFF] | ((WORD)id[NVME_IDENT_CCTEMP_OFF + 1] << 8);
+}
+
 static void FillNvmeProtocolFromIdent(DRIVE_INFO* pInfo)
 {
     const BYTE* id;
@@ -174,15 +222,22 @@ static void FillNvmeProtocolFromIdent(DRIVE_INFO* pInfo)
     unsigned maj, minr, ter;
     if (!pInfo) return;
     id = (const BYTE*)&pInfo->nvmeIdent;
-    ver = (DWORD)id[80] | ((DWORD)id[81] << 8) |
-          ((DWORD)id[82] << 16) | ((DWORD)id[83] << 24);
-    if (ver == 0) {
-        safe_snprintf(pInfo->szProtocol, "NVMe");
-        return;
-    }
+    ver = NvmeIdentVerDword(id, 4096);
     maj  = (ver >> 16) & 0xFFFF;
     minr = (ver >> 8) & 0xFF;
     ter  = ver & 0xFF;
+    /* Some adapters store MJR.MNR.TER as bytes 80,81,82 instead of LE DWORD. */
+    if (maj == 0 && id[NVME_IDENT_VER_OFF] >= 1 && id[NVME_IDENT_VER_OFF] <= 2) {
+        maj  = id[NVME_IDENT_VER_OFF];
+        minr = id[NVME_IDENT_VER_OFF + 1];
+        ter  = id[NVME_IDENT_VER_OFF + 2];
+    }
+    if (maj < 1 || maj > 2) {
+        /* Keep a model-table fallback such as "NVMe 1.4.0". */
+        if (pInfo->szProtocol[0] == '\0')
+            safe_snprintf(pInfo->szProtocol, "NVMe");
+        return;
+    }
     safe_snprintf(pInfo->szProtocol, "NVMe %u.%u.%u", maj, minr, ter);
 }
 
@@ -193,8 +248,9 @@ static void FillAtaProtocolFromIdent(DRIVE_INFO* pInfo, const WORD* pIdent)
     if (!pInfo || !pIdent) return;
     w76 = pIdent[76];
     w77 = pIdent[77];
-    /* Word 77 bits 3:1 = negotiated SATA speed (1=Gen1, 2=Gen2, 3=Gen3). */
-    neg = (unsigned)((w77 >> 1) & 0x7);
+    /* USB: word 77 is the dongle's negotiated speed, not the disk.
+     * Use word 76 (supported) for the disk, prefix USB later. */
+    neg = pInfo->bIsUSB ? 0 : (unsigned)((w77 >> 1) & 0x7);
     if (neg == 3)
         safe_snprintf(pInfo->szProtocol, "SATA 6 Гбит/с");
     else if (neg == 2)
@@ -216,6 +272,29 @@ static void FillAtaProtocolFromIdent(DRIVE_INFO* pInfo, const WORD* pIdent)
     }
 }
 
+static void PrefixUsbProtocol(DRIVE_INFO* pInfo)
+{
+    char disk[64];
+    const char* pre = "USB";
+    char hay[384];
+    if (!pInfo || !pInfo->bIsUSB || !pInfo->szProtocol[0])
+        return;
+    if (strncmp(pInfo->szProtocol, "USB", 3) == 0)
+        return;
+    lstrcpynA(disk, pInfo->szProtocol, (int)sizeof(disk));
+    safe_snprintf(hay, "%s %s %s",
+              pInfo->szModel, pInfo->szBridgeVendor, pInfo->szBridgeProduct);
+    if (IsRealtekNvmeUsbBridge(pInfo) ||
+        pInfo->eUsbBridgeType == USB_BRIDGE_NVME_REALTEK ||
+        strstr(hay, "RTL9210") || strstr(hay, "RTL921"))
+        pre = "USB RTL9210";
+    else if (pInfo->bIsNVMe)
+        pre = "USB";
+    else
+        pre = "USB SAT";
+    safe_snprintf(pInfo->szProtocol, "%s · %s", pre, disk);
+}
+
 /* Final protocol string after type / SMART / NVMe ident are known. */
 static void FillDriveProtocol(DRIVE_INFO* pInfo)
 {
@@ -228,6 +307,7 @@ static void FillDriveProtocol(DRIVE_INFO* pInfo)
         } else if (pInfo->szProtocol[0] == '\0') {
             safe_snprintf(pInfo->szProtocol, "NVMe");
         }
+        PrefixUsbProtocol(pInfo);
         return;
     }
 
@@ -243,25 +323,26 @@ static void FillDriveProtocol(DRIVE_INFO* pInfo)
         return;
     }
 
-    if (pInfo->szProtocol[0] &&
-        (strncmp(pInfo->szProtocol, "SATA", 4) == 0 ||
-         strcmp(pInfo->szProtocol, "ATA") == 0))
-        return;
+    if (!(pInfo->szProtocol[0] &&
+          (strncmp(pInfo->szProtocol, "SATA", 4) == 0 ||
+           strcmp(pInfo->szProtocol, "ATA") == 0))) {
+        if (pInfo->eType == DRIVE_TYPE_HDD ||
+            pInfo->eType == DRIVE_TYPE_SSD_SATA ||
+            pInfo->eType == DRIVE_TYPE_M2_SATA)
+            safe_snprintf(pInfo->szProtocol, "SATA");
+        else if (pInfo->eType == DRIVE_TYPE_EMMC)
+            safe_snprintf(pInfo->szProtocol, "eMMC");
+        else if (pInfo->eType == DRIVE_TYPE_SD)
+            safe_snprintf(pInfo->szProtocol, "SD");
+        else if (pInfo->eType == DRIVE_TYPE_SCSI)
+            safe_snprintf(pInfo->szProtocol, "SCSI");
+        else if (pInfo->bIsUSB)
+            safe_snprintf(pInfo->szProtocol, "USB");
+        else if (pInfo->szProtocol[0] == '\0')
+            safe_snprintf(pInfo->szProtocol, "ATA");
+    }
 
-    if (pInfo->eType == DRIVE_TYPE_HDD ||
-        pInfo->eType == DRIVE_TYPE_SSD_SATA ||
-        pInfo->eType == DRIVE_TYPE_M2_SATA)
-        safe_snprintf(pInfo->szProtocol, "SATA");
-    else if (pInfo->eType == DRIVE_TYPE_EMMC)
-        safe_snprintf(pInfo->szProtocol, "eMMC");
-    else if (pInfo->eType == DRIVE_TYPE_SD)
-        safe_snprintf(pInfo->szProtocol, "SD");
-    else if (pInfo->eType == DRIVE_TYPE_SCSI)
-        safe_snprintf(pInfo->szProtocol, "SCSI");
-    else if (pInfo->bIsUSB)
-        safe_snprintf(pInfo->szProtocol, "USB");
-    else if (pInfo->szProtocol[0] == '\0')
-        safe_snprintf(pInfo->szProtocol, "ATA");
+    PrefixUsbProtocol(pInfo);
 }
 
 /* memcpy Identify Controller without overreading a 4096-byte page. */
@@ -273,10 +354,11 @@ static void CopyNvmeIdentBuf(DRIVE_INFO* pInfo, const BYTE* pBuf, DWORD nAvail)
     if (n > nAvail) n = nAvail;
     if (n > 4096) n = 4096;
     memcpy(&pInfo->nvmeIdent, pBuf, n);
-    if (n >= 84)
-        FillNvmeProtocolFromIdent(pInfo);
-    else
-        safe_snprintf(pInfo->szProtocol, "NVMe");
+    if (n < (DWORD)sizeof(NVME_IDENTIFY_CONTROLLER))
+        ZeroMemory((BYTE*)&pInfo->nvmeIdent + n,
+                   sizeof(NVME_IDENTIFY_CONTROLLER) - n);
+    FillNvmeProtocolFromIdent(pInfo);
+    FillNvmeTempThresholdsFromIdent(pInfo, n);
 }
 
 /* Realtek RTL9210 USB dual-mode enclosure (NVMe via 0xE4, SATA via SAT).
@@ -308,13 +390,22 @@ static BOOL IsRealtekNvmeUsbBridge(const DRIVE_INFO* p)
 static BOOL QueryNVMeProtocolOnHandle(HANDLE h, ULONG dataType, ULONG requestValue,
                                       BYTE* pOut, DWORD dwOutLen, DWORD* pdwCopied)
 {
-    const ULONG propertyIds[2] = {
-        (ULONG)StorageAdapterProtocolSpecificProperty,
-        (ULONG)StorageDeviceProtocolSpecificProperty
-    };
+    /* Identify Controller is adapter-level. Device Identify is often a
+     * 72-byte SN/MN/FR stub (VER at 80 = 0). Health log: Device first. */
+    ULONG propertyIds[2];
+    if (dataType == MY_NVMeDataTypeIdentify) {
+        propertyIds[0] = (ULONG)StorageAdapterProtocolSpecificProperty;
+        propertyIds[1] = (ULONG)StorageDeviceProtocolSpecificProperty;
+    } else {
+        propertyIds[0] = (ULONG)StorageDeviceProtocolSpecificProperty;
+        propertyIds[1] = (ULONG)StorageAdapterProtocolSpecificProperty;
+    }
     ULONG subValues[3];
     ULONG lengths[2];
     int nSub, nLen, ip, isv, il;
+    BYTE bestIdent[4096];
+    DWORD bestCopied = 0, bestQ = 0;
+    BOOL stop = FALSE;
 
     if (dataType == MY_NVMeDataTypeLogPage) {
         subValues[0] = 0;
@@ -332,17 +423,23 @@ static BOOL QueryNVMeProtocolOnHandle(HANDLE h, ULONG dataType, ULONG requestVal
         nLen = 1;
     }
 
-    for (ip = 0; ip < 2; ip++) {
-        for (isv = 0; isv < nSub; isv++) {
-            for (il = 0; il < nLen; il++) {
+    ZeroMemory(bestIdent, sizeof(bestIdent));
+
+    for (ip = 0; ip < 2 && !stop; ip++) {
+        for (isv = 0; isv < nSub && !stop; isv++) {
+            for (il = 0; il < nLen && !stop; il++) {
                 CDI_NVME_QUERY_BUF* q = (CDI_NVME_QUERY_BUF*)HeapAlloc(
                     GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(CDI_NVME_QUERY_BUF));
                 DWORD dwBytes = 0;
                 BYTE* pData;
-                DWORD avail;
-                ULONG off;
+                const BYTE* src;
+                DWORD avail, copyLen;
+                ULONG off, reported;
 
-                if (!q) return FALSE;
+                if (!q) {
+                    if (bestCopied >= 8) break;
+                    return FALSE;
+                }
 
                 q->PropertyId = propertyIds[ip];
                 q->QueryType  = 0;
@@ -366,24 +463,62 @@ static BOOL QueryNVMeProtocolOnHandle(HANDLE h, ULONG dataType, ULONG requestVal
                 if (pData < (BYTE*)q || pData >= (BYTE*)q + sizeof(*q))
                     pData = q->Buffer;
                 avail = (DWORD)(((BYTE*)q + sizeof(*q)) - pData);
-                if (avail > dwOutLen) avail = dwOutLen;
+                reported = q->ProtocolSpecific.ProtocolDataLength;
+                copyLen = avail;
+                if (reported > 0 && reported < copyLen) copyLen = reported;
+                if (copyLen > dwOutLen) copyLen = dwOutLen;
 
-                if (avail >= 8 && !IsBufferAllZero(pData, avail > 16 ? 16 : (int)avail)) {
-                    memcpy(pOut, pData, avail);
-                    if (pdwCopied) *pdwCopied = avail;
-                    HeapFree(GetProcessHeap(), 0, q);
-                    return TRUE;
+                src = NULL;
+                if (copyLen >= 8 && !IsBufferAllZero(pData, copyLen > 16 ? 16 : (int)copyLen)) {
+                    src = pData;
+                } else if (!IsBufferAllZero(q->Buffer, 16)) {
+                    src = q->Buffer;
+                    copyLen = dwOutLen < 4096 ? dwOutLen : 4096;
+                    if (reported > 0 && reported < copyLen) copyLen = reported;
                 }
-                if (!IsBufferAllZero(q->Buffer, 16)) {
-                    avail = dwOutLen < 4096 ? dwOutLen : 4096;
-                    memcpy(pOut, q->Buffer, avail);
-                    if (pdwCopied) *pdwCopied = avail;
+                if (!src) {
                     HeapFree(GetProcessHeap(), 0, q);
-                    return TRUE;
+                    continue;
                 }
+
+                if (dataType == MY_NVMeDataTypeIdentify) {
+                    DWORD qq = NvmeIdentQuality(src, copyLen);
+                    if (qq > bestQ) {
+                        DWORD n = copyLen < 4096 ? copyLen : 4096;
+                        memcpy(bestIdent, src, n);
+                        bestCopied = n;
+                        bestQ = qq;
+                    }
+                    /* Also score the trailing Buffer[]: some drivers ignore
+                     * the ProtocolDataOffset they themselves returned. */
+                    {
+                        DWORD nBuf = dwOutLen < 4096 ? dwOutLen : 4096;
+                        if (reported > 0 && reported < nBuf) nBuf = reported;
+                        qq = NvmeIdentQuality(q->Buffer, nBuf);
+                        if (qq > bestQ) {
+                            memcpy(bestIdent, q->Buffer, nBuf);
+                            bestCopied = nBuf;
+                            bestQ = qq;
+                        }
+                    }
+                    HeapFree(GetProcessHeap(), 0, q);
+                    if (bestQ >= 1000) stop = TRUE;
+                    continue;
+                }
+
+                memcpy(pOut, src, copyLen);
+                if (pdwCopied) *pdwCopied = copyLen;
                 HeapFree(GetProcessHeap(), 0, q);
+                return TRUE;
             }
         }
+    }
+
+    if (bestCopied >= 8) {
+        DWORD n = bestCopied < dwOutLen ? bestCopied : dwOutLen;
+        memcpy(pOut, bestIdent, n);
+        if (pdwCopied) *pdwCopied = n;
+        return TRUE;
     }
     return FALSE;
 }
@@ -395,9 +530,16 @@ static BOOL QueryNVMeProtocol(HANDLE hDrive, ULONG dataType, ULONG requestValue,
     DWORD dwBytes = 0;
     HANDLE hScsi;
     char szScsi[32];
+    BOOL okDrive;
 
     g_dwLastNvmeQueryErr = 0;
-    if (QueryNVMeProtocolOnHandle(hDrive, dataType, requestValue, pOut, dwOutLen, pdwCopied))
+    okDrive = QueryNVMeProtocolOnHandle(hDrive, dataType, requestValue,
+                                        pOut, dwOutLen, pdwCopied);
+
+    /* A 72-byte SN/MN/FR stub still counts as success. For Identify, keep
+     * going to \\.\ScsiN: — that is where full VER/WCTEMP often live. */
+    if (okDrive && (dataType != MY_NVMeDataTypeIdentify ||
+                    NvmeIdentVerDword(pOut, pdwCopied ? *pdwCopied : 0) != 0))
         return TRUE;
 
     ZeroMemory(&addr, sizeof(addr));
@@ -409,17 +551,30 @@ static BOOL QueryNVMeProtocol(HANDLE hDrive, ULONG dataType, ULONG requestValue,
             FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
             FILE_ATTRIBUTE_NORMAL, NULL);
         if (hScsi != INVALID_HANDLE_VALUE) {
-            BOOL ok = QueryNVMeProtocolOnHandle(hScsi, dataType, requestValue,
-                                                pOut, dwOutLen, pdwCopied);
+            BYTE scsiBuf[4096];
+            DWORD nScsi = 0;
+            BOOL okScsi;
+            ZeroMemory(scsiBuf, sizeof(scsiBuf));
+            okScsi = QueryNVMeProtocolOnHandle(hScsi, dataType, requestValue,
+                                               scsiBuf, sizeof(scsiBuf), &nScsi);
             CloseHandle(hScsi);
-            if (ok) return TRUE;
+            if (okScsi) {
+                if (!okDrive ||
+                    NvmeIdentQuality(scsiBuf, nScsi) >
+                        NvmeIdentQuality(pOut, pdwCopied ? *pdwCopied : 0)) {
+                    DWORD n = nScsi < dwOutLen ? nScsi : dwOutLen;
+                    memcpy(pOut, scsiBuf, n);
+                    if (pdwCopied) *pdwCopied = n;
+                }
+                return TRUE;
+            }
         } else if (g_dwLastNvmeQueryErr == 0) {
             g_dwLastNvmeQueryErr = GetLastError();
         }
     } else if (g_dwLastNvmeQueryErr == 0) {
         g_dwLastNvmeQueryErr = GetLastError();
     }
-    return FALSE;
+    return okDrive;
 }
 
 static void TrimStr(char* sz)
@@ -1206,6 +1361,19 @@ const char* GetHealthStatusName(DRIVE_HEALTH_STATUS eStatus)
     }
 }
 
+const char* GetDiskStatusName(const DRIVE_INFO* p)
+{
+    if (!p)
+        return "НЕИЗВЕСТНО";
+    if (p->eDiskStatus != HEALTH_STATUS_UNKNOWN)
+        return GetHealthStatusName(p->eDiskStatus);
+    if (p->bIsUSB && p->bSMART_Supported)
+        return "нет статуса моста";
+    if (p->bIsUSB)
+        return "нет SMART";
+    return "НЕИЗВЕСТНО";
+}
+
 const char* GetVendorName(DRIVE_VENDOR eVendor)
 {
     switch (eVendor) {
@@ -1229,6 +1397,10 @@ const char* GetVendorName(DRIVE_VENDOR eVendor)
     case VENDOR_GOODRAM:       return "GOODRAM";
     case VENDOR_PLEXTOR:       return "Plextor";
     case VENDOR_OCZ:           return "OCZ";
+    case VENDOR_UTANIA:        return "Utania";
+    case VENDOR_PATRIOT:       return "Patriot";
+    case VENDOR_MSI:           return "MSI";
+    case VENDOR_RADEON:        return "Radeon";
     case VENDOR_OTHER:         return "Other";
     default:                   return "Unknown";
     }
@@ -1258,17 +1430,11 @@ const char* GetControllerName(DRIVE_CONTROLLER eController)
     }
 }
 
-const char* GetNandName(NAND_VENDOR eNand)
+const char* DriveControllerLabel(const DRIVE_INFO* p)
 {
-    switch (eNand) {
-    case NAND_SAMSUNG: return "Samsung";
-    case NAND_MICRON:  return "Micron";
-    case NAND_KIOXIA:  return "Kioxia";
-    case NAND_HYNIX:   return "SK Hynix";
-    case NAND_INTEL:   return "Intel";
-    case NAND_SANDISK: return "SanDisk";
-    default:           return "—";
-    }
+    if (p && p->szControllerChip[0])
+        return p->szControllerChip;
+    return GetControllerName(p ? p->eController : CONTROLLER_UNKNOWN);
 }
 
 /* ============================================================
@@ -1305,6 +1471,11 @@ DRIVE_VENDOR DetectDriveVendor(const char* szModel)
         strstr(szUpper, "WD80") || strstr(szUpper, "WD10"))
         return VENDOR_WDC;
 
+    if (strstr(szUpper, "UTANIA") || strstr(szUpper, "MR102") ||
+        (szUpper[0] == 'O' && szUpper[1] == 'O' && szUpper[2] == 'S' &&
+         szUpper[3] >= '0' && szUpper[3] <= '9'))
+        return VENDOR_UTANIA;
+
     if (szUpper[0] == 'S' && szUpper[1] == 'T' &&
         szUpper[2] >= '0' && szUpper[2] <= '9')
         return VENDOR_SEAGATE;
@@ -1320,7 +1491,8 @@ DRIVE_VENDOR DetectDriveVendor(const char* szModel)
     if (strstr(szUpper, "HITACHI") || strstr(szUpper, "HGST") ||
         strstr(szUpper, "HUA") || strstr(szUpper, "HDT") ||
         strstr(szUpper, "HDP") || strstr(szUpper, "HCS") ||
-        strstr(szUpper, "IC") || strstr(szUpper, "HTS") ||
+        strstr(szUpper, "IC25") || strstr(szUpper, "IC35") ||
+        strstr(szUpper, "HTS") ||
         strstr(szUpper, "HMS") || strstr(szUpper, "HUH"))
         return VENDOR_HITACHI;
 
@@ -1386,6 +1558,19 @@ DRIVE_VENDOR DetectDriveVendor(const char* szModel)
     if (strstr(szUpper, "OCZ") || strstr(szUpper, "VERTEX") ||
         strstr(szUpper, "AGILITY"))
         return VENDOR_OCZ;
+
+    if (strstr(szUpper, "PATRIOT") || strstr(szUpper, "P210") ||
+        strstr(szUpper, "P300") || strstr(szUpper, "P400"))
+        return VENDOR_PATRIOT;
+
+    if (strstr(szUpper, "MSI") || strstr(szUpper, "SPATIUM") ||
+        strstr(szUpper, "M450") || strstr(szUpper, "M390") ||
+        strstr(szUpper, "M480"))
+        return VENDOR_MSI;
+
+    if (strstr(szUpper, "RADEON") || strstr(szUpper, "R5SL") ||
+        strstr(szUpper, "R3SL") || strstr(szUpper, "R7SL"))
+        return VENDOR_RADEON;
 
     /* If model has SSD keyword but vendor unknown */
     if (strstr(szUpper, "SSD") || strstr(szUpper, "NVME"))
@@ -1465,6 +1650,18 @@ static DRIVE_CONTROLLER ControllerFromNvmeVid(USHORT vid)
     }
 }
 
+static BOOL ModelHasChipToken(const char* u, const char* tok)
+{
+    const char* p;
+    if (!u || !tok || !tok[0]) return FALSE;
+    for (p = u; (p = strstr(p, tok)) != NULL; p++) {
+        if (p != u && isalnum((unsigned char)p[-1]))
+            continue;
+        return TRUE;
+    }
+    return FALSE;
+}
+
 static DRIVE_CONTROLLER DetectDriveController(const DRIVE_INFO* p)
 {
     USHORT vid;
@@ -1493,6 +1690,10 @@ static DRIVE_CONTROLLER DetectDriveController(const DRIVE_INFO* p)
         }
     }
 
+    /* USB dongle/bridge with no disk SMART: model is the chip (ASM225), not the SSD. */
+    if (p->bIsUSB && !p->bSMART_Supported && !p->bIsNVMe)
+        return CONTROLLER_UNKNOWN;
+
     /* 2. Firmware / model strings (work even before SMART). */
     if (strncmp(szFwU, "HPS", 3) == 0 ||
         strncmp(szFwU, "SBFK", 4) == 0 ||
@@ -1501,11 +1702,18 @@ static DRIVE_CONTROLLER DetectDriveController(const DRIVE_INFO* p)
         strncmp(szFwU, "SBFB", 4) == 0 ||
         strncmp(szFwU, "ECFM", 4) == 0 ||
         strncmp(szFwU, "E8FM", 4) == 0 ||
-        strncmp(szFwU, "E7FM", 4) == 0)
+        strncmp(szFwU, "E7FM", 4) == 0 ||
+        strncmp(szFwU, "S9FM", 4) == 0 ||
+        strncmp(szFwU, "S8FM", 4) == 0 ||
+        strncmp(szFwU, "U11", 3) == 0 ||
+        strncmp(szFwU, "U10", 3) == 0 ||
+        strncmp(szFwU, "T07", 3) == 0 ||
+        strncmp(szFwU, "EJFM", 4) == 0)
         return CONTROLLER_PHISON;
 
-    if (strstr(szModelU, "SM226") || strstr(szModelU, "SM225") ||
-        strstr(szModelU, "SM232") || strstr(szModelU, "SM250") ||
+    /* Token match: "ASM225" must not count as SM225. */
+    if (ModelHasChipToken(szModelU, "SM226") || ModelHasChipToken(szModelU, "SM225") ||
+        ModelHasChipToken(szModelU, "SM232") || ModelHasChipToken(szModelU, "SM250") ||
         strstr(szFwU, "SM226") || strstr(szFwU, "SM225") ||
         strstr(szFwU, "SM232"))
         return CONTROLLER_SMI;
@@ -1580,36 +1788,84 @@ static DRIVE_CONTROLLER DetectDriveController(const DRIVE_INFO* p)
     return CONTROLLER_UNKNOWN;
 }
 
-static NAND_VENDOR DetectNandVendor(const DRIVE_INFO* p)
+/* Model/firmware → controller silicon. OEM PCI VID is the brand, not the ASIC. */
+static void ApplySsdPartIds(DRIVE_INFO* p)
 {
-    char szU[48];
-    if (!p) return NAND_UNKNOWN;
-    if (p->eType == DRIVE_TYPE_HDD)
-        return NAND_UNKNOWN;
-
-    ToUpperCopy(szU, sizeof(szU), p->szModel);
-
-    /* Conservative: only well-known Samsung consumer NAND. */
-    if (p->eVendor == VENDOR_SAMSUNG) {
-        if (strstr(szU, "MZ-") ||
-            (szU[0] == 'M' && szU[1] == 'Z' && szU[2] >= 'A' && szU[2] <= 'Z') ||
-            strstr(szU, "870") || strstr(szU, "860") ||
-            strstr(szU, "850") ||
-            strstr(szU, "980") || strstr(szU, "990") ||
-            ((strstr(szU, "EVO") || strstr(szU, "PRO")) &&
-             (strstr(szU, "SSD") || strstr(szU, "NVME"))))
-            return NAND_SAMSUNG;
+    static const struct {
+        const char* model;   /* substring of uppercase model */
+        const char* fw;      /* substring of uppercase firmware, NULL = any */
+        DRIVE_CONTROLLER ctl;
+        const char* chip;
+        const char* nvmeVer; /* "1.4.0" or NULL; used only if Identify VER is 0 */
+    } kTab[] = {
+        { "MICRON_2400", NULL, CONTROLLER_SMI,
+          "Silicon Motion SM2269XT", "1.4.0" },
+        { "2400_MTFD", NULL, CONTROLLER_SMI,
+          "Silicon Motion SM2269XT", "1.4.0" },
+        { "SX8200PNP", NULL, CONTROLLER_SMI,
+          "Silicon Motion SM2262EN/SM2262ENG/SM2262G", "1.3.0" },
+        { "SX8200 PRO", NULL, CONTROLLER_SMI,
+          "Silicon Motion SM2262EN/SM2262ENG/SM2262G", "1.3.0" },
+        { "SX8200PRO", NULL, CONTROLLER_SMI,
+          "Silicon Motion SM2262EN/SM2262ENG/SM2262G", "1.3.0" },
+        { "GAMMIX S11", NULL, CONTROLLER_SMI,
+          "Silicon Motion SM2262EN/SM2262ENG/SM2262G", "1.3.0" },
+        { "XPG S11", NULL, CONTROLLER_SMI,
+          "Silicon Motion SM2262EN/SM2262ENG/SM2262G", "1.3.0" },
+        { "SU800", NULL, CONTROLLER_SMI,
+          "Silicon Motion SM2258/SM2259", NULL },
+        { "GAMMIX S70", NULL, CONTROLLER_INNOGRIT,
+          "Innogrit IG5236", "1.4.0" },
+        { "P210", "U11", CONTROLLER_PHISON,
+          "Phison PS3111-S11", NULL },
+        { "BURST", "U11", CONTROLLER_PHISON,
+          "Phison PS3111-S11", NULL },
+        { "BURST", "U10", CONTROLLER_PHISON,
+          "Phison PS3110-S10", NULL },
+        { "", "U11", CONTROLLER_PHISON,
+          "Phison PS3111-S11", NULL },
+        { "", "U10", CONTROLLER_PHISON,
+          "Phison PS3110-S10", NULL },
+        { "", "S9FM", CONTROLLER_PHISON,
+          "Phison PS3109-S9", NULL },
+        { "", "T07", CONTROLLER_PHISON,
+          "Phison PS3111-S11", NULL },
+        { "", "EJFM", CONTROLLER_PHISON,
+          "Phison PS5016-E16", "1.3.0" },
+    };
+    char modelU[48], fwU[16];
+    unsigned i;
+    if (!p || p->eType == DRIVE_TYPE_HDD)
+        return;
+    ToUpperCopy(modelU, sizeof(modelU), p->szModel);
+    ToUpperCopy(fwU, sizeof(fwU), p->szFirmware);
+    for (i = 0; i < sizeof(kTab) / sizeof(kTab[0]); i++) {
+        if (kTab[i].model[0] && !strstr(modelU, kTab[i].model))
+            continue;
+        if (kTab[i].fw && !strstr(fwU, kTab[i].fw))
+            continue;
+        if (kTab[i].ctl != CONTROLLER_UNKNOWN)
+            p->eController = kTab[i].ctl;
+        if (kTab[i].chip)
+            safe_snprintf(p->szControllerChip, "%s", kTab[i].chip);
+        if (kTab[i].nvmeVer && p->bIsNVMe &&
+            (p->szProtocol[0] == '\0' || strcmp(p->szProtocol, "NVMe") == 0))
+            safe_snprintf(p->szProtocol, "NVMe %s", kTab[i].nvmeVer);
+        return;
     }
-
-    /* Intel 6xxp is often Intel/Micron mix — leave UNKNOWN.
-     * Never assume Kingston NAND=Kingston or ADATA NAND=ADATA. */
-    return NAND_UNKNOWN;
 }
 
 void IdentifyDriveParts(DRIVE_INFO* pInfo)
 {
     if (!pInfo) return;
+    pInfo->szControllerChip[0] = '\0';
     pInfo->eVendor     = DetectDriveVendor(pInfo->szModel);
+    if (pInfo->eVendor == VENDOR_UNKNOWN && pInfo->szFirmware[0]) {
+        char szFw[16];
+        ToUpperCopy(szFw, sizeof(szFw), pInfo->szFirmware);
+        if (strncmp(szFw, "OOS", 3) == 0)
+            pInfo->eVendor = VENDOR_UTANIA;
+    }
     /* USB dock + old IDENTIFY without word 217 still has HDD SMART. */
     if (pInfo->eType == DRIVE_TYPE_USB && !pInfo->bIsNVMe &&
         pInfo->wRotationRate != 0x0001 &&
@@ -1617,7 +1873,7 @@ void IdentifyDriveParts(DRIVE_INFO* pInfo)
          (HasSmartAttr(pInfo, 0xC1) && HasSmartAttr(pInfo, 0x07))))
         pInfo->eType = DRIVE_TYPE_HDD;
     pInfo->eController = DetectDriveController(pInfo);
-    pInfo->eNand       = DetectNandVendor(pInfo);
+    ApplySsdPartIds(pInfo);
 }
 
 /* ============================================================
@@ -3240,11 +3496,20 @@ BOOL GetNVMeIdentifyController(HANDLE hDrive, DRIVE_INFO* pInfo)
         return FALSE;
 
     if (!QueryNVMeProtocol(hDrive, MY_NVMeDataTypeIdentify, 1,
-                           ident, sizeof(ident), &nCopied) || nCopied < 72) {
-        nCopied = 4096;
-        if (!NvmeMiniportAdmin(hDrive, 6, 0, 1, ident, 4096) &&
-            !NvmeIntelRstAdmin(hDrive, 0x06, 0, 1, ident, 4096))
+                           ident, sizeof(ident), &nCopied) || nCopied < 72 ||
+        NvmeIdentVerDword(ident, nCopied) == 0) {
+        BYTE alt[4096];
+        ZeroMemory(alt, sizeof(alt));
+        if (NvmeMiniportAdmin(hDrive, 6, 0, 1, alt, 4096) ||
+            NvmeIntelRstAdmin(hDrive, 0x06, 0, 1, alt, 4096)) {
+            if (nCopied < 72 ||
+                NvmeIdentQuality(alt, 4096) > NvmeIdentQuality(ident, nCopied)) {
+                memcpy(ident, alt, 4096);
+                nCopied = 4096;
+            }
+        } else if (nCopied < 72) {
             return FALSE;
+        }
     }
 
     /* Store identify controller data (never more than the 4096-byte page). */
@@ -3263,10 +3528,6 @@ BOOL GetNVMeIdentifyController(HANDLE hDrive, DRIVE_INFO* pInfo)
     memcpy(pInfo->szFirmware, ident + 64, 8);
     pInfo->szFirmware[8] = '\0';
     TrimStr(pInfo->szFirmware);
-
-    /* Extract temperature thresholds */
-    pInfo->wNVMeWarnTempThreshold = ReadLE16(pInfo->nvmeIdent.WCTEMP);
-    pInfo->wNVMeCritTempThreshold = ReadLE16(pInfo->nvmeIdent.CCTEMP);
 
     return (pInfo->szModel[0] != '\0' || pInfo->szSerial[0] != '\0');
 }
@@ -3525,6 +3786,7 @@ static BOOL GetNVMeInfo(HANDLE hDrive, DRIVE_INFO* pInfo)
 
     if (GetNVMeHealthLogEx(hDrive, pInfo)) {
         ExtractNVMeExtendedInfo(pInfo);
+        TryNvmeLifetimeTemp(hDrive, pInfo);
     } else {
         GetSMARTViaLogSense(hDrive, pInfo);
     }
@@ -3858,7 +4120,6 @@ static BOOL MediaCountersClean(const DRIVE_INFO* p)
     if (p->nReallocated > 0) return FALSE;
     if (p->nPendingSectors > 0) return FALSE;
     if (p->nUncorrectable > 0) return FALSE;
-    if (p->nCrcErrors > 0) return FALSE;
     if (p->qwNVMeMediaErrors > 0) return FALSE;
     return TRUE;
 }
@@ -3949,15 +4210,49 @@ static void FormatUintGrouped(unsigned long n, char* buf, int nBuf)
     buf[o] = '\0';
 }
 
+static const char* RuCountWord(unsigned n, const char* one,
+                               const char* few, const char* many)
+{
+    unsigned n10 = n % 10;
+    unsigned n100 = n % 100;
+    if (n10 == 1 && n100 != 11) return one;
+    if (n10 >= 2 && n10 <= 4 && (n100 < 12 || n100 > 14)) return few;
+    return many;
+}
+
 void FormatPowerOnHours(DWORD dwHours, char* szBuf, int nBufLen)
 {
+    unsigned y, d, h;
+    char a[40], b[40], c[40];
+    int n = 0;
+    const char* p[3];
+
     if (!szBuf || nBufLen <= 0) return;
     if (dwHours == 0) {
         safe_snprintf_n(szBuf, nBufLen, "нет данных");
         return;
     }
-    safe_snprintf_n(szBuf, nBufLen, "%.2f года",
-                    (double)dwHours / 8760.0);
+    y = dwHours / 8760u;
+    d = (dwHours % 8760u) / 24u;
+    h = (dwHours % 8760u) % 24u;
+    if (y > 0) {
+        safe_snprintf(a, "%u %s", y, RuCountWord(y, "год", "года", "лет"));
+        p[n++] = a;
+    }
+    if (d > 0) {
+        safe_snprintf(b, "%u %s", d, RuCountWord(d, "день", "дня", "дней"));
+        p[n++] = b;
+    }
+    if (h > 0 || n == 0) {
+        safe_snprintf(c, "%u %s", h, RuCountWord(h, "час", "часа", "часов"));
+        p[n++] = c;
+    }
+    if (n == 1)
+        safe_snprintf_n(szBuf, nBufLen, "%s", p[0]);
+    else if (n == 2)
+        safe_snprintf_n(szBuf, nBufLen, "%s %s", p[0], p[1]);
+    else
+        safe_snprintf_n(szBuf, nBufLen, "%s %s %s", p[0], p[1], p[2]);
 }
 
 const char* GetTempBandName(TEMP_BAND eBand, BOOL bLowercase)
@@ -3979,12 +4274,27 @@ static void FormatTempLecture(const DRIVE_INFO* p, char* buf, int nBuf)
         safe_snprintf_n(buf, nBuf, "нет данных");
         return;
     }
-    warnC = p->bIsNVMe ? NvmeIdentifyTempC(p->wNVMeWarnTempThreshold) : -1;
-    critC = p->bIsNVMe ? NvmeIdentifyTempC(p->wNVMeCritTempThreshold) : -1;
-    if (warnC > 0 && critC > 0)
+    warnC = p->nTempWarnC > 0 ? p->nTempWarnC :
+            (p->bIsNVMe ? NvmeIdentifyTempC(p->wNVMeWarnTempThreshold) : -1);
+    critC = p->nTempCritC > 0 ? p->nTempCritC :
+            (p->bIsNVMe ? NvmeIdentifyTempC(p->wNVMeCritTempThreshold) : -1);
+    if (warnC > 0 && critC > 0 && p->nTempMaxC > 0)
+        safe_snprintf_n(buf, nBuf,
+            "%d °C · %s (макс. %d °C, пред. %d, крит. %d)",
+            p->nTemperatureC, GetTempBandName(p->eTempBand, TRUE),
+            p->nTempMaxC, warnC, critC);
+    else if (warnC > 0 && critC > 0)
         safe_snprintf_n(buf, nBuf, "%d °C · %s (пред. %d °C, крит. %d °C)",
                         p->nTemperatureC, GetTempBandName(p->eTempBand, TRUE),
                         warnC, critC);
+    else if (p->nTempMaxC > 0 && critC > 0)
+        safe_snprintf_n(buf, nBuf, "%d °C · %s (макс. %d, крит. %d)",
+                        p->nTemperatureC, GetTempBandName(p->eTempBand, TRUE),
+                        p->nTempMaxC, critC);
+    else if (p->nTempMaxC > 0)
+        safe_snprintf_n(buf, nBuf, "%d °C · %s (макс. зафиксированная %d °C)",
+                        p->nTemperatureC, GetTempBandName(p->eTempBand, TRUE),
+                        p->nTempMaxC);
     else if (warnC > 0)
         safe_snprintf_n(buf, nBuf, "%d °C · %s (пред. %d °C)",
                         p->nTemperatureC, GetTempBandName(p->eTempBand, TRUE),
@@ -4426,6 +4736,85 @@ static void AssessSsdHealth(DRIVE_INFO* pInfo)
         pInfo->eHealthStatus = WorstHealth(pInfo->eHealthStatus, HEALTH_STATUS_OBSERVE);
 }
 
+/* ATA 194/190 extra bytes often hold lifetime min/max. NVMe: Identify
+ * WCTEMP/CCTEMP are the safe limits; log 0xCA sometimes has lifetime max. */
+static void FillTempExtrema(DRIVE_INFO* p)
+{
+    int i;
+    if (!p) return;
+    p->nTempWarnC = -1;
+    p->nTempCritC = -1;
+    if (p->bIsNVMe) {
+        p->nTempWarnC = NvmeIdentifyTempC(p->wNVMeWarnTempThreshold);
+        p->nTempCritC = NvmeIdentifyTempC(p->wNVMeCritTempThreshold);
+    }
+    for (i = 0; i < 30; i++) {
+        const SMART_ATTRIBUTE* a = &p->attrData.stAttributes[i];
+        int nMin, nMax;
+        if (a->bAttrID != 0xC2 && a->bAttrID != 0xBE)
+            continue;
+        nMin = (int)a->bRawValue[2];
+        nMax = (int)a->bRawValue[4];
+        if (nMax >= 1 && nMax <= 125 &&
+            p->nTemperatureC > 0 && nMax >= p->nTemperatureC) {
+            if (p->nTempMaxC < 0 || nMax > p->nTempMaxC)
+                p->nTempMaxC = nMax;
+        }
+        if (nMin >= 1 && nMin <= 125 &&
+            p->nTemperatureC > 0 && nMin <= p->nTemperatureC) {
+            if (p->nTempMinC < 0 || nMin < p->nTempMinC)
+                p->nTempMinC = nMin;
+        }
+    }
+}
+
+static void TryNvmeLifetimeTemp(HANDLE hDrive, DRIVE_INFO* pInfo)
+{
+    BYTE log[512];
+    DWORD nCopied = 0;
+    int i, cur, hi, lo, nHit, warnC, critC;
+    BOOL curSeen;
+    int vals[24];
+    if (!pInfo || GetStorageBusType(hDrive) == 7)
+        return;
+    ZeroMemory(log, sizeof(log));
+    /* Vendor unique additional SMART (Samsung/Intel 0xCA). Not spec Health 02h. */
+    if (!QueryNVMeProtocol(hDrive, MY_NVMeDataTypeLogPage, 0xCA,
+                           log, sizeof(log), &nCopied) || nCopied < 16)
+        return;
+    nHit = 0;
+    cur = pInfo->nTemperatureC;
+    warnC = NvmeIdentifyTempC(pInfo->wNVMeWarnTempThreshold);
+    critC = NvmeIdentifyTempC(pInfo->wNVMeCritTempThreshold);
+    for (i = 0; i + 1 < 64 && i + 1 < (int)nCopied && nHit < 24; i += 2) {
+        unsigned k = (unsigned)log[i] | ((unsigned)log[i + 1] << 8);
+        int c;
+        if (k < 274 || k > 400)
+            continue;
+        c = (int)k - 273;
+        if ((warnC > 0 && c == warnC) || (critC > 0 && c == critC))
+            continue;
+        vals[nHit++] = c;
+    }
+    if (nHit < 2 || cur <= 0)
+        return;
+    curSeen = FALSE;
+    hi = vals[0];
+    lo = vals[0];
+    for (i = 0; i < nHit; i++) {
+        if (vals[i] >= cur - 1 && vals[i] <= cur + 1)
+            curSeen = TRUE;
+        if (vals[i] > hi) hi = vals[i];
+        if (vals[i] < lo) lo = vals[i];
+    }
+    if (!curSeen)
+        return;
+    if (hi > cur && hi != warnC && hi != critC)
+        pInfo->nTempMaxC = hi;
+    if (lo < cur && lo != warnC && lo != critC)
+        pInfo->nTempMinC = lo;
+}
+
 void AssessDriveHealth(DRIVE_INFO* pInfo)
 {
     BYTE cw;
@@ -4695,6 +5084,7 @@ void AssessDriveHealth(DRIVE_INFO* pInfo)
     pInfo->nConfidence = (20 * nConfC + 10 * nConfT + 15 * nConfM +
                           20 * nConfD + 35 * nConfH + 50) / 100;
     pInfo->nConfidence = Clamp100(pInfo->nConfidence);
+    FillTempExtrema(pInfo);
     if (pInfo->nGSenseEvents > 0 && pInfo->nGSenseDelta < 0)
         pInfo->nConfidence = Clamp100(pInfo->nConfidence - 2);
     if (pInfo->eType == DRIVE_TYPE_HDD && !pInfo->bIsNVMe) {
@@ -4845,9 +5235,14 @@ static void LectureAddDualStatus(char* szBuf, int nBufLen, const DRIVE_INFO* pIn
 {
     LectureAddF(szBuf, nBufLen, "Диск: %s%s\r\nОценка: %s%s\r\n\r\n",
                 HealthStatusMark(pInfo->eDiskStatus),
-                GetHealthStatusName(pInfo->eDiskStatus),
+                GetDiskStatusName(pInfo),
                 HealthStatusMark(pInfo->eHealthStatus),
                 GetHealthStatusName(pInfo->eHealthStatus));
+    if (pInfo->bIsUSB && pInfo->bSMART_Supported &&
+        !pInfo->bGotReturnStatus && !pInfo->bIsNVMe)
+        LectureAdd(szBuf, nBufLen,
+            "USB-мост не отдаёт SMART RETURN STATUS — это не отказ диска. "
+            "Оценка ниже по таблице SMART.\r\n\r\n");
 }
 
 static void FormatHddLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen)
@@ -4880,13 +5275,13 @@ static void FormatHddLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
             BOOL bSaid = FALSE;
             if (pInfo->bPrefailPast) {
                 LectureAdd(szBuf, nBufLen,
-                    "Prefail-атрибут был ≤ порога (In the past). "
-                    "Сейчас Value выше порога.\r\n");
+                    "Prefail-атрибут раньше опускался до порога. "
+                    "Сейчас значение снова выше порога.\r\n");
                 bSaid = TRUE;
             }
             if (pInfo->bUsageFailed) {
                 LectureAdd(szBuf, nBufLen,
-                    "Usage/old-age атрибут на пороге. Это износ, не прогноз отказа.\r\n");
+                    "Атрибут износа (old-age) на пороге. Это износ, не прогноз отказа.\r\n");
                 bSaid = TRUE;
             }
             if (!bSaid)
@@ -4895,11 +5290,11 @@ static void FormatHddLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
             LectureAdd(szBuf, nBufLen, "\r\n");
         }
         LectureAdd(szBuf, nBufLen, "Признаков повреждения поверхности:\r\n");
-        LectureAddF(szBuf, nBufLen, "  %s Reallocated: %d\r\n",
+        LectureAddF(szBuf, nBufLen, "  %s Переназначенные: %d\r\n",
                     (r <= 0) ? "\xE2\x9C\x93" : "\xE2\x9C\x97", r < 0 ? 0 : r);
-        LectureAddF(szBuf, nBufLen, "  %s Pending: %d\r\n",
+        LectureAddF(szBuf, nBufLen, "  %s Ожидающие: %d\r\n",
                     (pend <= 0) ? "\xE2\x9C\x93" : "\xE2\x9C\x97", pend < 0 ? 0 : pend);
-        LectureAddF(szBuf, nBufLen, "  %s Uncorrectable: %d\r\n\r\n",
+        LectureAddF(szBuf, nBufLen, "  %s Неисправимые: %d\r\n\r\n",
                     (u <= 0) ? "\xE2\x9C\x93" : "\xE2\x9C\x97", u < 0 ? 0 : u);
         LectureAdd(szBuf, nBufLen, "Рекомендация: Следить за динамикой SMART.\r\n");
         break;
@@ -4908,9 +5303,9 @@ static void FormatHddLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
         LectureAdd(szBuf, nBufLen,
             "Есть реальные признаки деградации носителя.\r\n\r\n");
         if (pend > 0)
-            LectureAddF(szBuf, nBufLen, "Pending sectors: %d\r\n", pend);
+            LectureAddF(szBuf, nBufLen, "Ожидающие сектора: %d\r\n", pend);
         if (r > 0)
-            LectureAddF(szBuf, nBufLen, "Reallocated sectors: %d\r\n", r);
+            LectureAddF(szBuf, nBufLen, "Переназначенные сектора: %d\r\n", r);
         if (pInfo->nRemapEvents > 0)
             LectureAddF(szBuf, nBufLen, "События переназначения: %d\r\n", pInfo->nRemapEvents);
         LectureAdd(szBuf, nBufLen,
@@ -4922,11 +5317,16 @@ static void FormatHddLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
         LectureAdd(szBuf, nBufLen,
             "Обнаружены признаки деградации носителя.\r\n\r\n");
         if (pend > 0)
-            LectureAddF(szBuf, nBufLen, "Pending sectors: %d\r\n", pend);
+            LectureAddF(szBuf, nBufLen, "Ожидающие сектора: %d\r\n", pend);
         if (r > 0)
-            LectureAddF(szBuf, nBufLen, "Reallocated sectors: %d\r\n", r);
+            LectureAddF(szBuf, nBufLen, "Переназначенные сектора: %d\r\n", r);
         if (u > 0)
-            LectureAddF(szBuf, nBufLen, "Uncorrectable sectors: %d\r\n", u);
+            LectureAddF(szBuf, nBufLen, "Неисправимые сектора: %d\r\n", u);
+        {
+            int n187 = AttrRawOrNeg1(pInfo, 0xBB);
+            if (n187 > 0)
+                LectureAddF(szBuf, nBufLen, "Неисправимые ошибки (187): %d\r\n", n187);
+        }
         LectureAdd(szBuf, nBufLen,
             "\r\nРекомендация: Немедленно создать резервную копию.\r\n");
         break;
@@ -5004,8 +5404,6 @@ static void FormatSsdLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
             LectureAddF(szBuf, nBufLen, "Переназначенные сектора: %d\r\n", pInfo->nReallocated);
         if (pInfo->nPendingSectors > 0)
             LectureAddF(szBuf, nBufLen, "Ожидающие сектора: %d\r\n", pInfo->nPendingSectors);
-        if (pInfo->nCrcErrors > 0)
-            LectureAddF(szBuf, nBufLen, "Ошибки CRC: %d\r\n", pInfo->nCrcErrors);
         if (pInfo->qwNVMeMediaErrors > 0)
             LectureAddF(szBuf, nBufLen, "Ошибки носителя NVMe: %llu\r\n",
                         (unsigned long long)pInfo->qwNVMeMediaErrors);
@@ -5370,7 +5768,11 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
     if (pInfo->nPendingSectors == 0) nPos++;
     if (pInfo->nUncorrectable == 0) nPos++;
     if (pInfo->nRemapEvents == 0) nPos++;
-    if (pInfo->nCrcErrors == 0) nPos++;
+    {
+        int n187c = AttrRawOrNeg1(pInfo, 0xBB);
+        if (n187c == 0) nPos++;
+        if (n187c > 0) nMediaDeg++;
+    }
     if (pInfo->nEndurancePercent >= 0) nPos++;
     if (pInfo->bIsNVMe && pInfo->qwNVMeMediaErrors == 0) nPos++;
     if (pInfo->bIsNVMe && !bSpareLow) nPos++;
@@ -5469,18 +5871,18 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
             LectureMatrixRow(szBuf, nBufLen, "Наработка", szH, "0");
         }
         LectureMatrixRow(szBuf, nBufLen, "Контроллер",
-                         GetControllerName(pInfo->eController),
+                         DriveControllerLabel(pInfo),
                          pInfo->eController == CONTROLLER_UNKNOWN ? "−уверенность" : "0");
 
         LectureAdd(szBuf, nBufLen, "\r\nИтог:\r\n");
         if (pInfo->eHealthStatus == HEALTH_STATUS_GOOD) {
-            LectureAdd(szBuf, nBufLen, "  GOOD because:\r\n");
+            LectureAdd(szBuf, nBufLen, "  ХОРОШО, потому что:\r\n");
         } else if (pInfo->eHealthStatus == HEALTH_STATUS_OBSERVE) {
-            LectureAdd(szBuf, nBufLen, "  OBSERVE because:\r\n");
+            LectureAdd(szBuf, nBufLen, "  РИСК, потому что:\r\n");
         } else if (pInfo->eHealthStatus == HEALTH_STATUS_CAUTION) {
-            LectureAdd(szBuf, nBufLen, "  CAUTION because:\r\n");
+            LectureAdd(szBuf, nBufLen, "  ВНИМАНИЕ, потому что:\r\n");
         } else {
-            LectureAdd(szBuf, nBufLen, "  BAD because:\r\n");
+            LectureAdd(szBuf, nBufLen, "  ПЛОХО, потому что:\r\n");
         }
         LectureAddF(szBuf, nBufLen, "    %d сильных положительных признаков\r\n", nPos);
         LectureAddF(szBuf, nBufLen, "    %d критических отказов\r\n", nCritFail);
@@ -5518,10 +5920,13 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
             LectureAdd(szBuf, nBufLen, "  ✓ События переназначения: 0\r\n");
         else if (pInfo->nRemapEvents > 0)
             LectureAddF(szBuf, nBufLen, "  ✗ События переназначения: %d\r\n", pInfo->nRemapEvents);
-        if (pInfo->nCrcErrors == 0)
-            LectureAdd(szBuf, nBufLen, "  ✓ CRC-ошибки: 0\r\n");
-        else if (pInfo->nCrcErrors > 0)
-            LectureAddF(szBuf, nBufLen, "  ✗ CRC-ошибки: %d\r\n", pInfo->nCrcErrors);
+        {
+            int n187 = AttrRawOrNeg1(pInfo, 0xBB);
+            if (n187 == 0)
+                LectureAdd(szBuf, nBufLen, "  ✓ Неисправимые ошибки (187): 0\r\n");
+            else if (n187 > 0)
+                LectureAddF(szBuf, nBufLen, "  ✗ Неисправимые ошибки (187): %d\r\n", n187);
+        }
         if (pInfo->nWriteErrorValue >= 0 && pInfo->nWriteErrorValue <= 10)
             LectureAddF(szBuf, nBufLen,
                 "  ✗ Частота ошибок записи (200): значение %d, худший %d\r\n",
@@ -5541,6 +5946,12 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
         }
 
         LectureAdd(szBuf, nBufLen, "\r\nКонтекст (не штраф):\r\n");
+        if (pInfo->nCrcErrors > 0)
+            LectureAddF(szBuf, nBufLen,
+                "  CRC UltraDMA: %d. Кабель/мост/порт, не здоровье носителя.\r\n",
+                pInfo->nCrcErrors);
+        else if (pInfo->nCrcErrors == 0)
+            LectureAdd(szBuf, nBufLen, "  CRC UltraDMA: 0. Контекст, не штраф.\r\n");
         LectureAddF(szBuf, nBufLen,
             "  Температура: %s. Время на высокой температуре: нет данных.\r\n",
             szTempBand);
@@ -5624,16 +6035,24 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
             LectureMatrixRow(szBuf, nBufLen, "События переназначения", szRemap,
                              pInfo->nRemapEvents == 0 ? "+" : "−");
         if (pInfo->nCrcErrors >= 0)
-            LectureMatrixRow(szBuf, nBufLen, "CRC", szCrc,
-                             pInfo->nCrcErrors == 0 ? "+" : "−");
-                if (pInfo->nWriteErrorValue >= 0 && pInfo->nWriteErrorValue <= 10) {
+            LectureMatrixRow(szBuf, nBufLen, "CRC", szCrc, "0");
+        {
+            int n187 = AttrRawOrNeg1(pInfo, 0xBB);
+            if (n187 >= 0) {
+                char sz187[24];
+                safe_snprintf(sz187, "%d", n187);
+                LectureMatrixRow(szBuf, nBufLen, "Неисправимые (187)", sz187,
+                                 n187 == 0 ? "+" : "−");
+            }
+        }
+        if (pInfo->nWriteErrorValue >= 0 && pInfo->nWriteErrorValue <= 10) {
             char szWe[32];
             const char* inf;
             safe_snprintf(szWe, "знач. %d", pInfo->nWriteErrorValue);
             inf = (pInfo->nWriteErrorValue <= 10) ? "−" : "0";
             LectureMatrixRow(szBuf, nBufLen, "Ошибки записи (200)", szWe, inf);
         }
-if (pInfo->nEndurancePercent >= 0) {
+        if (pInfo->nEndurancePercent >= 0) {
             safe_snprintf(szLife, "%d%%", pInfo->nEndurancePercent);
             LectureMatrixRow(szBuf, nBufLen, "Остаток ресурса", szLife, "+");
         }
@@ -5674,7 +6093,7 @@ if (pInfo->nEndurancePercent >= 0) {
             char szCtl[64];
             const char* ctl = GetControllerName(pInfo->eController);
             if (pInfo->eController == CONTROLLER_PHISON && nUnknown > 0)
-                safe_snprintf(szCtl, "Phison, упаковка RAW не подтверждена");
+                safe_snprintf(szCtl, "Phison (RAW частично)");
             else
                 safe_snprintf(szCtl, "%s", ctl);
             LectureMatrixRow(szBuf, nBufLen, "Контроллер", szCtl,
@@ -5683,13 +6102,13 @@ if (pInfo->nEndurancePercent >= 0) {
 
         LectureAdd(szBuf, nBufLen, "\r\nИтог:\r\n");
         if (pInfo->eHealthStatus == HEALTH_STATUS_GOOD)
-            LectureAdd(szBuf, nBufLen, "  GOOD because:\r\n");
+            LectureAdd(szBuf, nBufLen, "  ХОРОШО, потому что:\r\n");
         else if (pInfo->eHealthStatus == HEALTH_STATUS_OBSERVE)
-            LectureAdd(szBuf, nBufLen, "  OBSERVE because:\r\n");
+            LectureAdd(szBuf, nBufLen, "  РИСК, потому что:\r\n");
         else if (pInfo->eHealthStatus == HEALTH_STATUS_CAUTION)
-            LectureAdd(szBuf, nBufLen, "  CAUTION because:\r\n");
+            LectureAdd(szBuf, nBufLen, "  ВНИМАНИЕ, потому что:\r\n");
         else
-            LectureAdd(szBuf, nBufLen, "  BAD because:\r\n");
+            LectureAdd(szBuf, nBufLen, "  ПЛОХО, потому что:\r\n");
         LectureAddF(szBuf, nBufLen, "    %d сильных положительных признаков\r\n", nPos);
         LectureAddF(szBuf, nBufLen, "    %d критических отказов\r\n", nCritFail);
         LectureAddF(szBuf, nBufLen, "    %d признаков деградации носителя\r\n", nMediaDeg);
@@ -5734,8 +6153,14 @@ void ExtractSSDIndicators(DRIVE_INFO* pInfo)
         switch (pA->bAttrID) {
         /* Remaining Life / SSD Life Left */
         case 0xA9:
-            if (pInfo->nSSDLifeLeft < 0)
-                pInfo->nSSDLifeLeft = (int)pA->bAttrValue;
+            if (pInfo->nSSDLifeLeft < 0) {
+                int raw = (int)GetRawValue(pA->bRawValue);
+                /* Phison 169 RAW is remaining % (0 = exhausted). Value is dummy. */
+                if (raw <= 100)
+                    pInfo->nSSDLifeLeft = raw;
+                else
+                    pInfo->nSSDLifeLeft = (int)pA->bAttrValue;
+            }
             break;
         case 0xE7:
             if (pInfo->nSSDLifeLeft < 0) {
@@ -6250,10 +6675,6 @@ static BOOL NVMeIdentifyJMicron(HANDLE hDrive, DRIVE_INFO* pInfo)
 
         pInfo->bGotNVMeIdent = TRUE;
         CopyNvmeIdentBuf(pInfo, pIdentBuf, 4096);
-
-        /* Extract temperature thresholds from NVMe Identify */
-        pInfo->wNVMeWarnTempThreshold = ReadLE16(pInfo->nvmeIdent.WCTEMP);
-        pInfo->wNVMeCritTempThreshold = ReadLE16(pInfo->nvmeIdent.CCTEMP);
     }
 
     return (pInfo->szModel[0] != '\0');
@@ -6380,10 +6801,6 @@ static BOOL NVMeIdentifyASMedia(HANDLE hDrive, DRIVE_INFO* pInfo)
 
         pInfo->bGotNVMeIdent = TRUE;
         CopyNvmeIdentBuf(pInfo, pIdentBuf, 4096);
-
-        /* Extract temperature thresholds from NVMe Identify */
-        pInfo->wNVMeWarnTempThreshold = ReadLE16(pInfo->nvmeIdent.WCTEMP);
-        pInfo->wNVMeCritTempThreshold = ReadLE16(pInfo->nvmeIdent.CCTEMP);
     }
 
     return (pInfo->szModel[0] != '\0');
@@ -6489,9 +6906,6 @@ static BOOL NVMeIdentifyRealtek(HANDLE hDrive, DRIVE_INFO* pInfo)
 
         pInfo->bGotNVMeIdent = TRUE;
         CopyNvmeIdentBuf(pInfo, pIdentBuf, 4096);
-
-        pInfo->wNVMeWarnTempThreshold = ReadLE16(pInfo->nvmeIdent.WCTEMP);
-        pInfo->wNVMeCritTempThreshold = ReadLE16(pInfo->nvmeIdent.CCTEMP);
     }
 
     bOk = (pInfo->szModel[0] != '\0');
@@ -6636,9 +7050,6 @@ static BOOL NVMeIdentifyVLI(HANDLE hDrive, DRIVE_INFO* pInfo)
 
         pInfo->bGotNVMeIdent = TRUE;
         CopyNvmeIdentBuf(pInfo, pIdentBuf, 4096);
-
-        pInfo->wNVMeWarnTempThreshold = ReadLE16(pInfo->nvmeIdent.WCTEMP);
-        pInfo->wNVMeCritTempThreshold = ReadLE16(pInfo->nvmeIdent.CCTEMP);
     }
 
     return (pInfo->szModel[0] != '\0');
@@ -6848,6 +7259,10 @@ int ScanDrives(DRIVE_INFO* pDrives, int nMaxDrives)
         ZeroMemory(pInfo, sizeof(DRIVE_INFO));
         pInfo->nDriveIndex    = nDrive;
         pInfo->nTemperatureC  = -1;
+        pInfo->nTempMaxC      = -1;
+        pInfo->nTempMinC      = -1;
+        pInfo->nTempWarnC     = -1;
+        pInfo->nTempCritC     = -1;
         pInfo->nHealthPercent = -1;
         pInfo->nConfidence    = 0;
         pInfo->nEndurancePercent = -1;
@@ -6872,7 +7287,6 @@ int ScanDrives(DRIVE_INFO* pDrives, int nMaxDrives)
         pInfo->eHealthStatus  = HEALTH_STATUS_UNKNOWN;
         pInfo->eVendor        = VENDOR_UNKNOWN;
         pInfo->eController    = CONTROLLER_UNKNOWN;
-        pInfo->eNand          = NAND_UNKNOWN;
         pInfo->nSSDLifeLeft   = -1;
         pInfo->nSSDTotalWritesGB = -1;
         pInfo->nSSDAvgEraseCount = -1;

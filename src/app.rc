@@ -29,7 +29,7 @@ BEGIN
         BLOCK "040904b0"
         BEGIN
             VALUE "CompanyName",      "chuikoff"
-            VALUE "FileDescription",  "DriveMonitor " DRIVEMONITOR_VERSION
+            VALUE "FileDescription",  "DriveMonitor " DRIVEMONITOR_VERSION " (сборка " DRIVEMONITOR_BUILD_STR ")"
             VALUE "FileVersion",      DRIVEMONITOR_FILEVERSION_STR
             VALUE "InternalName",     "DriveMonitor"
             VALUE "LegalCopyright",   "Copyright (c) 2026 chuikoff. MIT License."

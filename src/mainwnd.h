@@ -46,8 +46,9 @@
 #define DRIVE_BTN_H    56
 #define DRIVE_BTN_GAP   6
 #define DRIVE_BTN_PANEL_W 200
-#define WINDOW_W    920
-#define WINDOW_H    620
+#define WINDOW_W     920
+#define WINDOW_H     960   /* ~32 SMART rows without v-scroll */
+#define WINDOW_H_MIN 620
 #define CLR_BG          RGB(236, 242, 252)
 #define CLR_PANEL       RGB(252, 254, 255)
 #define CLR_BORDER      RGB(186, 198, 216)

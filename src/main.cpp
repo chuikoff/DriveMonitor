@@ -130,17 +130,28 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         return 1;
     }
 
-    int nScrW = GetSystemMetrics(SM_CXSCREEN);
-    int nScrH = GetSystemMetrics(SM_CYSCREEN);
-    int nX    = (nScrW - WINDOW_W) / 2;
-    int nY    = (nScrH - WINDOW_H) / 2;
+    RECT wa;
+    int nW = WINDOW_W, nH = WINDOW_H;
+    int nScrW, nScrH, nX, nY;
+    if (!SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0)) {
+        wa.left = 0;
+        wa.top = 0;
+        wa.right = GetSystemMetrics(SM_CXSCREEN);
+        wa.bottom = GetSystemMetrics(SM_CYSCREEN);
+    }
+    nScrW = wa.right - wa.left;
+    nScrH = wa.bottom - wa.top;
+    if (nH > nScrH) nH = nScrH;
+    if (nW > nScrW) nW = nScrW;
+    nX = wa.left + (nScrW - nW) / 2;
+    nY = wa.top  + (nScrH - nH) / 2;
 
     HWND hWnd = CreateWindowExU8(
         0,
         "DriveMonitorMainWnd",
         "DriveMonitor",
         WS_OVERLAPPEDWINDOW,
-        nX, nY, WINDOW_W, WINDOW_H,
+        nX, nY, nW, nH,
         NULL, NULL, hInstance, NULL
     );
 

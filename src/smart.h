@@ -159,6 +159,10 @@ typedef enum _DRIVE_VENDOR {
     VENDOR_GOODRAM     = 18,
     VENDOR_PLEXTOR     = 19,
     VENDOR_OCZ         = 20,
+    VENDOR_UTANIA      = 21,
+    VENDOR_PATRIOT     = 22,
+    VENDOR_MSI         = 23,
+    VENDOR_RADEON      = 24,
     VENDOR_OTHER       = 99
 } DRIVE_VENDOR;
 
@@ -185,19 +189,6 @@ typedef enum _DRIVE_CONTROLLER {
     CONTROLLER_MAXIO    = 16,  /* MAP1202/MAP1602 */
     CONTROLLER_INNOGRIT = 17   /* IG5216/IG5236 */
 } DRIVE_CONTROLLER;
-
-/* ============================================================
- * NAND flash vendor — independent of brand and controller
- * ============================================================ */
-typedef enum _NAND_VENDOR {
-    NAND_UNKNOWN  = 0,
-    NAND_SAMSUNG  = 1,
-    NAND_MICRON   = 2,
-    NAND_KIOXIA   = 3,
-    NAND_HYNIX    = 4,
-    NAND_INTEL    = 5,
-    NAND_SANDISK  = 6
-} NAND_VENDOR;
 
 /* ============================================================
  * Drive types
@@ -278,8 +269,8 @@ typedef struct _NVME_IDENTIFY_CONTROLLER {
     BYTE    NPSS;              /* Number of Power States Support */
     BYTE    AVSCC;             /* Admin Vendor Specific Command Configuration */
     BYTE    APSTA;             /* Autonomous Power State Transition Attributes */
-    BYTE    WCTEMP[2];        /* Warning Composite Temperature Threshold */
-    BYTE    CCTEMP[2];        /* Critical Composite Temperature Threshold */
+    BYTE    WCTEMP[2];        /* NOT spec WCTEMP (that is raw offset 266) */
+    BYTE    CCTEMP[2];        /* NOT spec CCTEMP (that is raw offset 268) */
     BYTE    Reserved100[80];
     BYTE    Reserved180[16];
     BYTE    SQES;              /* Submission Queue Entry Size */
@@ -414,8 +405,12 @@ typedef struct _DRIVE_INFO {
     BOOL        bIsUSB;
     DRIVE_TYPE  eType;
     int         nTemperatureC;
+    int         nTempMaxC;       /* lifetime max °C from drive, -1 if unknown */
+    int         nTempMinC;       /* lifetime min °C, -1 if unknown */
+    int         nTempWarnC;      /* Identify WCTEMP °C, -1 if omitted */
+    int         nTempCritC;      /* Identify CCTEMP °C = max safe, -1 if omitted */
     BOOL        bIsNVMe;
-    char        szProtocol[32];  /* e.g. "NVMe 1.2.1", "SATA 6 Гбит/с", "USB" */
+    char        szProtocol[64];  /* e.g. "USB SAT · SATA 6 Гбит/с" */
     SMART_ACCESS_METHOD eAccessMethod;
     DWORD       dwPowerOnHours;
     DWORD       dwPowerCycleCount;
@@ -476,7 +471,7 @@ typedef struct _DRIVE_INFO {
     char        szEvidence[384];      /* one-line Russian evidence for UI */
     DRIVE_VENDOR     eVendor;            /* Drive brand from model string */
     DRIVE_CONTROLLER eController;        /* SSD ASIC / HDD MCU */
-    NAND_VENDOR      eNand;              /* NAND flash vendor, or UNKNOWN */
+    char        szControllerChip[72];    /* e.g. "Silicon Motion SM2262EN/…" */
 
     /* NVMe extended info */
     NVME_IDENTIFY_CONTROLLER nvmeIdent;
@@ -584,9 +579,10 @@ void GetAttrDecode(BYTE bID, const DRIVE_INFO* pInfo, ATTR_DECODE* out);
 const char* GetAttrNameEx(BYTE bID, const DRIVE_INFO* pInfo);
 const char* GetDriveTypeName(DRIVE_TYPE eType);
 const char* GetHealthStatusName(DRIVE_HEALTH_STATUS eStatus);
+const char* GetDiskStatusName(const DRIVE_INFO* p);
 const char* GetVendorName(DRIVE_VENDOR eVendor);
 const char* GetControllerName(DRIVE_CONTROLLER eController);
-const char* GetNandName(NAND_VENDOR eNand);
+const char* DriveControllerLabel(const DRIVE_INFO* p);
 DRIVE_VENDOR DetectDriveVendor(const char* szModel);
 void        IdentifyDriveParts(DRIVE_INFO* pInfo);
 
