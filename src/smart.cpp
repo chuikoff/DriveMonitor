@@ -1199,17 +1199,17 @@ static void ApplyPhisonSsdDecode(BYTE bID, ATTR_DECODE* out)
         out->eCrit = ATTR_CRIT_NONE;
         break;
     case 0xF1:
-        out->szName = "Записано LBA";
-        out->eEnc = RAW_ENC_LBA;
+        out->szName = "Записано хостом (ГБ)";
+        out->eEnc = RAW_ENC_COUNTER32;
         out->eState = ATTR_DECODE_KNOWN;
-        out->nSemanticConfidence = 90;
+        out->nSemanticConfidence = 85;
         out->eCrit = ATTR_CRIT_NONE;
         break;
     case 0xF2:
-        out->szName = "Прочитано LBA";
-        out->eEnc = RAW_ENC_LBA;
+        out->szName = "Прочитано хостом (ГБ)";
+        out->eEnc = RAW_ENC_COUNTER32;
         out->eState = ATTR_DECODE_KNOWN;
-        out->nSemanticConfidence = 90;
+        out->nSemanticConfidence = 85;
         out->eCrit = ATTR_CRIT_NONE;
         break;
     case 0xF5:
@@ -1441,6 +1441,25 @@ const char* DriveControllerLabel(const DRIVE_INFO* p)
  * Drive vendor detection from model name
  * Identifies vendors for attribute interpretation
  * ============================================================ */
+static BOOL ModelLooksSeagate(const char* szUpper)
+{
+    const char* p;
+    if (!szUpper || !szUpper[0])
+        return FALSE;
+    if (strstr(szUpper, "SEAGATE") || strstr(szUpper, "BARRACUDA") ||
+        strstr(szUpper, "FIRECUDA") || strstr(szUpper, "IRONWOLF") ||
+        strstr(szUpper, "SKYHAWK") || strstr(szUpper, "EXOS"))
+        return TRUE;
+    p = szUpper;
+    while ((p = strstr(p, "ST")) != NULL) {
+        if ((p == szUpper || !isalnum((unsigned char)p[-1])) &&
+            p[2] >= '0' && p[2] <= '9')
+            return TRUE;
+        p++;
+    }
+    return FALSE;
+}
+
 DRIVE_VENDOR DetectDriveVendor(const char* szModel)
 {
     if (!szModel || !szModel[0]) return VENDOR_UNKNOWN;
@@ -1476,10 +1495,7 @@ DRIVE_VENDOR DetectDriveVendor(const char* szModel)
          szUpper[3] >= '0' && szUpper[3] <= '9'))
         return VENDOR_UTANIA;
 
-    if (szUpper[0] == 'S' && szUpper[1] == 'T' &&
-        szUpper[2] >= '0' && szUpper[2] <= '9')
-        return VENDOR_SEAGATE;
-    if (strstr(szUpper, "SEAGATE"))
+    if (ModelLooksSeagate(szUpper))
         return VENDOR_SEAGATE;
 
     if (strstr(szUpper, "TOSHIBA") || strstr(szUpper, "MK") ||
@@ -1826,6 +1842,16 @@ static void ApplySsdPartIds(DRIVE_INFO* p)
           "Phison PS3111-S11", NULL },
         { "", "U10", CONTROLLER_PHISON,
           "Phison PS3110-S10", NULL },
+        { "SA400", "SBFK61", CONTROLLER_PHISON,
+          "Phison PS3110-S10", NULL },
+        { "", "SBFK61", CONTROLLER_PHISON,
+          "Phison PS3110-S10", NULL },
+        { "", "SBFK62", CONTROLLER_PHISON,
+          "Phison PS3111-S11", NULL },
+        { "", "SBFK", CONTROLLER_PHISON,
+          "Phison PS3110-S10 / PS3111-S11", NULL },
+        { "", "SBFM", CONTROLLER_PHISON,
+          "Phison PS3111-S11", NULL },
         { "", "S9FM", CONTROLLER_PHISON,
           "Phison PS3109-S9", NULL },
         { "", "T07", CONTROLLER_PHISON,
@@ -5376,8 +5402,15 @@ static void FormatSsdLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
     switch (pInfo->eHealthStatus) {
     case HEALTH_STATUS_GOOD:
         LectureAdd(szBuf, nBufLen,
-            "Критических проблем не обнаружено.\r\n"
-            "Носитель, ресурс, интерфейс и температура в норме.\r\n");
+            "Критических проблем не обнаружено.\r\n");
+        if (pInfo->nEndurancePercent >= 0 && pInfo->nEndurancePercent <= 20)
+            LectureAddF(szBuf, nBufLen,
+                "Носитель, интерфейс и температура в норме. "
+                "Остаток ресурса %d%% — износ NAND, не здоровье.\r\n",
+                pInfo->nEndurancePercent);
+        else
+            LectureAdd(szBuf, nBufLen,
+                "Носитель, ресурс, интерфейс и температура в норме.\r\n");
         break;
     case HEALTH_STATUS_OBSERVE:
         LectureAdd(szBuf, nBufLen, "Причина:\r\n");
@@ -5824,7 +5857,8 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
                         (unsigned long long)pInfo->qwNVMeMediaErrors);
         if (pInfo->nEndurancePercent >= 0)
             LectureAddF(szBuf, nBufLen,
-                "  ✓ Заявленный остаток ресурса: %d%%   (износ NAND, не здоровье)\r\n",
+                "  %s Заявленный остаток ресурса: %d%%   (износ NAND, не здоровье)\r\n",
+                pInfo->nEndurancePercent <= 20 ? "\xE2\x9A\xA0" : "\xE2\x9C\x93",
                 pInfo->nEndurancePercent);
 
         LectureAdd(szBuf, nBufLen, "\r\nКонтекст (не штраф):\r\n");
@@ -5855,7 +5889,8 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
                          pInfo->qwNVMeMediaErrors == 0 ? "+" : "−");
         if (pInfo->nEndurancePercent >= 0) {
             safe_snprintf(szLife, "%d%%", pInfo->nEndurancePercent);
-            LectureMatrixRow(szBuf, nBufLen, "Остаток ресурса", szLife, "+");
+            LectureMatrixRow(szBuf, nBufLen, "Остаток ресурса", szLife,
+                             pInfo->nEndurancePercent <= 20 ? "0" : "+");
         }
         {
             char szT[24];
@@ -5934,7 +5969,8 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
                 pInfo->nWriteErrorWorst >= 0 ? pInfo->nWriteErrorWorst : pInfo->nWriteErrorValue);
         if (pInfo->nEndurancePercent >= 0)
             LectureAddF(szBuf, nBufLen,
-                "  ✓ Заявленный остаток ресурса: %d%%   (это износ NAND, не здоровье)\r\n",
+                "  %s Заявленный остаток ресурса: %d%%   (это износ NAND, не здоровье)\r\n",
+                pInfo->nEndurancePercent <= 20 ? "\xE2\x9A\xA0" : "\xE2\x9C\x93",
                 pInfo->nEndurancePercent);
 
         if (nUnknown > 0) {
@@ -6054,7 +6090,8 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
         }
         if (pInfo->nEndurancePercent >= 0) {
             safe_snprintf(szLife, "%d%%", pInfo->nEndurancePercent);
-            LectureMatrixRow(szBuf, nBufLen, "Остаток ресурса", szLife, "+");
+            LectureMatrixRow(szBuf, nBufLen, "Остаток ресурса", szLife,
+                             pInfo->nEndurancePercent <= 20 ? "0" : "+");
         }
         {
             char szT[24];

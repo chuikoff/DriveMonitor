@@ -1866,14 +1866,33 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
     case 0xF3:
     case 0xF4:
     {
-        unsigned __int64 nLBA = qw48;
-        unsigned __int64 nGB  = nLBA / (1024ULL * 1024ULL * 2ULL);
-        if (nGB >= 1024)
-            safe_snprintf(szMain, "%llu LBA  (~%llu TB)", (unsigned long long)nLBA, (unsigned long long)(nGB / 1024ULL));
-        else if (nGB > 0)
-            safe_snprintf(szMain, "%llu LBA  (~%llu GB)", (unsigned long long)nLBA, (unsigned long long)nGB);
-        else
-            safe_snprintf(szMain, "%llu LBA", (unsigned long long)nLBA);
+        /* Phison 241/242 RAW is host GB, not a 512-byte LBA count. */
+        if (eCtl == CONTROLLER_PHISON && (bID == 0xF1 || bID == 0xF2)) {
+            unsigned __int64 nGB = qw48;
+            if (nGB > 4000000ULL)
+                nGB = 4000000ULL;
+            if (bID == 0xF1)
+                safe_snprintf(szMain, "%llu ГБ записано хостом",
+                              (unsigned long long)nGB);
+            else
+                safe_snprintf(szMain, "%llu ГБ прочитано хостом",
+                              (unsigned long long)nGB);
+            break;
+        }
+        {
+            unsigned __int64 nLBA = qw48;
+            unsigned __int64 nGB  = nLBA / (1024ULL * 1024ULL * 2ULL);
+            if (nGB >= 1024)
+                safe_snprintf(szMain, "%llu LBA  (~%llu TB)",
+                              (unsigned long long)nLBA,
+                              (unsigned long long)(nGB / 1024ULL));
+            else if (nGB > 0)
+                safe_snprintf(szMain, "%llu LBA  (~%llu GB)",
+                              (unsigned long long)nLBA,
+                              (unsigned long long)nGB);
+            else
+                safe_snprintf(szMain, "%llu LBA", (unsigned long long)nLBA);
+        }
         break;
     }
 

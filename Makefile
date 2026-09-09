@@ -64,13 +64,13 @@ else
 Q := @
 endif
 
-$(OBJDIR)/%.o: $(SRCDIR)/%.cpp | $(OBJDIR)
+$(OBJDIR)/%.o: $(SRCDIR)/%.cpp $(SRCDIR)/resource.h | $(OBJDIR)
 	@echo "  CC  $<"
 	$(Q)$(CC) $(CFLAGS) -c $< -o $@
 
 # Resource compilation: the .rc file references the .manifest and .ico,
 # so the .o depends on all three.
-$(RES_O): $(SRCDIR)/app.rc $(SRCDIR)/app.manifest $(SRCDIR)/app.ico | $(OBJDIR)
+$(RES_O): $(SRCDIR)/app.rc $(SRCDIR)/app.manifest $(SRCDIR)/app.ico $(SRCDIR)/resource.h | $(OBJDIR)
 	@echo "  RC  $(SRCDIR)/app.rc"
 	$(Q)$(WINDRES) --include-dir=$(SRCDIR) $(SRCDIR)/app.rc -o $(RES_O)
 

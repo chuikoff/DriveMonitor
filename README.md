@@ -4,7 +4,7 @@
 
 English: a one-shot Windows SMART viewer. No tray, no live polling, no Health% formula. Russian UI.
 
-**Текущий выпуск:** [1.6.1](https://github.com/chuikoff/DriveMonitor/releases/tag/1.6.1) — скачать `DriveMonitor.exe`, запустить от администратора.
+**Текущий выпуск:** [1.6.2](https://github.com/chuikoff/DriveMonitor/releases/tag/1.6.2) — скачать `DriveMonitor.exe`, запустить от администратора.
 
 Windows 10 / 11. Не CrystalDiskInfo и не Victoria: один снимок SMART (старт, hotplug, «Перечитать»), без трея, графика и теста поверхности.
 
