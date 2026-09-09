@@ -878,6 +878,7 @@ typedef struct _ATTR_OVERLAY {
 static const ATTR_OVERLAY g_OvSeagateHdd[] = {
     { 0x01, "Частота ошибок чтения (RAW вендора)" },
     { 0xBB, "Неисправимые ошибки" },
+    { 0xC3, "Восстановлено ECC (чтение)" },
     { 0xF0, "Часы полёта головок" },
     { 0x00, NULL }
 };
@@ -1011,6 +1012,11 @@ static BOOL IsAtaSsdTypeInfo(const DRIVE_INFO* p)
     return p->eType == DRIVE_TYPE_SSD_SATA || p->eType == DRIVE_TYPE_M2_SATA;
 }
 
+static BOOL DriveIsHdd(const DRIVE_INFO* p)
+{
+    return p && p->eType == DRIVE_TYPE_HDD && !p->bIsNVMe;
+}
+
 BOOL DriveTreatsC0AsPowerLoss(const DRIVE_INFO* pInfo)
 {
     if (!pInfo) return FALSE;
@@ -1030,8 +1036,6 @@ static BOOL IsVendorSpecificId(BYTE bID)
     if (bID == 0xBE || bID == 0xBF)
         return FALSE;
     if (bID >= 0xA0 && bID <= 0xBD)
-        return TRUE;
-    if (bID == 0xC3)
         return TRUE;
     if (bID >= 0xE7 && bID <= 0xF0)
         return TRUE;
@@ -1271,6 +1275,46 @@ void GetAttrDecode(BYTE bID, const DRIVE_INFO* pInfo, ATTR_DECODE* out)
     ovl = LookupOverlay(OverlayFor(pInfo), bID);
     if (ovl)
         out->szName = ovl;
+
+    /* HDD must not inherit SSD NAND/endurance names if the same ID exists. */
+    if (DriveIsHdd(pInfo)) {
+        switch (bID) {
+        case 0x1A:
+        case 0x1B:
+        case 0xA9:
+        case 0xE7:
+        case 0xE9:
+        case 0xEB:
+        case 0xF9:
+        case 0xFC:
+            out->szName = VendorSpecificAttrName(bID);
+            out->eEnc = RAW_ENC_UNKNOWN;
+            out->eCrit = ATTR_CRIT_NONE;
+            out->nSemanticConfidence = 20;
+            break;
+        default:
+            break;
+        }
+    }
+
+    /* 195: ATA Hardware ECC Recovered on HDD (plate read correction).
+     * Not NAND. On SSD the same ID is vendor-specific. */
+    if (bID == 0xC3 && pInfo && !IsPhisonFamily(pInfo)) {
+        if (DriveIsHdd(pInfo)) {
+            if (pInfo->eVendor == VENDOR_SEAGATE)
+                out->szName = "Восстановлено ECC (чтение)";
+            else
+                out->szName = "Восстановлено ECC";
+            out->eEnc = RAW_ENC_COUNTER32;
+            out->eCrit = ATTR_CRIT_NONE;
+            out->nSemanticConfidence = (pInfo->eVendor == VENDOR_SEAGATE) ? 90 : 70;
+        } else {
+            out->szName = "ECC (вендор)";
+            out->eEnc = RAW_ENC_UNKNOWN;
+            out->eCrit = ATTR_CRIT_NONE;
+            out->nSemanticConfidence = 30;
+        }
+    }
 
     /* Overlay on Samsung/Intel/Micron is a trusted profile for that ID.
      * Phison overlay is names-only for E7/E9; encoding comes from ApplyPhison. */
@@ -6054,12 +6098,28 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
                     "  G-Sense совпадает с проблемными секторами — это связанная улика, не отдельный штраф.\r\n");
         }
         if (nC3 >= 0) {
-            LectureAddF(szBuf, nBufLen,
-                "  ECC (195) RAW: %d. "
-                "Влияние на здоровье: нет. "
-                "На HDD это Hardware ECC Recovered (часто тот же регистр, что частота ошибок чтения), не NAND. "
-                "Абсолютный RAW без тренда не оценивается.\r\n",
-                nC3);
+            if (DriveIsHdd(pInfo) && pInfo->eVendor == VENDOR_SEAGATE) {
+                const SMART_ATTRIBUTE* a195 = FindAttr(pInfo, 0xC3);
+                unsigned nErr = a195 ? SeagateRateErrs(a195->bRawValue) : 0;
+                DWORD nOps = a195 ? SeagateRateOps(a195->bRawValue) : 0;
+                LectureAddF(szBuf, nBufLen,
+                    "  ID 195 (Hardware ECC Recovered): %u ошибок коррекции / %lu секторов. "
+                    "На HDD это штатная коррекция ошибок чтения пластины (как ID 1), "
+                    "не NAND и не неисправимые сектора. RAW без тренда не оценивается.\r\n",
+                    nErr, (unsigned long)nOps);
+            } else if (DriveIsHdd(pInfo)) {
+                LectureAddF(szBuf, nBufLen,
+                    "  ID 195 (Hardware ECC Recovered): RAW %d. "
+                    "На HDD это штатная коррекция чтения пластины, не NAND. "
+                    "Без профиля вендора абсолютный RAW не оценивается.\r\n",
+                    nC3);
+            } else {
+                LectureAddF(szBuf, nBufLen,
+                    "  ID 195 RAW: %d. На SSD это vendor-specific счётчик, "
+                    "не Hardware ECC Recovered HDD и не «механизм NAND» по умолчанию. "
+                    "Без профиля не оценивается.\r\n",
+                    nC3);
+            }
         }
 
         LectureAdd(szBuf, nBufLen, "\r\nМатрица улик:\r\n");
@@ -6121,7 +6181,8 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
         if (nC3 >= 0) {
             char szEcc[24];
             safe_snprintf(szEcc, "%d", nC3);
-            LectureMatrixRow(szBuf, nBufLen, "ECC (195)", szEcc, "UNKNOWN");
+            LectureMatrixRow(szBuf, nBufLen, "ECC (195)", szEcc,
+                             DriveIsHdd(pInfo) ? "0" : "UNKNOWN");
         }
         if (nB0 >= 0) {
             char szB[24];

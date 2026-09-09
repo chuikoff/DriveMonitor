@@ -1766,16 +1766,25 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
         break;
 
     case 0xC3:
-        if (eVendor == VENDOR_SEAGATE) {
+        if (eType == DRIVE_TYPE_HDD && eVendor == VENDOR_SEAGATE) {
             unsigned nErr = SeagateRateErrs(pRaw);
             DWORD nOps = SeagateRateOps(pRaw);
-            safe_snprintf(szMain, "%u ош. ECC / %lu секторов", nErr, (unsigned long)nOps);
+            safe_snprintf(szMain, "%u ош. чтения / %lu секторов", nErr, (unsigned long)nOps);
             break;
         }
-        if (dw32 == 0)
-            safe_snprintf(szMain, "0  (ОК)");
+        if (eType == DRIVE_TYPE_HDD) {
+            if (dw32 == 0)
+                safe_snprintf(szMain, "0  (ОК)");
+            else
+                safe_snprintf(szMain, "%lu восстановлений ECC", (unsigned long)dw32);
+            break;
+        }
+        if (qw48 > 0xFFFFFFFFULL)
+            safe_snprintf(szMain, "%llu  (vendor-specific)",
+                          (unsigned long long)qw48);
         else
-            safe_snprintf(szMain, "%lu ошибок ECC", (unsigned long)dw32);
+            safe_snprintf(szMain, "%lu  (vendor-specific)",
+                          (unsigned long)dw32);
         break;
 
     case 0xBC:
@@ -2109,8 +2118,8 @@ static const char* AtaRowStatus(const DRIVE_INFO* p, const SMART_ATTRIBUTE* a,
         return "ОК";
     }
 
-    if (id == 0xC3 && !ssd) {
-        if (p->eVendor == VENDOR_SEAGATE) {
+    if (id == 0xC3) {
+        if (!ssd && p->eVendor == VENDOR_SEAGATE) {
             if (SeagateRateErrs(a->bRawValue) > 0) return "Внимание";
             return "ОК";
         }
