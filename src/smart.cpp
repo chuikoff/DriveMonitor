@@ -4758,8 +4758,14 @@ static void AssessSsdHealth(DRIVE_INFO* pInfo)
     pInfo->eMechanics = HEALTH_STATUS_UNKNOWN;
 
     pInfo->eHealthStatus = pInfo->eReliability;
-    if (pInfo->bIsNVMe && (int)pInfo->nvmeHealth.PercentageUsed > 95)
-        pInfo->eHealthStatus = WorstHealth(pInfo->eHealthStatus, HEALTH_STATUS_OBSERVE);
+    /* Wear is not health. Only remaining ≤5% (NAND nearly exhausted) may
+     * raise overall, and never above CAUTION. */
+    if (pInfo->nEndurancePercent >= 0 && pInfo->nEndurancePercent <= 5)
+        pInfo->eHealthStatus = WorstHealth(pInfo->eHealthStatus,
+                                           HEALTH_STATUS_CAUTION);
+    else if (pInfo->bIsNVMe && (int)pInfo->nvmeHealth.PercentageUsed > 95)
+        pInfo->eHealthStatus = WorstHealth(pInfo->eHealthStatus,
+                                           HEALTH_STATUS_OBSERVE);
 }
 
 /* ATA 194/190 extra bytes often hold lifetime min/max. NVMe: Identify
@@ -5430,7 +5436,13 @@ static void FormatSsdLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
         break;
     case HEALTH_STATUS_CAUTION:
         LectureAdd(szBuf, nBufLen, "Причина:\r\n");
-        if (pInfo->eWear == HEALTH_STATUS_CAUTION && pInfo->nEndurancePercent >= 0)
+        if (pInfo->nEndurancePercent >= 0 && pInfo->nEndurancePercent <= 5)
+            LectureAddF(szBuf, nBufLen,
+                "Остаток ресурса %d%%. Запас NAND почти исчерпан — "
+                "это износ, не ошибка носителя.\r\n",
+                pInfo->nEndurancePercent);
+        else if (pInfo->eWear == HEALTH_STATUS_CAUTION &&
+                 pInfo->nEndurancePercent >= 0)
             LectureAddF(szBuf, nBufLen,
                 "Остаток ресурса %d%%.\r\n", pInfo->nEndurancePercent);
         if (pInfo->nReallocated > 0)
@@ -5998,7 +6010,7 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
             (unsigned long)pInfo->dwPowerCycleCount);
         if (nC0 >= 0 && DriveTreatsC0AsPowerLoss(pInfo)) {
             LectureAddF(szBuf, nBufLen,
-                "  Аварийные отключения питания (192): %d. Тяжесть: INFO. "
+                "  Аварийные отключения питания (192): %d. Контекст, не штраф. "
                 "Находка только при росте счётчика, не по абсолютному числу.\r\n",
                 nC0);
         } else if (nC0 >= 0) {

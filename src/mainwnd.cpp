@@ -1556,7 +1556,7 @@ static LPARAM AttrStatusParam(const char* s)
         return (LPARAM)ATTRST_DIM;
     if (strcmp(s, "Не оценивается") == 0)
         return (LPARAM)ATTRST_SKIP;
-    if (strcmp(s, "INFO") == 0)
+    if (strcmp(s, "INFO") == 0 || strcmp(s, "контекст") == 0)
         return (LPARAM)ATTRST_INFO;
     if (strcmp(s, "Риск") == 0)
         return (LPARAM)ATTRST_RISK;
@@ -2114,7 +2114,7 @@ static const char* AtaRowStatus(const DRIVE_INFO* p, const SMART_ATTRIBUTE* a,
             if (SeagateRateErrs(a->bRawValue) > 0) return "Внимание";
             return "ОК";
         }
-        return "ОК";
+        return "Не оценивается";
     }
 
     if (id == 0xC1 && !ssd) {
@@ -2138,7 +2138,7 @@ static const char* AtaRowStatus(const DRIVE_INFO* p, const SMART_ATTRIBUTE* a,
     }
 
     if (id == 0xC0 && !ssd && DriveTreatsC0AsPowerLoss(p))
-        return "INFO";
+        return "контекст";
 
     if (!ssd && IsShockSensorAttr(id)) {
         if (p->nGSenseEvents <= 0)
@@ -3368,7 +3368,7 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                             break;
                         case ATTRST_INFO:
                             clrBadgeBg = RGB(71, 99, 128);
-                            psz = "INFO";
+                            psz = "контекст";
                             break;
                         default:
                             return CDRF_DODEFAULT;
