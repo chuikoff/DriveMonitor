@@ -1,4 +1,4 @@
-/* DriveMonitor - SMART public API. Fork of HDDHealth Monitor, MIT: see LICENSE. */
+/* DriveMonitor - SMART public API. MIT: see LICENSE. */
 
 #pragma once
 #ifndef SMART_H
@@ -666,6 +666,8 @@ BOOL  IsLikelyUsbFlashDrive(const DRIVE_INFO* pInfo);
 void  FormatSize(DWORD dwMB, char* szBuf, int nBufLen);
 DWORD GetRawValue(const BYTE* pRaw);
 unsigned __int64 GetRawValue48(const BYTE* pRaw);
+/* 187 Reported Uncorrect. -1 = absent or vendor packing (do not score). */
+int DecodeReportedUncorrect(const BYTE* pRaw, DRIVE_VENDOR vendor);
 /* Seagate ID 1/7/195: low 32 = operations, high 16 = errors (SMART attrib spec). */
 DWORD    SeagateRateOps(const BYTE* pRaw);
 unsigned SeagateRateErrs(const BYTE* pRaw);

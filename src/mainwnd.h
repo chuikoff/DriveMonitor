@@ -1,4 +1,4 @@
-/* DriveMonitor - main window. Fork of HDDHealth Monitor, MIT: see LICENSE. */
+/* DriveMonitor - main window. MIT: see LICENSE. */
 #pragma once
 #ifndef MAINWND_H
 #define MAINWND_H

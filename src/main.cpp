@@ -1,4 +1,4 @@
-/* DriveMonitor - WinMain. Fork of HDDHealth Monitor, MIT: see LICENSE. */
+/* DriveMonitor - WinMain. MIT: see LICENSE. */
 
 #ifdef _MSC_VER
 #pragma comment(lib, "comctl32.lib")

@@ -1,7 +1,5 @@
 # ============================================================================
-#  DriveMonitor - MinGW build
-#  Fork of HDDHealth Monitor (Ari Sohandri Putra / ARImetic Inc., MIT)
-#  Fork changes: chuikoff
+#  DriveMonitor - MinGW build. MIT: see LICENSE.
 # ============================================================================
 
 ifeq ($(OS),Windows_NT)

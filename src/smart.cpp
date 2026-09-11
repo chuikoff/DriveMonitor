@@ -1,5 +1,5 @@
 /* DriveMonitor - SMART acquisition (ATA / USB SAT / NVMe query).
- * Fork of HDDHealth Monitor, MIT: see LICENSE.
+ * MIT: see LICENSE.
  * Never IOCTL_STORAGE_PROTOCOL_COMMAND — nvme.sys bugchecks on it. */
 
 #define WIN32_LEAN_AND_MEAN
@@ -153,6 +153,7 @@ static BOOL NvmeIntelRstAdmin(HANDLE hDrive, DWORD opcode, DWORD nsid, DWORD cdw
 static BOOL IsRealtekNvmeUsbBridge(const DRIVE_INFO* pInfo);
 static void CopyNvmeIdentBuf(DRIVE_INFO* pInfo, const BYTE* pBuf, DWORD nAvail);
 static void TryNvmeLifetimeTemp(HANDLE hDrive, DRIVE_INFO* pInfo);
+static const SMART_ATTRIBUTE* FindAttr(const DRIVE_INFO* pInfo, BYTE id);
 
 #pragma pack(push, 1)
 typedef struct _CDI_NVME_QUERY_BUF {
@@ -668,6 +669,24 @@ unsigned __int64 GetRawValue48(const BYTE* pRaw)
             (unsigned __int64)pRaw[0];
 }
 
+/* Seagate 187 is a 32-bit counter. Hitachi/HGST (and similar firmware)
+ * leave the low 16 bits at 0 and pack other fields above — that is not
+ * millions of uncorrectable errors. */
+int DecodeReportedUncorrect(const BYTE* pRaw, DRIVE_VENDOR vendor)
+{
+    unsigned __int64 q;
+    DWORD lo32;
+    WORD lo16;
+    if (!pRaw) return -1;
+    q = GetRawValue48(pRaw);
+    lo32 = GetRawValue(pRaw);
+    lo16 = (WORD)(lo32 & 0xFFFFu);
+    if (vendor != VENDOR_SEAGATE && lo16 == 0 && q != 0)
+        return -1;
+    if (lo32 > (DWORD)INT_MAX) return INT_MAX;
+    return (int)lo32;
+}
+
 DWORD SeagateRateOps(const BYTE* pRaw)
 {
     if (!pRaw) return 0;
@@ -681,7 +700,7 @@ unsigned SeagateRateErrs(const BYTE* pRaw)
     return (unsigned)pRaw[4] | ((unsigned)pRaw[5] << 8);
 }
 
-static WORD GetRawValue16Lo(BYTE* pRaw)
+static WORD GetRawValue16Lo(const BYTE* pRaw)
 {
     return ((WORD)pRaw[1] << 8) | (WORD)pRaw[0];
 }
@@ -1363,6 +1382,17 @@ void GetAttrDecode(BYTE bID, const DRIVE_INFO* pInfo, ATTR_DECODE* out)
         out->eCrit = ATTR_CRIT_NONE;
         if (out->nSemanticConfidence < 80)
             out->nSemanticConfidence = 80;
+    }
+
+    /* 187: Hitachi-style packing is not a sector-error counter. */
+    if (bID == 0xBB && pInfo) {
+        const SMART_ATTRIBUTE* a187 = FindAttr(pInfo, 0xBB);
+        if (a187 && DecodeReportedUncorrect(a187->bRawValue, pInfo->eVendor) < 0) {
+            out->eEnc = RAW_ENC_UNKNOWN;
+            out->eCrit = ATTR_CRIT_NONE;
+            if (out->nSemanticConfidence > 30)
+                out->nSemanticConfidence = 30;
+        }
     }
 
     out->eState = (out->eEnc == RAW_ENC_UNKNOWN)
@@ -3985,14 +4015,24 @@ static BYTE FindThreshold(const DRIVE_INFO* pInfo, BYTE bAttrID)
     return 0;
 }
 
-/* RAW of attribute `id`, or -1 if the attribute is absent. */
+/* RAW of attribute `id`, or -1 if the attribute is absent.
+ * 05 uses the low 16 bits (sector count). 187 uses DecodeReportedUncorrect. */
 static int AttrRawOrNeg1(const DRIVE_INFO* pInfo, BYTE id)
 {
     int i;
     if (!pInfo) return -1;
     for (i = 0; i < 30; i++) {
         if (pInfo->attrData.stAttributes[i].bAttrID == id) {
-            unsigned __int64 v = GetRawValue48(pInfo->attrData.stAttributes[i].bRawValue);
+            const BYTE* raw = pInfo->attrData.stAttributes[i].bRawValue;
+            ATTR_DECODE dec;
+            unsigned __int64 v;
+            if (id == 0xBB)
+                return DecodeReportedUncorrect(raw, pInfo->eVendor);
+            GetAttrDecode(id, pInfo, &dec);
+            if (dec.eEnc == RAW_ENC_SECTORS_LO16)
+                v = (unsigned __int64)((WORD)raw[0] | ((WORD)raw[1] << 8));
+            else
+                v = GetRawValue48(raw);
             if (v > (unsigned __int64)INT_MAX) return INT_MAX;
             return (int)v;
         }
@@ -6351,38 +6391,61 @@ void ExtractSSDIndicators(DRIVE_INFO* pInfo)
     }
 }
 
-/* ============================================================
- * Temperature extraction from ATA attributes
- * ============================================================ */
+/* Current °C from 190/194. RAW[0] is the sensor. Normalized Value is
+ * 100−T (Seagate / HGST / Toshiba) — not Celsius. */
+static int TempCFromAtaAttr(const SMART_ATTRIBUTE* pA)
+{
+    int raw0, lo16, val;
+    if (!pA) return -1;
+    raw0 = (int)pA->bRawValue[0];
+    lo16 = (int)GetRawValue16Lo(pA->bRawValue);
+    val  = (int)pA->bAttrValue;
+
+    if (raw0 >= 1 && raw0 <= 125)
+        return raw0;
+    if (lo16 >= 1 && lo16 <= 125)
+        return lo16;
+    /* Value as °C only on old drives that store temperature there.
+     * 70–100 is the inverted 100−T scale, not a hot disk. */
+    if (val >= 1 && val <= 60)
+        return val;
+    if (val >= 70 && val <= 100) {
+        int t = 100 - val;
+        if (t >= 1 && t <= 60)
+            return t;
+    }
+    return -1;
+}
+
 static void ExtractTemperatureFromATA(DRIVE_INFO* pInfo)
 {
     int i;
     IdentifyDriveParts(pInfo);
-    /* Primary: 0xC2 (Temperature) */
     for (i = 0; i < 30; i++) {
         SMART_ATTRIBUTE* pA = &pInfo->attrData.stAttributes[i];
         if (pA->bAttrID == 0xC2) {
-            int t = (int)GetRawValue16Lo(pA->bRawValue);
-            if (t <= 0 || t > 150) t = (int)pA->bAttrValue;
-            if (t > 0 && t <= 150) { pInfo->nTemperatureC = t; return; }
+            int t = TempCFromAtaAttr(pA);
+            if (t > 0) { pInfo->nTemperatureC = t; return; }
         }
     }
-    /* Fallback: 0xBE (Airflow Temperature) */
     for (i = 0; i < 30; i++) {
         SMART_ATTRIBUTE* pA = &pInfo->attrData.stAttributes[i];
-        if (pA->bAttrID == 0xBE && pInfo->nTemperatureC < 0) {
-            int t = (int)pA->bAttrValue;
-            if (t > 0 && t <= 150) pInfo->nTemperatureC = t;
-            return;
+        if (pA->bAttrID == 0xBE) {
+            int t = TempCFromAtaAttr(pA);
+            if (t > 0) { pInfo->nTemperatureC = t; return; }
         }
-        if (pA->bAttrID == 0xE7 && pInfo->nTemperatureC < 0) {
-            /* Phison: 0xE7 is life remaining, not °C. Brand (Kingston/ADATA)
-             * must not trigger this — only the controller. */
-            if (pInfo->eController == CONTROLLER_PHISON)
-                continue;
-            {
-                int nT = (int)GetRawValue16Lo(pA->bRawValue);
-                if (nT > 0 && nT <= 150) pInfo->nTemperatureC = nT;
+    }
+    for (i = 0; i < 30; i++) {
+        SMART_ATTRIBUTE* pA = &pInfo->attrData.stAttributes[i];
+        if (pA->bAttrID != 0xE7)
+            continue;
+        if (pInfo->eController == CONTROLLER_PHISON)
+            continue;
+        {
+            int nT = (int)GetRawValue16Lo(pA->bRawValue);
+            if (nT > 0 && nT <= 125) {
+                pInfo->nTemperatureC = nT;
+                return;
             }
         }
     }

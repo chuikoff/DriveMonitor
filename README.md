@@ -1,16 +1,16 @@
 # DriveMonitor
 
-Русский просмотрщик S.M.A.R.T. для Windows. Форк [HDDHealth Monitor](https://github.com/arisohandriputra/HDD-Health-Monitor) (MIT).
+Русский просмотрщик S.M.A.R.T. для Windows.
 
 English: a one-shot Windows SMART viewer. No tray, no live polling, no Health% formula. Russian UI.
 
-**Текущий выпуск:** [1.6.2.3](https://github.com/chuikoff/DriveMonitor/releases/tag/1.6.2.3) — скачать `DriveMonitor.exe`, запустить от администратора.
+**Текущий выпуск:** [1.6.2.4](https://github.com/chuikoff/DriveMonitor/releases/tag/1.6.2.4) — скачать `DriveMonitor.exe`, запустить от администратора.
 
-Windows 10 / 11. Не CrystalDiskInfo и не Victoria: один снимок SMART (старт, hotplug, «Перечитать»), без трея, графика и теста поверхности.
+Windows 10 / 11. Один снимок SMART (старт, hotplug, «Перечитать»), без трея, графика и теста поверхности.
 
 ## Что внутри
 
-Читает сырые SMART-данные через `DeviceIoControl` и показывает таблицу Victoria: ID / Параметр / Значение / Худший / Порог / RAW / Статус.
+Читает сырые SMART-данные через `DeviceIoControl` и показывает таблицу: ID / Параметр / Значение / Худший / Порог / RAW / Статус.
 
 | Шина | Как читается |
 |------|----------------|
@@ -20,9 +20,9 @@ Windows 10 / 11. Не CrystalDiskInfo и не Victoria: один снимок SM
 
 Имя USB-переходника берётся из VID/PID (например Realtek `0BDA:9201`), не из модели диска.
 
-**Диск** — SMART RETURN STATUS / NVMe Critical Warning. **Оценка** — ATA-3 как в smartctl (без GPL-кода): prefail Value≤порог сейчас, In the past, usage на пороге, RAW носителя (05/197/198/187), self-test. Механика, температура и CRC — только в своих осях и лекции, **не** в overall (это не «худший из четырёх каналов»). Ресурс SSD тоже не здоровье: 11–20% остатка — ось «РИСК», overall не трогает; ≤5% может поднять оценку не выше **ВНИМАНИЕ**. Шкала **ХОРОШО → РИСК → ТРЕБУЕТ ВНИМАНИЯ → ПЛОХО → КРИТИЧЕСКОЕ**.
+**Диск** — SMART RETURN STATUS / NVMe Critical Warning. **Оценка** — ATA-3: prefail Value≤порог сейчас, In the past, usage на пороге, RAW носителя (05/197/198/187), self-test. Механика, температура и CRC — только в своих осях и лекции, **не** в overall (это не «худший из четырёх каналов»). Ресурс SSD тоже не здоровье: 11–20% остатка — ось «РИСК», overall не трогает; ≤5% может поднять оценку не выше **ВНИМАНИЕ**. Шкала **ХОРОШО → РИСК → ТРЕБУЕТ ВНИМАНИЯ → ПЛОХО → КРИТИЧЕСКОЕ**.
 
-Не формула Health%. Неизвестный vendor RAW не оценивается как поломка (например ECC 195 у не-Seagate — «не оценивается», не ОК). Наработка и C0 (аварийные парковки / power-loss) — контекст, не штраф. Для NVMe пороги температуры — WCTEMP/CCTEMP диска, иначе ~50/60/70 °C. USB-диск можно извлечь кнопкой «Извлечь». В текстовом отчёте есть версия программы.
+Не формула Health%. Неизвестный vendor RAW не оценивается как поломка (например ECC 195 у не-Seagate и 187 Hitachi/HGST с packing в старших байтах — «не оценивается», не ОК). ATA 190/194 — RAW[0] датчика, не инвертированный Value 100−T. Наработка и C0 (аварийные парковки / power-loss) — контекст, не штраф. Для NVMe пороги температуры — WCTEMP/CCTEMP диска, иначе ~50/60/70 °C. USB-диск можно извлечь кнопкой «Извлечь». В текстовом отчёте есть версия программы.
 
 Имена и RAW атрибутов зависят от производителя (Seagate, WD, Samsung, Kingston/Phison, ADATA, Toshiba, Micron, Hynix, Intel).
 
@@ -42,7 +42,6 @@ make clean
 
 ## Лицензия
 
-MIT. Оригинальный copyright: Ari Sohandri Putra / ARImetic Inc. Изменения форка: [chuikoff](https://github.com/chuikoff).
+MIT. Copyright: Ari Sohandri Putra / ARImetic Inc. Изменения: [chuikoff](https://github.com/chuikoff).
 
-Поддержать форк: https://boosty.to/chuikoff  
-Апстрим: https://github.com/sponsors/arisohandriputra/
+Поддержать: https://boosty.to/chuikoff

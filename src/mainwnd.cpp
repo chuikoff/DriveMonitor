@@ -1,4 +1,4 @@
-/* DriveMonitor - main window. Fork of HDDHealth Monitor, MIT: see LICENSE. */
+/* DriveMonitor - main window. MIT: see LICENSE. */
 
 #define WIN32_LEAN_AND_MEAN
 #ifndef UNICODE
@@ -1606,6 +1606,11 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
         ATTR_DECODE dec;
         GetAttrDecode(bID, pDrv, &dec);
         if (dec.eState == ATTR_DECODE_UNKNOWN) {
+            if (bID == 0xBB) {
+                safe_snprintf(szMain, "(vendor-specific)");
+                safe_snprintf_n(szBuf, nBufLen, "%s", szMain);
+                return;
+            }
             if (pDrv && pDrv->eType == DRIVE_TYPE_HDD &&
                 (bID == 0xB5 || bID == 0xB6 || bID == 0xAB || bID == 0xAC)) {
                 unsigned hi = (unsigned)((dw32 >> 16) & 0xFFFFu);
@@ -2063,14 +2068,6 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
     safe_snprintf_n(szBuf, nBufLen, "%s", szMain);
 }
 
-static DWORD AttrRaw32(const SMART_ATTRIBUTE* p)
-{
-    return (DWORD)p->bRawValue[0]
-         | ((DWORD)p->bRawValue[1] << 8)
-         | ((DWORD)p->bRawValue[2] << 16)
-         | ((DWORD)p->bRawValue[3] << 24);
-}
-
 /* Status from RAW counters and collapsed Value, not from Value==100. */
 static const char* AtaRowStatus(const DRIVE_INFO* p, const SMART_ATTRIBUTE* a,
                                 BYTE bThresh, BOOL bFailed)
@@ -2081,7 +2078,6 @@ static const char* AtaRowStatus(const DRIVE_INFO* p, const SMART_ATTRIBUTE* a,
     BOOL ssd = p->bIsNVMe || p->eType == DRIVE_TYPE_SSD_SATA ||
                p->eType == DRIVE_TYPE_M2_SATA;
     int n = -1;
-    DWORD raw;
 
     if (bFailed) {
         if (a->wStatusFlags & 0x0001)
@@ -2111,8 +2107,9 @@ static const char* AtaRowStatus(const DRIVE_INFO* p, const SMART_ATTRIBUTE* a,
     }
 
     if (id == 0xBB) {
-        raw = AttrRaw32(a);
-        if (raw > 0) return "ПЛОХО";
+        int n187 = DecodeReportedUncorrect(a->bRawValue, p->eVendor);
+        if (n187 < 0) return "Не оценивается";
+        if (n187 > 0) return "ПЛОХО";
         if (val <= 1) return "ПЛОХО";
         if (val <= 10) return "Внимание";
         return "ОК";
