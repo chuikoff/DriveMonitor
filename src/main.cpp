@@ -105,6 +105,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     }
 
     g_hInst = hInstance;
+    UiInitScale();
 
     INITCOMMONCONTROLSEX icex;
     icex.dwSize = sizeof(icex);
@@ -122,7 +123,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     wc.lpszClassName = DRIVEMONITOR_WNDCLASS;
     wc.hIcon         = LoadIconW(hInstance, MAKEINTRESOURCEW(IDI_APPICON));
     wc.hIconSm       = (HICON)LoadImageW(hInstance, MAKEINTRESOURCEW(IDI_APPICON),
-                                          IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR);
+                                          IMAGE_ICON,
+                                          GetSystemMetrics(SM_CXSMICON),
+                                          GetSystemMetrics(SM_CYSMICON),
+                                          LR_DEFAULTCOLOR);
 
     if (!RegisterClassExW(&wc)) {
         MessageBoxU8(NULL, "RegisterClassEx failed!", "Error", MB_ICONERROR);
@@ -131,7 +135,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     }
 
     RECT wa;
-    int nW = WINDOW_W, nH = WINDOW_H;
+    int nW = UiWindowW(), nH = UiWindowH();
     int nScrW, nScrH, nX, nY;
     if (!SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0)) {
         wa.left = 0;
@@ -164,16 +168,28 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     ShowWindow(hWnd, nCmdShow);
     UpdateWindow(hWnd);
 
-    MSG msg;
-    ZeroMemory(&msg, sizeof(msg));
-    while (GetMessage(&msg, NULL, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
+    {
+        HACCEL hAcc = UiCreateAccelTable();
+        MSG msg;
+        int nExit = 0;
+        ZeroMemory(&msg, sizeof(msg));
+        while (GetMessage(&msg, NULL, 0, 0)) {
+            if (msg.message == WM_MOUSEWHEEL && (LOWORD(msg.wParam) & MK_CONTROL)) {
+                SendMessage(hWnd, WM_COMMAND,
+                    ((short)HIWORD(msg.wParam) > 0) ? IDM_ZOOM_IN : IDM_ZOOM_OUT, 0);
+                continue;
+            }
+            if (hAcc && TranslateAccelerator(hWnd, hAcc, &msg))
+                continue;
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+        nExit = (int)msg.wParam;
+        if (hAcc) DestroyAcceleratorTable(hAcc);
+        if (hMutex) {
+            ReleaseMutex(hMutex);
+            CloseHandle(hMutex);
+        }
+        return nExit;
     }
-
-    if (hMutex) {
-        ReleaseMutex(hMutex);
-        CloseHandle(hMutex);
-    }
-    return (int)msg.wParam;
 }

@@ -32,7 +32,7 @@ static unsigned __int64 NVMeRead128Lo(const BYTE* p)
 {
     unsigned __int64 lo = 0;
     int i;
-    for (i = 7; i >= 0; i--) lo = (lo << 8) | p[i];
+    for (i = 7; i >= 0; i--) lo = (lo << 8) | (unsigned __int64)p[i];
     return lo;
 }
 
@@ -211,26 +211,245 @@ HFONT   g_hFontNormal = NULL;
 HFONT   g_hFontSmall  = NULL;
 HFONT   g_hFontBig    = NULL;
 
+#ifndef WM_DPICHANGED
+#define WM_DPICHANGED 0x02E0
+#endif
+
+static int   g_nDpi = 96;
+static int   g_nZoom = 100;
+static HMENU g_hViewMenu = NULL;
+
+static void LayoutMainWindow(HWND hWnd);
+static void RecreateUiFonts(void);
+static void UiApplyFonts(HWND hWnd);
+static void UiSyncZoomMenu(void);
+
+int UiScale(int px)
+{
+    int v;
+    if (px <= 0) return px;
+    v = MulDiv(px, g_nDpi * g_nZoom, 96 * 100);
+    return v < 1 ? 1 : v;
+}
+
+static UINT QueryDpiForMonitor(HMONITOR hMon)
+{
+    typedef HRESULT (WINAPI *PFN)(HMONITOR, int, UINT*, UINT*);
+    static PFN pGet = NULL;
+    static int once = 0;
+    UINT x = 0, y = 0;
+    if (!once) {
+        HMODULE h = LoadLibraryW(L"shcore.dll");
+        if (h) pGet = (PFN)GetProcAddress(h, "GetDpiForMonitor");
+        once = 1;
+    }
+    if (pGet && hMon && pGet(hMon, 0, &x, &y) == S_OK && x)
+        return x;
+    {
+        HDC hdc = GetDC(NULL);
+        x = hdc ? (UINT)GetDeviceCaps(hdc, LOGPIXELSX) : 96;
+        if (hdc) ReleaseDC(NULL, hdc);
+    }
+    return x ? x : 96;
+}
+
+static UINT QueryDpiForWindow(HWND hWnd)
+{
+    typedef UINT (WINAPI *PFN)(HWND);
+    static PFN pGet = NULL;
+    static int once = 0;
+    if (!once) {
+        HMODULE h = GetModuleHandleW(L"user32.dll");
+        if (h) pGet = (PFN)GetProcAddress(h, "GetDpiForWindow");
+        once = 1;
+    }
+    if (pGet && hWnd) {
+        UINT d = pGet(hWnd);
+        if (d) return d;
+    }
+    return QueryDpiForMonitor(MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST));
+}
+
+static int SnapZoom(int z)
+{
+    if (z < 100) z = 100;
+    if (z > 200) z = 200;
+    z = ((z + 12) / 25) * 25;
+    if (z < 100) z = 100;
+    if (z > 200) z = 200;
+    return z;
+}
+
+static int LoadZoomReg(void)
+{
+    HKEY k;
+    DWORD v = 100, sz = sizeof(v), t = 0;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\chuikoff\\DriveMonitor",
+                      0, KEY_READ, &k) == ERROR_SUCCESS) {
+        if (RegQueryValueExA(k, "UiZoom", NULL, &t, (LPBYTE)&v, &sz) != ERROR_SUCCESS ||
+            t != REG_DWORD)
+            v = 100;
+        RegCloseKey(k);
+    }
+    return SnapZoom((int)v);
+}
+
+static void SaveZoomReg(int z)
+{
+    HKEY k;
+    DWORD d = (DWORD)z;
+    if (RegCreateKeyExA(HKEY_CURRENT_USER, "Software\\chuikoff\\DriveMonitor",
+                        0, NULL, 0, KEY_WRITE, NULL, &k, NULL) == ERROR_SUCCESS) {
+        RegSetValueExA(k, "UiZoom", 0, REG_DWORD, (const BYTE*)&d, sizeof(d));
+        RegCloseKey(k);
+    }
+}
+
+void UiInitScale(void)
+{
+    POINT pt = { 0, 0 };
+    g_nZoom = LoadZoomReg();
+    g_nDpi = (int)QueryDpiForMonitor(MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY));
+    if (g_nDpi < 96) g_nDpi = 96;
+}
+
+int UiWindowW(void)    { return UiScale(WINDOW_W); }
+int UiWindowH(void)    { return UiScale(WINDOW_H); }
+int UiWindowHMin(void) { return UiScale(WINDOW_H_MIN); }
+
+HACCEL UiCreateAccelTable(void)
+{
+    ACCEL a[] = {
+        { (BYTE)(FVIRTKEY | FCONTROL),           (WORD)'S',           IDM_SCREENSHOT },
+        { (BYTE)(FVIRTKEY | FCONTROL),           (WORD)VK_OEM_PLUS,   IDM_ZOOM_IN },
+        { (BYTE)(FVIRTKEY | FCONTROL | FSHIFT),  (WORD)VK_OEM_PLUS,   IDM_ZOOM_IN },
+        { (BYTE)(FVIRTKEY | FCONTROL),           (WORD)VK_ADD,        IDM_ZOOM_IN },
+        { (BYTE)(FVIRTKEY | FCONTROL),           (WORD)VK_OEM_MINUS,  IDM_ZOOM_OUT },
+        { (BYTE)(FVIRTKEY | FCONTROL),           (WORD)VK_SUBTRACT,   IDM_ZOOM_OUT },
+        { (BYTE)(FVIRTKEY | FCONTROL),           (WORD)'0',           IDM_ZOOM_100 },
+        { (BYTE)(FVIRTKEY | FCONTROL),           (WORD)VK_NUMPAD0,    IDM_ZOOM_100 },
+    };
+    return CreateAcceleratorTable(a, (int)(sizeof(a) / sizeof(a[0])));
+}
+
+static HFONT UiMakeFont(int px, int weight, BOOL italic)
+{
+    return CreateFontA(-UiScale(px), 0, 0, 0, weight, italic, FALSE, FALSE,
+                       DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                       CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
+}
+
+static void RecreateUiFonts(void)
+{
+    if (g_hFontTitle)  { DeleteObject(g_hFontTitle);  g_hFontTitle  = NULL; }
+    if (g_hFontNormal) { DeleteObject(g_hFontNormal); g_hFontNormal = NULL; }
+    if (g_hFontSmall)  { DeleteObject(g_hFontSmall);  g_hFontSmall  = NULL; }
+    if (g_hFontBig)    { DeleteObject(g_hFontBig);    g_hFontBig    = NULL; }
+    g_hFontTitle  = UiMakeFont(13, FW_NORMAL, FALSE);
+    g_hFontNormal = UiMakeFont(12, FW_NORMAL, FALSE);
+    g_hFontSmall  = UiMakeFont(11, FW_NORMAL, FALSE);
+    g_hFontBig    = UiMakeFont(32, FW_BOLD,   FALSE);
+}
+
+static void UiApplyFonts(HWND hWnd)
+{
+    HWND h;
+    for (h = GetWindow(hWnd, GW_CHILD); h; h = GetWindow(h, GW_HWNDNEXT)) {
+        int id = GetDlgCtrlID(h);
+        HFONT f = g_hFontSmall;
+        if (id == IDC_PREDICT_STATIC ||
+            id == IDC_MODEL_STATIC || id == IDC_BRAND_STATIC ||
+            id == IDC_CONTROLLER_STATIC || id == IDC_SERIAL_STATIC ||
+            id == IDC_FIRMWARE_STATIC || id == IDC_SIZE_STATIC ||
+            id == IDC_TEMP_STATIC || id == IDC_POH_STATIC ||
+            id == IDC_STATUS_STATIC || id == IDC_PROTOCOL_STATIC ||
+            id == IDC_ADAPTER_STATIC)
+            f = g_hFontNormal;
+        SendMessage(h, WM_SETFONT, (WPARAM)f, TRUE);
+        if (id == IDC_ATTR_LIST) {
+            HWND hHdr = ListView_GetHeader(h);
+            if (hHdr) SendMessage(hHdr, WM_SETFONT, (WPARAM)g_hFontSmall, TRUE);
+        }
+    }
+}
+
+static void UiSyncZoomMenu(void)
+{
+    UINT id = IDM_ZOOM_100;
+    if (g_nZoom == 125) id = IDM_ZOOM_125;
+    else if (g_nZoom == 150) id = IDM_ZOOM_150;
+    else if (g_nZoom == 175) id = IDM_ZOOM_175;
+    else if (g_nZoom == 200) id = IDM_ZOOM_200;
+    if (g_hViewMenu)
+        CheckMenuRadioItem(g_hViewMenu, IDM_ZOOM_100, IDM_ZOOM_200, id, MF_BYCOMMAND);
+}
+
+static void UiChangeZoom(HWND hWnd, int z)
+{
+    int old = g_nZoom;
+    RECT rc, wa;
+    int nw, nh;
+    HMONITOR hMon;
+    MONITORINFO mi;
+
+    z = SnapZoom(z);
+    if (z == old) return;
+    g_nZoom = z;
+    SaveZoomReg(z);
+    RecreateUiFonts();
+    UiApplyFonts(hWnd);
+    UiSyncZoomMenu();
+
+    GetWindowRect(hWnd, &rc);
+    nw = MulDiv(rc.right - rc.left, z, old);
+    nh = MulDiv(rc.bottom - rc.top, z, old);
+    if (nw < UiWindowW()) nw = UiWindowW();
+    if (nh < UiWindowHMin()) nh = UiWindowHMin();
+
+    ZeroMemory(&mi, sizeof(mi));
+    mi.cbSize = sizeof(mi);
+    hMon = MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST);
+    if (GetMonitorInfoW(hMon, &mi))
+        wa = mi.rcWork;
+    else if (!SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0)) {
+        wa.left = 0; wa.top = 0;
+        wa.right = GetSystemMetrics(SM_CXSCREEN);
+        wa.bottom = GetSystemMetrics(SM_CYSCREEN);
+    }
+    if (nw > wa.right - wa.left) nw = wa.right - wa.left;
+    if (nh > wa.bottom - wa.top) nh = wa.bottom - wa.top;
+    if (rc.left + nw > wa.right) rc.left = wa.right - nw;
+    if (rc.top + nh > wa.bottom) rc.top = wa.bottom - nh;
+    if (rc.left < wa.left) rc.left = wa.left;
+    if (rc.top < wa.top) rc.top = wa.top;
+
+    SetWindowPos(hWnd, NULL, rc.left, rc.top, nw, nh, SWP_NOZORDER | SWP_NOACTIVATE);
+    LayoutMainWindow(hWnd);
+    InvalidateRect(hWnd, NULL, TRUE);
+}
+
+static void UiOnDpiChanged(HWND hWnd, UINT dpi, const RECT* prc)
+{
+    if (dpi < 96) dpi = 96;
+    g_nDpi = (int)dpi;
+    RecreateUiFonts();
+    UiApplyFonts(hWnd);
+    if (prc)
+        SetWindowPos(hWnd, NULL, prc->left, prc->top,
+                     prc->right - prc->left, prc->bottom - prc->top,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+    LayoutMainWindow(hWnd);
+    InvalidateRect(hWnd, NULL, TRUE);
+}
+
 void CreateGDIObjects(void)
 {
-    g_hbrBG     = CreateSolidBrush(CLR_BG);
-    g_hbrPanel  = CreateSolidBrush(CLR_PANEL);
-    g_hbrGreen  = CreateSolidBrush(CLR_GREEN);
-    g_hbrYellow = CreateSolidBrush(CLR_YELLOW);
-    g_hbrRed    = CreateSolidBrush(CLR_RED);
-
-    g_hFontTitle  = CreateFontA(-13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                                DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
-    g_hFontNormal = CreateFontA(-12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                                DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
-    g_hFontSmall  = CreateFontA(-11, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                                DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
-    g_hFontBig    = CreateFontA(-32, 0, 0, 0, FW_BOLD,   FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                                DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
+    if (!g_hbrBG)     g_hbrBG     = CreateSolidBrush(CLR_BG);
+    if (!g_hbrPanel)  g_hbrPanel  = CreateSolidBrush(CLR_PANEL);
+    if (!g_hbrGreen)  g_hbrGreen  = CreateSolidBrush(CLR_GREEN);
+    if (!g_hbrYellow) g_hbrYellow = CreateSolidBrush(CLR_YELLOW);
+    if (!g_hbrRed)    g_hbrRed    = CreateSolidBrush(CLR_RED);
+    RecreateUiFonts();
 }
 
 static ULONG_PTR g_gdiplusToken = 0;
@@ -812,15 +1031,15 @@ static void DeviceNotify_Unregister(void)
 }
 
 void DestroyGDIObjects(void){
-    if (g_hbrBG)     DeleteObject(g_hbrBG);
-    if (g_hbrPanel)  DeleteObject(g_hbrPanel);
-    if (g_hbrGreen)  DeleteObject(g_hbrGreen);
-    if (g_hbrYellow) DeleteObject(g_hbrYellow);
-    if (g_hbrRed)    DeleteObject(g_hbrRed);
-    if (g_hFontTitle)  DeleteObject(g_hFontTitle);
-    if (g_hFontNormal) DeleteObject(g_hFontNormal);
-    if (g_hFontSmall)  DeleteObject(g_hFontSmall);
-    if (g_hFontBig)    DeleteObject(g_hFontBig);
+    if (g_hbrBG)     { DeleteObject(g_hbrBG);     g_hbrBG     = NULL; }
+    if (g_hbrPanel)  { DeleteObject(g_hbrPanel);  g_hbrPanel  = NULL; }
+    if (g_hbrGreen)  { DeleteObject(g_hbrGreen);  g_hbrGreen  = NULL; }
+    if (g_hbrYellow) { DeleteObject(g_hbrYellow); g_hbrYellow = NULL; }
+    if (g_hbrRed)    { DeleteObject(g_hbrRed);    g_hbrRed    = NULL; }
+    if (g_hFontTitle)  { DeleteObject(g_hFontTitle);  g_hFontTitle  = NULL; }
+    if (g_hFontNormal) { DeleteObject(g_hFontNormal); g_hFontNormal = NULL; }
+    if (g_hFontSmall)  { DeleteObject(g_hFontSmall);  g_hFontSmall  = NULL; }
+    if (g_hFontBig)    { DeleteObject(g_hFontBig);    g_hFontBig    = NULL; }
 }
 
 COLORREF GetHealthStatusColor(DRIVE_HEALTH_STATUS eStatus)
@@ -905,8 +1124,8 @@ LRESULT CALLBACK HealthBarWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lP
                     safe_snprintf(szDisk, "Диск: %s", GetHealthStatusName(eDisk));
                 safe_snprintf(szOurs, "Оценка: %s", GetHealthStatusName(eOurs));
                 {
-                    RECT rc1 = { 4, 2, w - 4, h / 2 };
-                    RECT rc2 = { 4, h / 2 - 1, w - 4, h - 2 };
+                    RECT rc1 = { UiScale(4), UiScale(2), w - UiScale(4), h / 2 };
+                    RECT rc2 = { UiScale(4), h / 2 - 1, w - UiScale(4), h - 2 };
                     DrawTextU8(hdc, szDisk, &rc1, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
                     DrawTextU8(hdc, szOurs, &rc2, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
                 }
@@ -1025,12 +1244,10 @@ LRESULT CALLBACK DriveBtnWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPa
                 DRIVE_INFO* pD = &g_Drives[nIdx];
 
                 char szName[64];
-                if (strlen(pD->szModel) > 0) {
+                if (strlen(pD->szModel) > 0)
                     safe_snprintf(szName, "%s", pD->szModel);
-                    if (strlen(szName) > 26) { szName[24] = '.'; szName[25] = '.'; szName[26] = '\0'; }
-                } else {
+                else
                     safe_snprintf(szName, "Диск %d", pD->nDriveIndex);
-                }
 
                 char szType[16];
                 const char* szT = GetDriveTypeName(pD->eType);
@@ -1074,21 +1291,26 @@ LRESULT CALLBACK DriveBtnWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPa
 
                 hOldFont = (HFONT)SelectObject(hdc, g_hFontNormal);
                 SetTextColor(hdc, clrText);
-                RECT rcName = { rcBuf.left + 8, rcBuf.top + 4, rcBuf.right - 8, rcBuf.top + 20 };
+                RECT rcName = { rcBuf.left + UiScale(8), rcBuf.top + UiScale(4),
+                                rcBuf.right - UiScale(8), rcBuf.top + UiScale(20) };
                 DrawTextU8(hdc, szName, &rcName, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
 
                 SelectObject(hdc, g_hFontSmall);
-                RECT rcType = { rcBuf.left + 8, rcBuf.top + 20, (rcBuf.left + rcBuf.right) / 2, rcBuf.top + 36 };
+                RECT rcType = { rcBuf.left + UiScale(8), rcBuf.top + UiScale(20),
+                                (rcBuf.left + rcBuf.right) / 2, rcBuf.top + UiScale(36) };
                 SetTextColor(hdc, CLR_TEXT_DIM);
                 DrawTextU8(hdc, szType, &rcType, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
-                RECT rcHealth = { (rcBuf.left + rcBuf.right) / 2, rcBuf.top + 20, rcBuf.right - 8, rcBuf.top + 36 };
+                RECT rcHealth = { (rcBuf.left + rcBuf.right) / 2, rcBuf.top + UiScale(20),
+                                  rcBuf.right - UiScale(8), rcBuf.top + UiScale(36) };
                 SetTextColor(hdc, clrH);
                 DrawTextU8(hdc, szHealth, &rcHealth, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
 
                 {
-                    RECT rcCap  = { rcBuf.left + 8, rcBuf.bottom - 17, (rcBuf.left + rcBuf.right) / 2, rcBuf.bottom - 4 };
-                    RECT rcTmp  = { (rcBuf.left + rcBuf.right) / 2, rcBuf.bottom - 17, rcBuf.right - 8, rcBuf.bottom - 4 };
+                    RECT rcCap  = { rcBuf.left + UiScale(8), rcBuf.bottom - UiScale(17),
+                                    (rcBuf.left + rcBuf.right) / 2, rcBuf.bottom - UiScale(4) };
+                    RECT rcTmp  = { (rcBuf.left + rcBuf.right) / 2, rcBuf.bottom - UiScale(17),
+                                    rcBuf.right - UiScale(8), rcBuf.bottom - UiScale(4) };
                     SetTextColor(hdc, clrText);
                     DrawTextU8(hdc, szCap, &rcCap, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
                     if (szTempStr[0]) {
@@ -1180,9 +1402,9 @@ void RepaintHealthBar(void)
 void UpdateDriveButtons(HWND hWnd)
 {
     int i;
-    int nBtnW  = DRIVE_BTN_PANEL_W - 12;
-    int nBtnH  = DRIVE_BTN_H;
-    int nStartY = 40;
+    int nBtnW  = UiScale(DRIVE_BTN_PANEL_W - 12);
+    int nBtnH  = UiScale(DRIVE_BTN_H);
+    int nStartY = UiScale(40);
 
     BOOL bNeedRebuild = FALSE;
 
@@ -1213,22 +1435,22 @@ void UpdateDriveButtons(HWND hWnd)
         if (g_nDriveCount == 0) {
             HWND hPlaceholder = CreateWindowExU8(0, "STATIC", "Диски не найдены",
                 WS_CHILD | WS_VISIBLE | SS_CENTER,
-                6, nStartY, nBtnW, nBtnH,
+                UiScale(6), nStartY, nBtnW, nBtnH,
                 hWnd, (HMENU)(IDC_DRIVE_BTN_BASE), g_hInst, NULL);
             SendMessage(hPlaceholder, WM_SETFONT, (WPARAM)g_hFontSmall, TRUE);
             g_hDriveBtn[0] = hPlaceholder;
-            return;
-        }
+        } else {
 
         for (i = 0; i < g_nDriveCount && i < MAX_DRIVES; i++) {
-            int nY = nStartY + i * (nBtnH + DRIVE_BTN_GAP);
+            int nY = nStartY + i * (nBtnH + UiScale(DRIVE_BTN_GAP));
             g_hDriveBtn[i] = CreateWindowExU8(
                 0, "LLHDDriveBtn", "",
                 WS_CHILD | WS_VISIBLE,
-                6, nY, nBtnW, nBtnH,
+                UiScale(6), nY, nBtnW, nBtnH,
                 hWnd, (HMENU)(UINT_PTR)(IDC_DRIVE_BTN_BASE + i), g_hInst, NULL
             );
             SetWindowLongPtrA(g_hDriveBtn[i], GWLP_USERDATA, (LONG_PTR)i);
+        }
         }
     } else {
 
@@ -1237,6 +1459,7 @@ void UpdateDriveButtons(HWND hWnd)
                 InvalidateRect(g_hDriveBtn[i], NULL, FALSE);
         }
     }
+    LayoutMainWindow(hWnd);
 }
 
 
@@ -1556,7 +1779,8 @@ static LPARAM AttrStatusParam(const char* s)
         return (LPARAM)ATTRST_DIM;
     if (strcmp(s, "Не оценивается") == 0)
         return (LPARAM)ATTRST_SKIP;
-    if (strcmp(s, "INFO") == 0 || strcmp(s, "контекст") == 0)
+    if (strcmp(s, "INFO") == 0 || strcmp(s, "контекст") == 0 ||
+        strcmp(s, "журнал питания") == 0)
         return (LPARAM)ATTRST_INFO;
     if (strcmp(s, "Риск") == 0)
         return (LPARAM)ATTRST_RISK;
@@ -1587,16 +1811,9 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
     DRIVE_TYPE eType = pDrv ? pDrv->eType : DRIVE_TYPE_UNKNOWN;
     DRIVE_CONTROLLER eCtl = pDrv ? pDrv->eController : CONTROLLER_UNKNOWN;
 
-    DWORD dw32 = ((DWORD)pRaw[3] << 24) | ((DWORD)pRaw[2] << 16) |
-                 ((DWORD)pRaw[1] <<  8) |  (DWORD)pRaw[0];
-    WORD  w16  = ((WORD)pRaw[1] << 8) | (WORD)pRaw[0];
-    unsigned __int64 qw48 =
-        ((unsigned __int64)pRaw[5] << 40) |
-        ((unsigned __int64)pRaw[4] << 32) |
-        ((unsigned __int64)pRaw[3] << 24) |
-        ((unsigned __int64)pRaw[2] << 16) |
-        ((unsigned __int64)pRaw[1] <<  8) |
-         (unsigned __int64)pRaw[0];
+    DWORD dw32 = GetRawValue(pRaw);
+    WORD  w16  = (WORD)(dw32 & 0xFFFFu);
+    unsigned __int64 qw48 = GetRawValue48(pRaw);
 
     (void)bWorst;
     (void)bThresh;
@@ -1883,9 +2100,9 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
     case 0xF3:
     case 0xF4:
     {
-        /* Phison 241/242 RAW is host GB, not a 512-byte LBA count. */
+        /* Phison 241/242: GB or 32 MB units (S11). Not 512-byte LBA. */
         if (eCtl == CONTROLLER_PHISON && (bID == 0xF1 || bID == 0xF2)) {
-            unsigned __int64 nGB = qw48;
+            unsigned __int64 nGB = ScalePhisonHostGiB(pDrv, qw48);
             if (nGB > 4000000ULL)
                 nGB = 4000000ULL;
             if (bID == 0xF1)
@@ -2143,8 +2360,10 @@ static const char* AtaRowStatus(const DRIVE_INFO* p, const SMART_ATTRIBUTE* a,
         return "ОК";
     }
 
-    if (id == 0xC0 && !ssd && DriveTreatsC0AsPowerLoss(p))
-        return "контекст";
+    if (id == 0xC0 && DriveTreatsC0AsPowerLoss(p))
+        return (GetRawValue(a->bRawValue) > 0) ? "журнал питания" : "ОК";
+    if ((id == 0xA0 || id == 0xAE) && GetRawValue(a->bRawValue) > 0)
+        return "журнал питания";
 
     if (!ssd && IsShockSensorAttr(id)) {
         if (p->nGSenseEvents <= 0)
@@ -2326,7 +2545,8 @@ void UpdateAttrList(HWND hWnd, int nDriveIdx)
         NVME_ROW("0Ch","Наработка",szPOH,"ОК");
 
         safe_snprintf(szUS,"%llu",(unsigned long long)qwUnsafeSDs);
-        NVME_ROW("0Dh","Небезопасные выключения",szUS,"ОК");
+        NVME_ROW("0Dh","Небезопасные выключения",szUS,
+            (qwUnsafeSDs>0?"журнал питания":"ОК"));
 
         safe_snprintf(szME,"%llu",(unsigned long long)qwMediaErr);
         NVME_ROW("0Eh","Ошибки носителя",szME,(qwMediaErr>0?"ПЛОХО":"ОК"));
@@ -2335,10 +2555,12 @@ void UpdateAttrList(HWND hWnd, int nDriveIdx)
         NVME_ROW("0Fh","Записи в журнале ошибок",szEL,(qwErrLog>0?"Внимание":"ОК"));
 
         safe_snprintf(szWCT,"%lu мин",(unsigned long)pLog->WarningCompTempTime);
-        NVME_ROW("--","Время при высокой температуре",szWCT,(pLog->WarningCompTempTime>0?"Внимание":"ОК"));
+        NVME_ROW("--","Время при высокой температуре",szWCT,
+            (pLog->WarningCompTempTime>0?"контекст":"ОК"));
 
         safe_snprintf(szCCT,"%lu мин",(unsigned long)pLog->CriticalCompTempTime);
-        NVME_ROW("--","Время при критической температуре",szCCT,(pLog->CriticalCompTempTime>0?"ПЛОХО":"ОК"));
+        NVME_ROW("--","Время при критической температуре",szCCT,
+            (pLog->CriticalCompTempTime>0?"контекст":"ОК"));
         {
             int ts;
             for (ts = 0; ts < 8; ts++) {
@@ -2504,9 +2726,12 @@ void UpdateAttrList(HWND hWnd, int nDriveIdx)
 
 static volatile LONG g_bScanBusy = 0;
 
-/* Private scan buffer: the worker thread writes ONLY these. The UI thread
- * copies into g_Drives / g_nDriveCount on WM_APP_REFRESH_DONE so paint
- * never races with ScanDrives' ZeroMemory of live slots. */
+/* Double buffer. The worker writes only g_ScanBuf / g_nScanBufCount.
+ * The UI thread reads only g_Drives / g_nDriveCount (paint, list, buttons).
+ * Merge is WM_APP_REFRESH_DONE on the UI thread: Snapshot_Save, then memcpy
+ * g_ScanBuf → g_Drives. g_bScanBusy is Interlocked CAS 0→1 in RefreshData
+ * and InterlockedExchange 0 after that memcpy, so a second scan cannot start
+ * (and cannot overwrite g_ScanBuf) while the copy is in flight. */
 static DRIVE_INFO g_ScanBuf[MAX_DRIVES];
 static int        g_nScanBufCount;
 
@@ -2582,92 +2807,89 @@ static LRESULT CALLBACK AboutDlgProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM
     {
     case WM_CREATE:
         {
-            int cx = ABOUT_W;
+            int cx = UiScale(ABOUT_W);
+            int ico = UiScale(32);
 
             HWND hIco = CreateWindowExU8(0, "STATIC", "",
                 WS_CHILD | WS_VISIBLE | SS_ICON | SS_CENTERIMAGE,
-                (cx - 32) / 2, 18, 32, 32,
+                (cx - ico) / 2, UiScale(18), ico, ico,
                 hDlg, (HMENU)0, g_hInst, NULL);
             HICON hIc = (HICON)LoadImageA(g_hInst, MAKEINTRESOURCEA(IDI_APPICON),
-                IMAGE_ICON, 32, 32, LR_DEFAULTCOLOR);
+                IMAGE_ICON, ico, ico, LR_DEFAULTCOLOR);
             if (hIc) SendMessageA(hIco, STM_SETICON, (WPARAM)hIc, 0);
 
-            HFONT hFontBold = CreateFontA(-15, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
-                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
+            HFONT hFontBold = UiMakeFont(15, FW_BOLD, FALSE);
             SetPropA(hDlg, PROP_ABOUT_FONT_BOLD, (HANDLE)hFontBold);
             HWND hName = CreateWindowExU8(0, "STATIC",
                 "DriveMonitor " DRIVEMONITOR_VERSION " (сборка " DRIVEMONITOR_BUILD_STR ")",
                 WS_CHILD | WS_VISIBLE | SS_CENTER,
-                20, 58, cx - 40, 22,
+                UiScale(20), UiScale(58), cx - UiScale(40), UiScale(22),
                 hDlg, (HMENU)0, g_hInst, NULL);
             SendMessageA(hName, WM_SETFONT, (WPARAM)hFontBold, TRUE);
 
             HWND hDesc = CreateWindowExU8(0, "STATIC",
                 "Мониторинг состояния дисков и S.M.A.R.T. на низком уровне.",
                 WS_CHILD | WS_VISIBLE | SS_CENTER,
-                20, 82, cx - 40, 18,
+                UiScale(20), UiScale(82), cx - UiScale(40), UiScale(18),
                 hDlg, (HMENU)0, g_hInst, NULL);
             SendMessageA(hDesc, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
 
             CreateWindowExU8(0, "STATIC", "",
                 WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ,
-                20, 108, cx - 40, 2,
+                UiScale(20), UiScale(108), cx - UiScale(40), UiScale(2),
                 hDlg, (HMENU)0, g_hInst, NULL);
 
             HWND hCopy = CreateWindowExU8(0, "STATIC",
                 "\xC2\xA9 2026 chuikoff",
                 WS_CHILD | WS_VISIBLE | SS_CENTER,
-                20, 118, cx - 40, 18,
+                UiScale(20), UiScale(118), cx - UiScale(40), UiScale(18),
                 hDlg, (HMENU)0, g_hInst, NULL);
             SendMessageA(hCopy, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
 
             HWND hDrv = CreateWindowExU8(0, "STATIC",
                 "Автор: chuikoff — MIT License",
                 WS_CHILD | WS_VISIBLE | SS_CENTER,
-                20, 140, cx - 40, 18,
+                UiScale(20), UiScale(140), cx - UiScale(40), UiScale(18),
                 hDlg, (HMENU)0, g_hInst, NULL);
             SendMessageA(hDrv, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
 
             CreateWindowExU8(0, "STATIC", "",
                 WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ,
-                20, 166, cx - 40, 2,
+                UiScale(20), UiScale(166), cx - UiScale(40), UiScale(2),
                 hDlg, (HMENU)0, g_hInst, NULL);
 
             {
                 HWND hLicStatus = CreateWindowExU8(0, "STATIC",
                     "Свободное ПО с открытым исходным кодом",
                     WS_CHILD | WS_VISIBLE | SS_CENTER,
-                    20, 176, cx - 40, 18,
+                    UiScale(20), UiScale(176), cx - UiScale(40), UiScale(18),
                     hDlg, (HMENU)IDC_ABOUT_LIC_STATUS, g_hInst, NULL);
                 SendMessageA(hLicStatus, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
 
                 HWND hActivate = CreateWindowExU8(0, "BUTTON", "Поддержать",
                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                    (cx - 120) / 2, 200, 120, 26,
+                    (cx - UiScale(120)) / 2, UiScale(200), UiScale(120), UiScale(26),
                     hDlg, (HMENU)IDC_ABOUT_ACTIVATE, g_hInst, NULL);
                 SendMessageA(hActivate, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
             }
 
             CreateWindowExU8(0, "STATIC", "",
                 WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ,
-                20, 234, cx - 40, 2,
+                UiScale(20), UiScale(234), cx - UiScale(40), UiScale(2),
                 hDlg, (HMENU)0, g_hInst, NULL);
 
-            HFONT hFontLink = CreateFontA(-12, 0, 0, 0, FW_NORMAL, FALSE, TRUE, FALSE,
-                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
+            HFONT hFontLink = UiMakeFont(12, FW_NORMAL, TRUE);
             SetPropA(hDlg, PROP_ABOUT_FONT_LINK, (HANDLE)hFontLink);
             HWND hLink = CreateWindowExU8(0, "STATIC",
                 DONATE_URL,
                 WS_CHILD | WS_VISIBLE | SS_CENTER | SS_NOTIFY,
-                20, 244, cx - 40, 18,
+                UiScale(20), UiScale(244), cx - UiScale(40), UiScale(18),
                 hDlg, (HMENU)IDC_ABOUT_LINK, g_hInst, NULL);
             SendMessageA(hLink, WM_SETFONT, (WPARAM)hFontLink, TRUE);
 
             HWND hBtn = CreateWindowExU8(0, "BUTTON", "OK",
                 WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-                (cx - 80) / 2, 274, 80, 26,
+                (cx - UiScale(80)) / 2, UiScale(274), UiScale(80), UiScale(26),
                 hDlg, (HMENU)IDOK, g_hInst, NULL);
             SendMessageA(hBtn, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
 
@@ -2768,17 +2990,18 @@ void ShowAboutDialog(HWND hWndParent)
     int nScrH = GetSystemMetrics(SM_CYSCREEN);
 
     int nX, nY;
+    int aw = UiScale(ABOUT_W), ah = UiScale(ABOUT_H);
     if (hWndParent) {
         RECT rcP;
         GetWindowRect(hWndParent, &rcP);
-        nX = rcP.left + (rcP.right  - rcP.left - ABOUT_W) / 2;
-        nY = rcP.top  + (rcP.bottom - rcP.top  - ABOUT_H) / 2;
+        nX = rcP.left + (rcP.right  - rcP.left - aw) / 2;
+        nY = rcP.top  + (rcP.bottom - rcP.top  - ah) / 2;
     } else {
-        nX = (nScrW - ABOUT_W) / 2;
-        nY = (nScrH - ABOUT_H) / 2;
+        nX = (nScrW - aw) / 2;
+        nY = (nScrH - ah) / 2;
     }
 
-    RECT rcAdj = {0, 0, ABOUT_W, ABOUT_H};
+    RECT rcAdj = {0, 0, aw, ah};
     AdjustWindowRectEx(&rcAdj, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
                        FALSE, WS_EX_DLGMODALFRAME);
     int nWinW = rcAdj.right  - rcAdj.left;
@@ -2822,19 +3045,17 @@ static LRESULT CALLBACK HealthLectureDlgProc(HWND hDlg, UINT uMsg, WPARAM wParam
             GetClientRect(hDlg, &rc);
             cx = rc.right - rc.left;
             cy = rc.bottom - rc.top;
-            if (cx < 200) cx = LECTURE_W;
-            if (cy < 200) cy = LECTURE_H;
-            btnW = 88;
-            btnH = 26;
-            margin = 12;
+            if (cx < UiScale(200)) cx = UiScale(LECTURE_W);
+            if (cy < UiScale(200)) cy = UiScale(LECTURE_H);
+            btnW = UiScale(88);
+            btnH = UiScale(26);
+            margin = UiScale(12);
             editH = cy - margin * 3 - btnH;
-            if (editH < 80) editH = 80;
+            if (editH < UiScale(80)) editH = UiScale(80);
 
-            hFont = CreateFontA(-13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                CLEARTYPE_QUALITY, VARIABLE_PITCH | FF_SWISS, "Segoe UI");
+            hFont = UiMakeFont(13, FW_NORMAL, FALSE);
             if (!hFont)
-                hFont = CreateFontA(-13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                hFont = CreateFontA(-UiScale(13), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                     DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                     CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, "Courier New");
             if (!hFont)
@@ -2929,17 +3150,17 @@ void ShowHealthLectureDialog(HWND hParent)
     if (hParent) {
         RECT rcP;
         GetWindowRect(hParent, &rcP);
-        nX = rcP.left + (rcP.right  - rcP.left - LECTURE_W) / 2;
-        nY = rcP.top  + (rcP.bottom - rcP.top  - LECTURE_H) / 2;
+        nX = rcP.left + (rcP.right  - rcP.left - UiScale(LECTURE_W)) / 2;
+        nY = rcP.top  + (rcP.bottom - rcP.top  - UiScale(LECTURE_H)) / 2;
     } else {
-        nX = (GetSystemMetrics(SM_CXSCREEN) - LECTURE_W) / 2;
-        nY = (GetSystemMetrics(SM_CYSCREEN) - LECTURE_H) / 2;
+        nX = (GetSystemMetrics(SM_CXSCREEN) - UiScale(LECTURE_W)) / 2;
+        nY = (GetSystemMetrics(SM_CYSCREEN) - UiScale(LECTURE_H)) / 2;
     }
 
     rcAdj.left = 0;
     rcAdj.top = 0;
-    rcAdj.right = LECTURE_W;
-    rcAdj.bottom = LECTURE_H;
+    rcAdj.right = UiScale(LECTURE_W);
+    rcAdj.bottom = UiScale(LECTURE_H);
     AdjustWindowRectEx(&rcAdj, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
                        FALSE, WS_EX_DLGMODALFRAME);
     nWinW = rcAdj.right  - rcAdj.left;
@@ -2976,6 +3197,18 @@ static void CreateMenuBar(HWND hWnd)
     AppendMenuU8(hFile, MF_SEPARATOR, 0, NULL);
     AppendMenuU8(hFile, MF_STRING, IDM_EXIT,       "Выход");
     AppendMenuU8(hMenuBar, MF_POPUP, (UINT_PTR)hFile, "Файл");
+
+    g_hViewMenu = CreatePopupMenu();
+    AppendMenuU8(g_hViewMenu, MF_STRING, IDM_ZOOM_IN,  "Увеличить\tCtrl++");
+    AppendMenuU8(g_hViewMenu, MF_STRING, IDM_ZOOM_OUT, "Уменьшить\tCtrl+-");
+    AppendMenuU8(g_hViewMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenuU8(g_hViewMenu, MF_STRING, IDM_ZOOM_100, "100%\tCtrl+0");
+    AppendMenuU8(g_hViewMenu, MF_STRING, IDM_ZOOM_125, "125%");
+    AppendMenuU8(g_hViewMenu, MF_STRING, IDM_ZOOM_150, "150%");
+    AppendMenuU8(g_hViewMenu, MF_STRING, IDM_ZOOM_175, "175%");
+    AppendMenuU8(g_hViewMenu, MF_STRING, IDM_ZOOM_200, "200%");
+    AppendMenuU8(hMenuBar, MF_POPUP, (UINT_PTR)g_hViewMenu, "Вид");
+    UiSyncZoomMenu();
 
     HMENU hHelp = CreatePopupMenu();
     AppendMenuU8(hHelp, MF_STRING, IDM_DONATE, "Поддержать...");
@@ -3230,12 +3463,122 @@ static LRESULT HandleCtlColor(HWND hWnd, WPARAM wParam)
     return (LRESULT)g_hbrBG;
 }
 
+static void LayoutMainWindow(HWND hWnd)
+{
+    RECT rc;
+    int cxClient, cyClient;
+    int i, nBtnW, nStartY, nRightX, nBarsW, nInfoX;
+    HWND hDriveLabel, hHl, hPred, hList;
+
+    GetClientRect(hWnd, &rc);
+    cxClient = rc.right - rc.left;
+    cyClient = rc.bottom - rc.top;
+    if (cxClient < 100 || cyClient < 100) return;
+
+    nBtnW   = UiScale(DRIVE_BTN_PANEL_W - 12);
+    nStartY = UiScale(40);
+    for (i = 0; i < MAX_DRIVES; i++) {
+        if (g_hDriveBtn[i]) {
+            int nY = nStartY + i * (UiScale(DRIVE_BTN_H) + UiScale(DRIVE_BTN_GAP));
+            SetWindowPos(g_hDriveBtn[i], NULL, UiScale(6), nY, nBtnW, UiScale(DRIVE_BTN_H),
+                         SWP_NOZORDER);
+        }
+    }
+
+    hDriveLabel = GetDlgItem(hWnd, IDC_DRIVE_LIST);
+    if (hDriveLabel)
+        SetWindowPos(hDriveLabel, NULL, UiScale(6), UiScale(8), nBtnW, UiScale(16), SWP_NOZORDER);
+
+    nRightX = UiScale(DRIVE_BTN_PANEL_W + 10);
+    nBarsW  = UiScale(190);
+
+    hHl = GetDlgItem(hWnd, IDC_HEALTH_LABEL);
+    if (hHl) SetWindowPos(hHl, NULL, nRightX, UiScale(40), nBarsW, UiScale(14), SWP_NOZORDER);
+    if (g_hHealthBar)
+        SetWindowPos(g_hHealthBar, NULL, nRightX, UiScale(56), nBarsW, UiScale(48), SWP_NOZORDER);
+    {
+        HWND hReread = GetDlgItem(hWnd, IDC_REREAD_BTN);
+        HWND hReport = GetDlgItem(hWnd, IDC_REPORT_BTN);
+        HWND hEject  = GetDlgItem(hWnd, IDC_EJECT_BTN);
+        if (hReread) SetWindowPos(hReread, NULL, nRightX, UiScale(110), UiScale(90), UiScale(24), SWP_NOZORDER);
+        if (hReport) SetWindowPos(hReport, NULL, nRightX + UiScale(100), UiScale(110), UiScale(90), UiScale(24), SWP_NOZORDER);
+        if (hEject)  SetWindowPos(hEject,  NULL, nRightX, UiScale(138), nBarsW, UiScale(24), SWP_NOZORDER);
+        {
+            int axL[] = { IDC_AXIS_MEDIA_L, IDC_AXIS_IFACE_L,
+                          IDC_AXIS_TEMPA_L, IDC_AXIS_ROW4_L };
+            int axV[] = { IDC_AXIS_MEDIA_V, IDC_AXIS_IFACE_V,
+                          IDC_AXIS_TEMPA_V, IDC_AXIS_ROW4_V };
+            int ai;
+            for (ai = 0; ai < 4; ai++) {
+                HWND hL = GetDlgItem(hWnd, axL[ai]);
+                HWND hV = GetDlgItem(hWnd, axV[ai]);
+                int y = UiScale(166) + UiScale(16) * ai;
+                if (hL) SetWindowPos(hL, NULL, nRightX, y, UiScale(78), UiScale(16), SWP_NOZORDER);
+                if (hV) SetWindowPos(hV, NULL, nRightX + UiScale(80), y, nBarsW - UiScale(80), UiScale(16), SWP_NOZORDER);
+            }
+        }
+    }
+
+    nInfoX = nRightX + nBarsW + UiScale(10);
+    {
+        int nLblW2  = UiScale(100);
+        int nValX2  = nInfoX + nLblW2 + UiScale(4);
+        int nValW2  = cxClient - nValX2 - UiScale(8);
+        int nInfoY2 = UiScale(36), nInfoH2 = UiScale(16), nInfoGap2 = UiScale(2);
+        int lblIds[] = { IDC_MODEL_LABEL, IDC_BRAND_LABEL, IDC_CONTROLLER_LABEL,
+                         IDC_SERIAL_LABEL, IDC_FIRMWARE_LABEL,
+                         IDC_SIZE_LABEL, IDC_TEMP_LABEL, IDC_POH_LABEL, IDC_STATUS_LABEL,
+                         IDC_PROTOCOL_LABEL, IDC_ADAPTER_LABEL };
+        int valIds[] = { IDC_MODEL_STATIC, IDC_BRAND_STATIC, IDC_CONTROLLER_STATIC,
+                         IDC_SERIAL_STATIC, IDC_FIRMWARE_STATIC,
+                         IDC_SIZE_STATIC, IDC_TEMP_STATIC, IDC_POH_STATIC, IDC_STATUS_STATIC,
+                         IDC_PROTOCOL_STATIC, IDC_ADAPTER_STATIC };
+        int k;
+        if (nValW2 < UiScale(40)) nValW2 = UiScale(40);
+        for (k = 0; k < 11; k++) {
+            HWND hL = GetDlgItem(hWnd, lblIds[k]);
+            HWND hV = GetDlgItem(hWnd, valIds[k]);
+            int y = nInfoY2 + (nInfoH2 + nInfoGap2) * k;
+            if (hL) SetWindowPos(hL, NULL, nInfoX, y, nLblW2, nInfoH2, SWP_NOZORDER);
+            if (hV) SetWindowPos(hV, NULL, nValX2, y, nValW2, nInfoH2, SWP_NOZORDER);
+        }
+    }
+    hPred = GetDlgItem(hWnd, IDC_PREDICT_STATIC);
+    if (hPred) SetWindowPos(hPred, NULL, nRightX, UiScale(258),
+                            cxClient - nRightX - UiScale(8), UiScale(17), SWP_NOZORDER);
+
+    hList = GetDlgItem(hWnd, IDC_ATTR_LIST);
+    if (hList) {
+        int nListTop = UiScale(283);
+        int nListH   = cyClient - nListTop - UiScale(8);
+        int nListW   = cxClient - nRightX - UiScale(8);
+        int nRaw;
+        if (nListH < UiScale(50)) nListH = UiScale(50);
+        if (nListW < UiScale(200)) nListW = UiScale(200);
+        SetWindowPos(hList, NULL, nRightX, nListTop, nListW, nListH, SWP_NOZORDER);
+        ListView_SetColumnWidth(hList, 0, UiScale(42));
+        ListView_SetColumnWidth(hList, 1, UiScale(200));
+        ListView_SetColumnWidth(hList, 2, UiScale(70));
+        ListView_SetColumnWidth(hList, 3, UiScale(50));
+        ListView_SetColumnWidth(hList, 4, UiScale(50));
+        ListView_SetColumnWidth(hList, 6, UiScale(124));
+        nRaw = nListW - UiScale(42) - UiScale(200) - UiScale(70) - UiScale(50)
+             - UiScale(50) - UiScale(124) - UiScale(24);
+        if (nRaw < UiScale(80)) nRaw = UiScale(80);
+        ListView_SetColumnWidth(hList, 5, nRaw);
+    }
+}
+
 LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
     switch (uMsg)
     {
     case WM_CREATE:
         g_hMainWnd = hWnd;
+        {
+            UINT dpi = QueryDpiForWindow(hWnd);
+            if (dpi >= 96) g_nDpi = (int)dpi;
+        }
         RegisterHealthBarClass(g_hInst);
         CreateGDIObjects();
         CreateMenuBar(hWnd);
@@ -3309,9 +3652,11 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                         SetBkMode(hdc, TRANSPARENT);
                         SetTextColor(hdc, CLR_TEXT);
                         RECT rcT = pCD->rc;
-                        rcT.left += 6;
+                        HFONT hOldHdr = (HFONT)SelectObject(hdc, g_hFontSmall);
+                        rcT.left += UiScale(6);
                         DrawTextW(hdc, wz, -1, &rcT,
                                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                        SelectObject(hdc, hOldHdr);
                         return CDRF_SKIPDEFAULT;
                     }
                     return CDRF_DODEFAULT;
@@ -3386,13 +3731,26 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                         DeleteObject(hbrRow);
 
                         HFONT hOldFont = (HFONT)SelectObject(hdc, g_hFontSmall);
-                        WCHAR wz[32];
-                        U8ToW(psz, wz, 32);
+                        WCHAR wz[40];
+                        if (nSt == ATTRST_INFO) {
+                            LVITEMW li;
+                            ZeroMemory(&li, sizeof(li));
+                            li.mask = LVIF_TEXT;
+                            li.iItem = (int)pCD->nmcd.dwItemSpec;
+                            li.iSubItem = 6;
+                            li.pszText = wz;
+                            li.cchTextMax = 40;
+                            if (!SendMessageW(pCD->nmcd.hdr.hwndFrom, LVM_GETITEMW,
+                                              0, (LPARAM)&li) || !wz[0])
+                                U8ToW("контекст", wz, 40);
+                        } else {
+                            U8ToW(psz, wz, 40);
+                        }
                         SIZE sz;
                         GetTextExtentPoint32W(hdc, wz, lstrlenW(wz), &sz);
 
-                        int badgeH  = sz.cy + 6;
-                        int badgeW  = sz.cx + ((nSt == ATTRST_SKIP) ? 20 : 16);
+                        int badgeH  = sz.cy + UiScale(6);
+                        int badgeW  = sz.cx + UiScale((nSt == ATTRST_SKIP) ? 20 : 16);
                         int cellCX  = rcCell.right  - rcCell.left;
                         int cellCY  = rcCell.bottom - rcCell.top;
                         int bx      = rcCell.left + (cellCX - badgeW) / 2;
@@ -3404,7 +3762,8 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                         HBRUSH hbrOld   = (HBRUSH)SelectObject(hdc, hbrBadge);
                         HPEN   hpOld    = (HPEN)SelectObject(hdc, hpBorder);
                         RoundRect(hdc, rcBadge.left, rcBadge.top,
-                                       rcBadge.right, rcBadge.bottom, 8, 8);
+                                       rcBadge.right, rcBadge.bottom,
+                                       UiScale(8), UiScale(8));
                         SelectObject(hdc, hbrOld);
                         SelectObject(hdc, hpOld);
                         DeleteObject(hbrBadge);
@@ -3479,6 +3838,27 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             else if (nCtrl == IDM_EXIT) {
                 DestroyWindow(hWnd);
             }
+            else if (nCtrl == IDM_ZOOM_IN) {
+                UiChangeZoom(hWnd, g_nZoom + 25);
+            }
+            else if (nCtrl == IDM_ZOOM_OUT) {
+                UiChangeZoom(hWnd, g_nZoom - 25);
+            }
+            else if (nCtrl == IDM_ZOOM_100) {
+                UiChangeZoom(hWnd, 100);
+            }
+            else if (nCtrl == IDM_ZOOM_125) {
+                UiChangeZoom(hWnd, 125);
+            }
+            else if (nCtrl == IDM_ZOOM_150) {
+                UiChangeZoom(hWnd, 150);
+            }
+            else if (nCtrl == IDM_ZOOM_175) {
+                UiChangeZoom(hWnd, 175);
+            }
+            else if (nCtrl == IDM_ZOOM_200) {
+                UiChangeZoom(hWnd, 200);
+            }
         }
         return 0;
 
@@ -3486,7 +3866,10 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         {
             int i;
 
-            /* Snapshot CURRENT g_Drives before replacing them. */
+            /* UI thread only. Worker has exited (or ran inline); g_ScanBuf is
+             * stable. Snapshot g_Drives, then publish the scan buffer. Busy
+             * stays 1 until after memcpy so RefreshData cannot launch another
+             * writer into g_ScanBuf during this copy. */
             Snapshot_Save();
 
             memcpy(g_Drives, g_ScanBuf, sizeof(DRIVE_INFO) * MAX_DRIVES);
@@ -3523,114 +3906,18 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
     case WM_GETMINMAXINFO:
         {
             MINMAXINFO* pmmi = (MINMAXINFO*)lParam;
-            pmmi->ptMinTrackSize.x = WINDOW_W;
-            pmmi->ptMinTrackSize.y = WINDOW_H_MIN;
+            pmmi->ptMinTrackSize.x = UiWindowW();
+            pmmi->ptMinTrackSize.y = UiWindowHMin();
         }
         return 0;
 
+    case WM_DPICHANGED:
+        UiOnDpiChanged(hWnd, (UINT)HIWORD(wParam), (const RECT*)lParam);
+        return 0;
+
     case WM_SIZE:
-        {
-            int cxClient = LOWORD(lParam);
-            int cyClient = HIWORD(lParam);
-            if (cxClient < 100 || cyClient < 100) break;
-            if (wParam == SIZE_MINIMIZED) break;
-
-            int i;
-            int nBtnW = DRIVE_BTN_PANEL_W - 12;
-            int nStartY = 40;
-            for (i = 0; i < MAX_DRIVES; i++) {
-                if (g_hDriveBtn[i]) {
-                    int nY = nStartY + i * (DRIVE_BTN_H + DRIVE_BTN_GAP);
-                    SetWindowPos(g_hDriveBtn[i], NULL, 6, nY, nBtnW, DRIVE_BTN_H, SWP_NOZORDER);
-                }
-            }
-
-            HWND hDriveLabel = GetDlgItem(hWnd, IDC_DRIVE_LIST);
-            if (hDriveLabel)
-                SetWindowPos(hDriveLabel, NULL, 6, 8, nBtnW, 16, SWP_NOZORDER);
-
-            int nRightX = DRIVE_BTN_PANEL_W + 10;
-            int nBarsW  = 190;
-            int nInfoX  = nRightX + nBarsW + 10;
-
-            HWND hHl = GetDlgItem(hWnd, IDC_HEALTH_LABEL);
-            if (hHl) SetWindowPos(hHl, NULL, nRightX, 40, nBarsW, 14, SWP_NOZORDER);
-            if (g_hHealthBar) SetWindowPos(g_hHealthBar, NULL, nRightX, 56, nBarsW, 48, SWP_NOZORDER);
-            {
-                HWND hReread = GetDlgItem(hWnd, IDC_REREAD_BTN);
-                HWND hReport = GetDlgItem(hWnd, IDC_REPORT_BTN);
-                HWND hEject  = GetDlgItem(hWnd, IDC_EJECT_BTN);
-                if (hReread) SetWindowPos(hReread, NULL, nRightX, 110, 90, 24, SWP_NOZORDER);
-                if (hReport) SetWindowPos(hReport, NULL, nRightX + 100, 110, 90, 24, SWP_NOZORDER);
-                if (hEject)  SetWindowPos(hEject,  NULL, nRightX, 138, nBarsW, 24, SWP_NOZORDER);
-                {
-                    int axL[] = { IDC_AXIS_MEDIA_L, IDC_AXIS_IFACE_L,
-                                  IDC_AXIS_TEMPA_L, IDC_AXIS_ROW4_L };
-                    int axV[] = { IDC_AXIS_MEDIA_V, IDC_AXIS_IFACE_V,
-                                  IDC_AXIS_TEMPA_V, IDC_AXIS_ROW4_V };
-                    int ai;
-                    for (ai = 0; ai < 4; ai++) {
-                        HWND hL = GetDlgItem(hWnd, axL[ai]);
-                        HWND hV = GetDlgItem(hWnd, axV[ai]);
-                        int y = 166 + 16 * ai;
-                        if (hL) SetWindowPos(hL, NULL, nRightX, y, 78, 16, SWP_NOZORDER);
-                        if (hV) SetWindowPos(hV, NULL, nRightX + 80, y, nBarsW - 80, 16, SWP_NOZORDER);
-                    }
-                }
-            }
-
-            int nLblW2  = 100;
-            int nValX2  = nInfoX + nLblW2 + 4;
-            int nValW2  = cxClient - nValX2 - 8;
-            if (nValW2 < 40) nValW2 = 40;
-            int nInfoY2 = 36, nInfoH2 = 16, nInfoGap2 = 2;
-            { int lblIds[] = { IDC_MODEL_LABEL, IDC_BRAND_LABEL, IDC_CONTROLLER_LABEL,
-                               IDC_SERIAL_LABEL, IDC_FIRMWARE_LABEL,
-                               IDC_SIZE_LABEL, IDC_TEMP_LABEL, IDC_POH_LABEL, IDC_STATUS_LABEL,
-                               IDC_PROTOCOL_LABEL, IDC_ADAPTER_LABEL };
-              int k2;
-              for (k2 = 0; k2 < 11; k2++) {
-                  HWND hL = GetDlgItem(hWnd, lblIds[k2]);
-                  if (hL) SetWindowPos(hL, NULL, nInfoX,
-                      nInfoY2 + (nInfoH2 + nInfoGap2) * k2, nLblW2, nInfoH2, SWP_NOZORDER);
-              }
-            }
-
-            { int valIds[] = { IDC_MODEL_STATIC, IDC_BRAND_STATIC, IDC_CONTROLLER_STATIC,
-                               IDC_SERIAL_STATIC, IDC_FIRMWARE_STATIC,
-                               IDC_SIZE_STATIC, IDC_TEMP_STATIC, IDC_POH_STATIC, IDC_STATUS_STATIC,
-                               IDC_PROTOCOL_STATIC, IDC_ADAPTER_STATIC };
-              int k3;
-              for (k3 = 0; k3 < 11; k3++) {
-                  HWND hV = GetDlgItem(hWnd, valIds[k3]);
-                  if (hV) SetWindowPos(hV, NULL, nValX2,
-                      nInfoY2 + (nInfoH2 + nInfoGap2) * k3, nValW2, nInfoH2, SWP_NOZORDER);
-              }
-            }
-            HWND hPred = GetDlgItem(hWnd, IDC_PREDICT_STATIC);
-            if (hPred) SetWindowPos(hPred, NULL, nRightX, 258, cxClient - nRightX - 8, 17, SWP_NOZORDER);
-
-            HWND hList = GetDlgItem(hWnd, IDC_ATTR_LIST);
-            if (hList) {
-                int nListTop = 283;
-                int nListH   = cyClient - nListTop - 8;
-                if (nListH < 50) nListH = 50;
-                int nListW = cxClient - nRightX - 8;
-                if (nListW < 200) nListW = 200;
-                SetWindowPos(hList, NULL, nRightX, nListTop, nListW, nListH, SWP_NOZORDER);
-                ListView_SetColumnWidth(hList, 0, 42);
-                ListView_SetColumnWidth(hList, 1, 200);
-                ListView_SetColumnWidth(hList, 2, 70);
-                ListView_SetColumnWidth(hList, 3, 50);
-                ListView_SetColumnWidth(hList, 4, 50);
-                ListView_SetColumnWidth(hList, 6, 124);
-                {
-                    int nRaw = nListW - 42 - 200 - 70 - 50 - 50 - 124 - 24;
-                    if (nRaw < 80) nRaw = 80;
-                    ListView_SetColumnWidth(hList, 5, nRaw);
-                }
-            }
-        }
+        if (wParam != SIZE_MINIMIZED)
+            LayoutMainWindow(hWnd);
         return 0;
 
     case WM_DESTROY:

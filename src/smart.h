@@ -671,6 +671,10 @@ int DecodeReportedUncorrect(const BYTE* pRaw, DRIVE_VENDOR vendor);
 /* Seagate ID 1/7/195: low 32 = operations, high 16 = errors (SMART attrib spec). */
 DWORD    SeagateRateOps(const BYTE* pRaw);
 unsigned SeagateRateErrs(const BYTE* pRaw);
+/* Phison 241/242: RAW is GB on some firmwares, 32 MB units on S11-class.
+ * If RAW-as-GB exceeds NAND written (erase×capacity) or >20 GB/h lifetime,
+ * treat as 32 MB units. */
+unsigned __int64 ScalePhisonHostGiB(const DRIVE_INFO* pInfo, unsigned __int64 raw);
 
 #ifdef __cplusplus
 }

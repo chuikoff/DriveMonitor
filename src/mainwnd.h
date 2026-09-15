@@ -41,6 +41,13 @@
 #define IDM_SCREENSHOT       2004
 #define IDM_DONATE           2006
 #define IDM_EJECT            2007
+#define IDM_ZOOM_IN          2010
+#define IDM_ZOOM_OUT         2011
+#define IDM_ZOOM_100         2012
+#define IDM_ZOOM_125         2013
+#define IDM_ZOOM_150         2014
+#define IDM_ZOOM_175         2015
+#define IDM_ZOOM_200         2016
 #define IDT_HOTPLUG          3002
 #define WM_APP_REFRESH_DONE  (WM_APP + 1)
 #define DRIVE_BTN_H    56
@@ -97,5 +104,11 @@ void    PaintMain(HWND hWnd, HDC hdc);
 void    ShowAboutDialog(HWND hWnd);
 void    ShowHealthLectureDialog(HWND hParent);
 COLORREF GetHealthStatusColor(DRIVE_HEALTH_STATUS eStatus);
+int     UiScale(int px);
+void    UiInitScale(void);
+int     UiWindowW(void);
+int     UiWindowH(void);
+int     UiWindowHMin(void);
+HACCEL  UiCreateAccelTable(void);
 
 #endif

@@ -16,7 +16,11 @@ OUTDIR  = bin
 TARGET  = $(OUTDIR)/DriveMonitor.exe
 SRCS    = $(SRCDIR)/main.cpp \
           $(SRCDIR)/mainwnd.cpp \
-          $(SRCDIR)/smart.cpp
+          $(SRCDIR)/smart.cpp \
+          $(SRCDIR)/ata_smart.cpp \
+          $(SRCDIR)/nvme_smart.cpp \
+          $(SRCDIR)/usb_bridge.cpp \
+          $(SRCDIR)/health_assessment.cpp
 
 OBJS    = $(patsubst $(SRCDIR)/%.cpp, $(OBJDIR)/%.o, $(SRCS))
 RES_O   = $(OBJDIR)/app_res.o
@@ -25,15 +29,13 @@ RES_O   = $(OBJDIR)/app_res.o
 #   -mwindows          : GUI subsystem (no console window)
 #   -O2                : Optimized release build
 #   -DWIN32 ...        : Win32 platform defines expected by the source
-#   -Wall              : Enable common warnings; unused-* only are suppressed
-#                        (format and C++ type issues are fixed in source).
+#   CXXFLAGS           : strict warnings (conversions, pedantic, extra)
 #   V=1                : Show full compiler/linker commands (default is quiet).
 CFLAGS  = -mwindows -O2 \
           -DWIN32 -D_WIN32 -D_WINDOWS -DNDEBUG \
           -I$(SRCDIR) \
-          -Wall -Wno-unused-function -Wno-unused-parameter \
-          -Wno-unused-variable \
           -finput-charset=UTF-8
+CXXFLAGS += -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion
 
 # Linker flags:
 #   -static*           : Statically link the C/C++ runtime so the .exe
@@ -64,7 +66,7 @@ endif
 
 $(OBJDIR)/%.o: $(SRCDIR)/%.cpp $(SRCDIR)/resource.h | $(OBJDIR)
 	@echo "  CC  $<"
-	$(Q)$(CC) $(CFLAGS) -c $< -o $@
+	$(Q)$(CC) $(CFLAGS) $(CXXFLAGS) -c $< -o $@
 
 # Resource compilation: the .rc file references the .manifest and .ico,
 # so the .o depends on all three.
