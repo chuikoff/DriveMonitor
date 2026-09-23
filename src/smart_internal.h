@@ -24,6 +24,29 @@
 #define CR_SUCCESS 0
 #endif
 
+/* Which driver owns the disk. Passthrough policy hangs off this:
+ * ATA SMART IOCTLs only on inbox AHCI, SCSI/SAT only on USB,
+ * NvmeMini only on stornvme, IntelNvm only on iaStor*.
+ * RAID, VROC, Storage Spaces and unknown stacks get descriptor
+ * and a 512-byte NVMe query — not a command that can bugcheck. */
+typedef enum _DRIVE_STACK_KIND {
+    DRIVE_STACK_UNKNOWN = 0,
+    DRIVE_STACK_ATA,
+    DRIVE_STACK_NVME,
+    DRIVE_STACK_INTEL_RST,
+    DRIVE_STACK_USB,
+    DRIVE_STACK_RAID,
+    DRIVE_STACK_VIRT
+} DRIVE_STACK_KIND;
+
+DRIVE_STACK_KIND DriveStackKind(HANDLE hDrive);
+BOOL DriveBehindIntelRst(HANDLE hDrive);
+BOOL DriveAllowsAtaIoctl(HANDLE hDrive);
+BOOL DriveAllowsScsiPassthrough(HANDLE hDrive);
+BOOL DriveAllowsNvmeProtocol(HANDLE hDrive);
+BOOL DriveAllowsNvmeMini(HANDLE hDrive);
+BOOL DriveAllowsFullNvmeIdentify(HANDLE hDrive);
+
 #ifndef StorageDeviceProtocolSpecificProperty
 #define StorageDeviceProtocolSpecificProperty ((STORAGE_PROPERTY_ID)49)
 #endif

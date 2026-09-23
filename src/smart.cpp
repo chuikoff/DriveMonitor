@@ -1655,6 +1655,190 @@ static BOOL FindDiskDevInst(DWORD nDisk, DEVINST* pInst)
     return found;
 }
 
+static BOOL BufHasI(const char* buf, ULONG len, const char* tok)
+{
+    ULONG i, j;
+    size_t tlen;
+    if (!buf || !tok) return FALSE;
+    tlen = strlen(tok);
+    if (tlen == 0 || len < tlen) return FALSE;
+    for (i = 0; i + (ULONG)tlen <= len; i++) {
+        for (j = 0; j < (ULONG)tlen; j++) {
+            char a = buf[i + j];
+            char b = tok[j];
+            if (a >= 'a' && a <= 'z') a = (char)(a - 'a' + 'A');
+            if (b >= 'a' && b <= 'z') b = (char)(b - 'a' + 'A');
+            if (a != b) break;
+        }
+        if (j == (ULONG)tlen) return TRUE;
+    }
+    return FALSE;
+}
+
+static int StackRank(DRIVE_STACK_KIND k)
+{
+    switch (k) {
+    case DRIVE_STACK_INTEL_RST: return 6;
+    case DRIVE_STACK_RAID:      return 5;
+    case DRIVE_STACK_VIRT:      return 4;
+    case DRIVE_STACK_NVME:      return 3;
+    case DRIVE_STACK_USB:       return 2;
+    case DRIVE_STACK_ATA:       return 1;
+    default:                    return 0;
+    }
+}
+
+/* One devnode. Service and hardware id only — a product string
+ * "NVMe Phison" must not classify the disk as the NVMe driver. */
+static DRIVE_STACK_KIND KindFromText(const char* buf, ULONG len,
+                                     BOOL* pMini, BOOL* pFullIdent)
+{
+    if (BufHasI(buf, len, "iaStor") ||
+        BufHasI(buf, len, "DEV_A77F") ||
+        BufHasI(buf, len, "DEV_09AB") ||
+        BufHasI(buf, len, "RST VMD") ||
+        BufHasI(buf, len, "Intel RST"))
+        return DRIVE_STACK_INTEL_RST;
+    /* VROC, AMD-RAID, MegaRAID, LSI/Broadcom, HighPoint, Marvell, NVIDIA.
+     * ATA and SCSI passthrough bugcheck these. */
+    if (BufHasI(buf, len, "iaVROC") || BufHasI(buf, len, "VROC") ||
+        BufHasI(buf, len, "rcraid") || BufHasI(buf, len, "AMD-RAID") ||
+        BufHasI(buf, len, "megasas") || BufHasI(buf, len, "MegaRAID") ||
+        BufHasI(buf, len, "mpt3sas") || BufHasI(buf, len, "mpt2sas") ||
+        BufHasI(buf, len, "lsi_sas") || BufHasI(buf, len, "smartpqi") ||
+        BufHasI(buf, len, "hpcisss") || BufHasI(buf, len, "arcsas") ||
+        BufHasI(buf, len, "nvraid") || BufHasI(buf, len, "SiSRaid") ||
+        BufHasI(buf, len, "mvraid") || BufHasI(buf, len, "mvsas") ||
+        BufHasI(buf, len, "vsmraid") || BufHasI(buf, len, "iaRNVMe"))
+        return DRIVE_STACK_RAID;
+    if (BufHasI(buf, len, "storvsc") || BufHasI(buf, len, "vhdmp") ||
+        BufHasI(buf, len, "spaceport"))
+        return DRIVE_STACK_VIRT;
+    if (BufHasI(buf, len, "stornvme")) {
+        if (pMini) *pMini = TRUE;
+        if (pFullIdent) *pFullIdent = TRUE;
+        return DRIVE_STACK_NVME;
+    }
+    if (BufHasI(buf, len, "secnvme")) {
+        if (pFullIdent) *pFullIdent = TRUE;
+        return DRIVE_STACK_NVME;
+    }
+    if (BufHasI(buf, len, "usbstor") || BufHasI(buf, len, "uaspstor") ||
+        BufHasI(buf, len, "uasp"))
+        return DRIVE_STACK_USB;
+    if (BufHasI(buf, len, "storahci") || BufHasI(buf, len, "msahci") ||
+        BufHasI(buf, len, "atapi") || BufHasI(buf, len, "pciide") ||
+        BufHasI(buf, len, "intelide") || BufHasI(buf, len, "amdsata") ||
+        BufHasI(buf, len, "viaide") || BufHasI(buf, len, "aliide") ||
+        BufHasI(buf, len, "cmdide"))
+        return DRIVE_STACK_ATA;
+    return DRIVE_STACK_UNKNOWN;
+}
+
+static void NoteDevNode(DEVINST inst, DRIVE_STACK_KIND* pBest,
+                        BOOL* pMini, BOOL* pFullIdent)
+{
+    char buf[1024];
+    ULONG len, prop;
+    static const ULONG kProps[] = {
+        CM_DRP_SERVICE, CM_DRP_HARDWAREID, CM_DRP_DEVICEDESC, CM_DRP_FRIENDLYNAME
+    };
+    for (prop = 0; prop < sizeof(kProps) / sizeof(kProps[0]); prop++) {
+        DRIVE_STACK_KIND k;
+        len = sizeof(buf);
+        ZeroMemory(buf, sizeof(buf));
+        if (CM_Get_DevNode_Registry_PropertyA(inst, kProps[prop], NULL,
+                buf, &len, 0) != CR_SUCCESS)
+            continue;
+        if (len > sizeof(buf)) len = sizeof(buf);
+        k = KindFromText(buf, len, pMini, pFullIdent);
+        if (StackRank(k) > StackRank(*pBest))
+            *pBest = k;
+    }
+}
+
+static int s_stackNum = -2;
+static DRIVE_STACK_KIND s_stackKind = DRIVE_STACK_UNKNOWN;
+static BOOL s_stackMini = FALSE;
+static BOOL s_stackFullIdent = FALSE;
+
+DRIVE_STACK_KIND DriveStackKind(HANDLE hDrive)
+{
+    DWORD nDisk = (DWORD)-1;
+    DEVINST inst = 0;
+    DRIVE_STACK_KIND best = DRIVE_STACK_UNKNOWN;
+    BOOL mini = FALSE, full = FALSE;
+    BYTE bus;
+    int walk;
+
+    if (!GetDiskNumber(hDrive, &nDisk))
+        return DRIVE_STACK_UNKNOWN;
+    if ((int)nDisk == s_stackNum)
+        return s_stackKind;
+    if (FindDiskDevInst(nDisk, &inst)) {
+        for (walk = 0; walk < 16 && inst; walk++) {
+            DEVINST parent = 0;
+            NoteDevNode(inst, &best, &mini, &full);
+            if (CM_Get_Parent(&parent, inst, 0) != CR_SUCCESS)
+                break;
+            inst = parent;
+        }
+    }
+    bus = GetStorageBusType(hDrive);
+    if (best == DRIVE_STACK_UNKNOWN) {
+        if (bus == 7)
+            best = DRIVE_STACK_USB;
+        else if (bus == 17)
+            best = DRIVE_STACK_NVME;
+        else if (bus == 8)
+            best = DRIVE_STACK_RAID;
+        else if (bus == 14 || bus == 15 || bus == 16)
+            best = DRIVE_STACK_VIRT;
+        else if (bus == 11 || bus == 3 || bus == 2)
+            best = DRIVE_STACK_ATA;
+    }
+    s_stackNum = (int)nDisk;
+    s_stackKind = best;
+    s_stackMini = mini;
+    s_stackFullIdent = full;
+    return s_stackKind;
+}
+
+BOOL DriveBehindIntelRst(HANDLE hDrive)
+{
+    return DriveStackKind(hDrive) == DRIVE_STACK_INTEL_RST;
+}
+
+BOOL DriveAllowsAtaIoctl(HANDLE hDrive)
+{
+    return DriveStackKind(hDrive) == DRIVE_STACK_ATA;
+}
+
+BOOL DriveAllowsScsiPassthrough(HANDLE hDrive)
+{
+    return DriveStackKind(hDrive) == DRIVE_STACK_USB;
+}
+
+BOOL DriveAllowsNvmeProtocol(HANDLE hDrive)
+{
+    DRIVE_STACK_KIND k = DriveStackKind(hDrive);
+    return k != DRIVE_STACK_INTEL_RST && k != DRIVE_STACK_USB;
+}
+
+BOOL DriveAllowsNvmeMini(HANDLE hDrive)
+{
+    if (DriveStackKind(hDrive) != DRIVE_STACK_NVME)
+        return FALSE;
+    return s_stackMini;
+}
+
+BOOL DriveAllowsFullNvmeIdentify(HANDLE hDrive)
+{
+    if (DriveStackKind(hDrive) != DRIVE_STACK_NVME)
+        return FALSE;
+    return s_stackFullIdent;
+}
+
 static BOOL DismountDiskVolumes(DWORD nDisk)
 {
     char letters[256];
@@ -1995,7 +2179,9 @@ DRIVE_TYPE DetectDriveType(HANDLE hDrive, DRIVE_INFO* pInfo)
         return DRIVE_TYPE_HDD;
     }
 
-    /* Try IDENTIFY to extract rotation rate */
+    /* Try IDENTIFY to extract rotation rate.
+     * iaStorVD bugchecks 0x139 on these IOCTLs. */
+    if (DriveAllowsAtaIoctl(hDrive)) {
     BYTE ident[IDENTIFY_BUFFER_SIZE];
     BOOL bGotIdent = FALSE;
     ZeroMemory(ident, sizeof(ident));
@@ -2036,6 +2222,7 @@ DRIVE_TYPE DetectDriveType(HANDLE hDrive, DRIVE_INFO* pInfo)
             return DRIVE_TYPE_SSD_SATA;
         }
         if (wRot >= 0x0401) return DRIVE_TYPE_HDD;
+    }
     }
 
     /* Heuristic from model name */
@@ -2124,6 +2311,34 @@ int ScanDrives(DRIVE_INFO* pDrives, int nMaxDrives)
 
         BYTE busType = GetStorageBusType(hDrive);
 
+        /* Intel RST VMD (iaStorVD, DEV_A77F): ATA/SCSI passthrough and a
+         * 4096-byte NVMe protocol query bugcheck 0x139. IntelNvm only. */
+        if (DriveBehindIntelRst(hDrive)) {
+            char modelU[80];
+            int mi;
+            GetNVMeInfo(hDrive, pInfo);
+            if (pInfo->szModel[0] == '\0') GetDeviceDescriptor(hDrive, pInfo);
+            if (pInfo->dwCapacityMB == 0)  GetCapacityFromGeometry(hDrive, pInfo);
+            for (mi = 0; mi < 79 && pInfo->szModel[mi]; mi++)
+                modelU[mi] = (char)toupper((unsigned char)pInfo->szModel[mi]);
+            modelU[mi] = '\0';
+            if (!pInfo->bIsNVMe &&
+                (busType == 17 || strstr(modelU, "NVME"))) {
+                pInfo->bIsNVMe = TRUE;
+                pInfo->eType = DRIVE_TYPE_NVME;
+            }
+            if (!pInfo->bIsNVMe) {
+                pInfo->bSMART_Supported = FALSE;
+                pInfo->eType = DRIVE_TYPE_UNKNOWN;
+            }
+            AssessDriveHealth(pInfo);
+            IdentifyDriveParts(pInfo);
+            FillDriveProtocol(pInfo);
+            CloseHandle(hDrive);
+            nFound++;
+            continue;
+        }
+
         /* --------------------- NVMe (not USB bridges) --------------------- */
         if (IsNVMeDrive(hDrive) && busType != 7) {
             GetNVMeInfo(hDrive, pInfo);
@@ -2157,16 +2372,54 @@ int ScanDrives(DRIVE_INFO* pDrives, int nMaxDrives)
             continue;
         }
 
+        /* RAID, VROC, Storage Spaces, Hyper-V, or an unknown stack
+         * that is not inbox AHCI and not USB. Descriptor only.
+         * ATA/SCSI passthrough bugchecks these drivers (0x139 and kin). */
+        if (!DriveAllowsAtaIoctl(hDrive) &&
+            !DriveAllowsScsiPassthrough(hDrive)) {
+            GetDeviceDescriptor(hDrive, pInfo);
+            GetCapacityFromGeometry(hDrive, pInfo);
+            pInfo->bSMART_Supported = FALSE;
+            if (busType == 17) {
+                pInfo->bIsNVMe = TRUE;
+                pInfo->eType = DRIVE_TYPE_NVME;
+            } else if (busType == 10) {
+                pInfo->eType = DRIVE_TYPE_SCSI;
+            } else {
+                pInfo->eType = DRIVE_TYPE_UNKNOWN;
+            }
+            AssessDriveHealth(pInfo);
+            IdentifyDriveParts(pInfo);
+            FillDriveProtocol(pInfo);
+            CloseHandle(hDrive);
+            nFound++;
+            continue;
+        }
+
         /* --------------------- ATA / USB / SAS --------------------- */
-        /* try ATA Pass-Through first for IDENTIFY,
-         * then fall back to legacy IOCTL, then SAT/USB. */
+        /* ATA identify only on inbox AHCI. USB starts at SAT. */
         BOOL bIdentOK = FALSE;
 
-        if (GetIdentifyDataATAPassthrough(hDrive, pInfo)) bIdentOK = TRUE;
-        if (!bIdentOK && GetIdentifyData(hDrive, nDrive, pInfo)) bIdentOK = TRUE;
-        if (!bIdentOK && GetIdentifyDataSAT(hDrive, pInfo)) {
-            bIdentOK = TRUE;
-            if (busType == 7) pInfo->bIsUSB = TRUE;
+        if (DriveAllowsAtaIoctl(hDrive)) {
+            if (GetIdentifyDataATAPassthrough(hDrive, pInfo)) bIdentOK = TRUE;
+            if (!bIdentOK && GetIdentifyData(hDrive, nDrive, pInfo)) bIdentOK = TRUE;
+        }
+        if (!bIdentOK && DriveAllowsScsiPassthrough(hDrive)) {
+            /* Name the stick from the descriptor before any SAT CDB.
+             * JetFlash / SanDisk UFD then never see ATA-over-SCSI. */
+            if (busType == 7) {
+                pInfo->bIsUSB = TRUE;
+                if (pInfo->szModel[0] == '\0')
+                    GetDeviceDescriptor(hDrive, pInfo);
+                if (IsLikelyUsbFlashDrive(pInfo)) {
+                    bIdentOK = (pInfo->szModel[0] != '\0');
+                    pInfo->bSMART_Supported = FALSE;
+                }
+            }
+            if (!bIdentOK && GetIdentifyDataSAT(hDrive, pInfo)) {
+                bIdentOK = TRUE;
+                if (busType == 7) pInfo->bIsUSB = TRUE;
+            }
         }
         if (!bIdentOK) {
             bIdentOK = GetIdentifyDataUSB(hDrive, pInfo);
@@ -2371,24 +2624,10 @@ int ScanDrives(DRIVE_INFO* pDrives, int nMaxDrives)
                 }
             }
 
-            if (!pInfo->bIsNVMe &&
-                !IsRealtekNvmeUsbBridge(pInfo) &&
-                bridge != USB_BRIDGE_NVME_REALTEK &&
-                bridge != USB_BRIDGE_NVME_FMA &&
-                bridge != USB_BRIDGE_NVME_JMICRON &&
-                bridge != USB_BRIDGE_NVME_ASMEDIA &&
-                bridge != USB_BRIDGE_JMICRON &&
-                bridge != USB_BRIDGE_SUNPLUS && bridge != USB_BRIDGE_CYPRESS &&
-                bridge != USB_BRIDGE_IO_DATA && bridge != USB_BRIDGE_LOGITEC &&
-                bridge != USB_BRIDGE_PROLIFIC) {
-                /* Try generic NVMe-over-USB detection.
-                 * Never shotgun vendor cmds at RTL9210 / JMS583 / ASM2362. */
-                if (NVMeOverUSBTryAll(hDrive, pInfo)) {
-                    ExtractNVMeExtendedInfo(pInfo);
-                    pInfo->bIsNVMe = TRUE;
-                    pInfo->eType = DRIVE_TYPE_NVME;
-                }
-            }
+            /* No NVMeOverUSBTryAll here. An unidentified bridge used to
+             * receive every vendor CDB in turn; that bugchecks UASP and
+             * USBSTOR on flash sticks and unknown docks. Known bridges
+             * already had their one command above. SAT is the fallback. */
 
             /* If not NVMe-over-USB, or NVMe detection failed, try SATA SMART via SAT.
              * Realtek RTL9210/FMA and JMicron/ASMedia NVMe: SAT + one vendor

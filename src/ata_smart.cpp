@@ -53,6 +53,7 @@ void SwapATAString(char* szDst, const WORD* pSrc, int nWords)
 BOOL EnableSMART(HANDLE hDrive, int nDrive)
 {
     SENDCMDINPARAMS cip;
+    if (!DriveAllowsAtaIoctl(hDrive)) return FALSE;
     SENDCMDOUTPARAMS cop;
     DWORD dwBytes = 0;
     ZeroMemory(&cip, sizeof(cip));
@@ -77,6 +78,7 @@ BOOL EnableSMART(HANDLE hDrive, int nDrive)
 BOOL GetIdentifyData(HANDLE hDrive, int nDrive, DRIVE_INFO* pInfo)
 {
     BYTE inBuf[sizeof(SENDCMDINPARAMS) - 1 + IDENTIFY_BUFFER_SIZE];
+    if (!DriveAllowsAtaIoctl(hDrive)) return FALSE;
     BYTE outBuf[sizeof(SENDCMDOUTPARAMS) - 1 + IDENTIFY_BUFFER_SIZE];
     DWORD dwBytes = 0;
     ZeroMemory(inBuf,  sizeof(inBuf));
@@ -129,6 +131,7 @@ BOOL GetIdentifyData(HANDLE hDrive, int nDrive, DRIVE_INFO* pInfo)
 BOOL GetSMARTAttributes(HANDLE hDrive, int nDrive, DRIVE_INFO* pInfo)
 {
     BYTE inBuf[sizeof(SENDCMDINPARAMS) - 1];
+    if (!DriveAllowsAtaIoctl(hDrive)) return FALSE;
     BYTE outBuf[sizeof(SENDCMDOUTPARAMS) - 1 + READ_ATTRIBUTE_BUFFER_SIZE];
     DWORD dwBytes = 0;
     ZeroMemory(inBuf, sizeof(inBuf));
@@ -159,6 +162,7 @@ BOOL GetSMARTAttributes(HANDLE hDrive, int nDrive, DRIVE_INFO* pInfo)
 BOOL GetSMARTThresholds(HANDLE hDrive, int nDrive, DRIVE_INFO* pInfo)
 {
     BYTE inBuf[sizeof(SENDCMDINPARAMS) - 1];
+    if (!DriveAllowsAtaIoctl(hDrive)) return FALSE;
     BYTE outBuf[sizeof(SENDCMDOUTPARAMS) - 1 + READ_THRESHOLD_BUFFER_SIZE];
     DWORD dwBytes = 0;
     ZeroMemory(inBuf,  sizeof(inBuf));
@@ -198,6 +202,7 @@ BOOL GetSMARTPredictFailure(HANDLE hDrive, int nDrive, BOOL* pbFail)
     SENDCMDINPARAMS cip;
     MY_OUTPARAMS    cop;
     DWORD dwBytes = 0;
+    if (!DriveAllowsAtaIoctl(hDrive)) return FALSE;
     ZeroMemory(&cip, sizeof(cip));
     ZeroMemory(&cop, sizeof(cop));
     if (!pbFail) return FALSE;
@@ -232,6 +237,7 @@ static BOOL ReadSMARTLog(HANDLE hDrive, int nDrive, BYTE bLogAddr,
                          BYTE* pOutBuf, DWORD dwBufSize)
 {
     BYTE inBuf[sizeof(SENDCMDINPARAMS) - 1];
+    if (!DriveAllowsAtaIoctl(hDrive)) return FALSE;
     BYTE outBuf[sizeof(SENDCMDOUTPARAMS) - 1 + 512];
     DWORD dwBytes = 0;
     ZeroMemory(inBuf, sizeof(inBuf));
@@ -262,6 +268,7 @@ static BOOL ReadSMARTLog(HANDLE hDrive, int nDrive, BYTE bLogAddr,
 static BOOL ReadSMARTLogATAPassthrough(HANDLE hDrive, BYTE bLogAddr,
                                        BYTE* pOutBuf, DWORD dwBufSize)
 {
+    if (!DriveAllowsAtaIoctl(hDrive)) return FALSE;
     /* Use ATA pass-through to read SMART log */
     BYTE buf[sizeof(MY_ATA_PASS_THROUGH_EX) + 4 + 512];
     ZeroMemory(buf, sizeof(buf));
@@ -356,6 +363,7 @@ BOOL ATAPassThrough(HANDLE hDrive, BYTE bCommand, BYTE bFeatures,
     BYTE bDevice, BYTE* pDataBuf, DWORD dwDataLen, BOOL bDataIn)
 {
     BYTE buf[sizeof(MY_ATA_PASS_THROUGH_EX) + 4 + 512];
+    if (!DriveAllowsAtaIoctl(hDrive)) return FALSE;
     if (dwDataLen > 512) return FALSE;
     ZeroMemory(buf, sizeof(buf));
 

@@ -1,6 +1,8 @@
 /* DriveMonitor - NVMe via IOCTL_STORAGE_QUERY_PROPERTY.
  * MIT: see LICENSE.
- * Never IOCTL_STORAGE_PROTOCOL_COMMAND — nvme.sys bugchecks on it. */
+ * Never IOCTL_STORAGE_PROTOCOL_COMMAND — nvme.sys bugchecks on it.
+ * Intel RST VMD (iaStorVD): IntelNvm SRB only. ATA/SCSI passthrough
+ * and a 4096-byte log-page query bugcheck 0x139. */
 #include "smart_internal.h"
 
 static DWORD g_dwLastNvmeQueryErr;
@@ -172,7 +174,8 @@ static int NvmeProtocolTry(HANDLE h, CDI_NVME_QUERY_BUF* q,
 }
 
 static BOOL QueryNVMeProtocolOnHandle(HANDLE h, ULONG dataType, ULONG requestValue,
-                                      BYTE* pOut, DWORD dwOutLen, DWORD* pdwCopied)
+                                      BYTE* pOut, DWORD dwOutLen, DWORD* pdwCopied,
+                                      DWORD identLen)
 {
     /* Identify Controller is adapter-level. Device Identify is often a
      * 72-byte SN/MN/FR stub (VER at 80 = 0). Health log: Device first. */
@@ -190,7 +193,11 @@ static BOOL QueryNVMeProtocolOnHandle(HANDLE h, ULONG dataType, ULONG requestVal
         subValues[0] = 0;
         subValues[1] = 1;
         nSub = 2;
-        lengths[0] = 4096;
+        /* 4096 only for stornvme/secnvme. Other drivers allocate a
+         * stack buffer from this length and bugcheck 0x139. */
+        if (identLen < 512) identLen = 512;
+        if (identLen > 4096) identLen = 4096;
+        lengths[0] = identLen;
         nLen = 1;
     } else {
         propertyIds[0] = (ULONG)StorageDeviceProtocolSpecificProperty;
@@ -199,9 +206,10 @@ static BOOL QueryNVMeProtocolOnHandle(HANDLE h, ULONG dataType, ULONG requestVal
         subValues[1] = 0xFFFFFFFFu;
         subValues[2] = 1;
         nSub = 3;
+        /* Log page 02h is 512 bytes. ProtocolDataLength 4096 makes
+         * iaStorVD overrun a stack cookie (bugcheck 0x139). */
         lengths[0] = 512;
-        lengths[1] = 4096;
-        nLen = 2;
+        nLen = 1;
     }
 
     ZeroMemory(bestIdent, sizeof(bestIdent));
@@ -237,16 +245,28 @@ BOOL QueryNVMeProtocol(HANDLE hDrive, ULONG dataType, ULONG requestValue,
     HANDLE hScsi;
     char szScsi[32];
     BOOL okDrive;
+    DWORD identLen;
 
     g_dwLastNvmeQueryErr = 0;
+    /* Intel RST and USB bridges: no Microsoft protocol query.
+     * RAID/VROC/virtual get a 512-byte query on this handle only.
+     * \\.\ScsiN: is stornvme/secnvme — opening it on iaStor or MegaRAID
+     * bugchecks 0x139. */
+    if (!DriveAllowsNvmeProtocol(hDrive)) {
+        g_dwLastNvmeQueryErr = ERROR_NOT_SUPPORTED;
+        return FALSE;
+    }
+    identLen = DriveAllowsFullNvmeIdentify(hDrive) ? 4096 : 512;
     okDrive = QueryNVMeProtocolOnHandle(hDrive, dataType, requestValue,
-                                        pOut, dwOutLen, pdwCopied);
+                                        pOut, dwOutLen, pdwCopied, identLen);
 
     /* A 72-byte SN/MN/FR stub still counts as success. For Identify, keep
      * going to \\.\ScsiN: — that is where full VER/WCTEMP often live. */
     if (okDrive && (dataType != MY_NVMeDataTypeIdentify ||
                     NvmeIdentVerDword(pOut, pdwCopied ? *pdwCopied : 0) != 0))
         return TRUE;
+    if (!DriveAllowsFullNvmeIdentify(hDrive))
+        return okDrive;
 
     ZeroMemory(&addr, sizeof(addr));
     addr.Length = sizeof(addr);
@@ -262,7 +282,8 @@ BOOL QueryNVMeProtocol(HANDLE hDrive, ULONG dataType, ULONG requestValue,
             BOOL okScsi;
             ZeroMemory(scsiBuf, sizeof(scsiBuf));
             okScsi = QueryNVMeProtocolOnHandle(hScsi, dataType, requestValue,
-                                               scsiBuf, sizeof(scsiBuf), &nScsi);
+                                               scsiBuf, sizeof(scsiBuf), &nScsi,
+                                               identLen);
             CloseHandle(hScsi);
             if (okScsi) {
                 if (!okDrive ||
@@ -296,6 +317,18 @@ BOOL GetNVMeIdentifyController(HANDLE hDrive, DRIVE_INFO* pInfo)
     if (GetStorageBusType(hDrive) == 7)
         return FALSE;
 
+    /* VMD: do not send NvmeMini or a 4096-byte protocol identify. */
+    if (DriveBehindIntelRst(hDrive)) {
+        BYTE alt[4096];
+        ZeroMemory(alt, sizeof(alt));
+        if (!NvmeIntelRstAdmin(hDrive, 0x06, 0, 1, alt, 4096) ||
+            NvmeIdentQuality(alt, 4096) < 10)
+            return FALSE;
+        memcpy(ident, alt, 4096);
+        nCopied = 4096;
+        goto ident_copied;
+    }
+
     if (!QueryNVMeProtocol(hDrive, MY_NVMeDataTypeIdentify, 1,
                            ident, sizeof(ident), &nCopied) || nCopied < 72 ||
         NvmeIdentVerDword(ident, nCopied) == 0) {
@@ -313,6 +346,7 @@ BOOL GetNVMeIdentifyController(HANDLE hDrive, DRIVE_INFO* pInfo)
         }
     }
 
+ident_copied:
     /* Store identify controller data (never more than the 4096-byte page). */
     CopyNvmeIdentBuf(pInfo, ident, nCopied ? nCopied : 4096);
     pInfo->bGotNVMeIdent = TRUE;
@@ -439,7 +473,12 @@ static BOOL NvmeMiniportAdmin(HANDLE hDrive, DWORD cdw0, DWORD nsid, DWORD cdw10
                               BYTE* pOut, DWORD dwOut)
 {
     SCSI_ADDRESS addr;
-    HANDLE hScsi = OpenScsiAdapterFromDrive(hDrive, &addr);
+    HANDLE hScsi;
+    /* "NvmeMini" is stornvme's SRB. iaStor, MegaRAID, Samsung secnvme
+     * and AMD-RAID bugcheck or corrupt the stack on this signature. */
+    if (!DriveAllowsNvmeMini(hDrive))
+        return FALSE;
+    hScsi = OpenScsiAdapterFromDrive(hDrive, &addr);
     MY_NVME_PT* pt;
     DWORD dwRet = 0;
     BOOL ok;
@@ -468,6 +507,7 @@ static BOOL NvmeMiniportAdmin(HANDLE hDrive, DWORD cdw0, DWORD nsid, DWORD cdw10
         HeapFree(GetProcessHeap(), 0, pt);
         return FALSE;
     }
+    if (dwOut > sizeof(pt->DataBuffer)) dwOut = (DWORD)sizeof(pt->DataBuffer);
     memcpy(pOut, pt->DataBuffer, dwOut);
     HeapFree(GetProcessHeap(), 0, pt);
     return TRUE;
@@ -477,10 +517,13 @@ static BOOL NvmeIntelRstAdmin(HANDLE hDrive, DWORD opcode, DWORD nsid, DWORD cdw
                               BYTE* pOut, DWORD dwOut)
 {
     SCSI_ADDRESS addr;
-    HANDLE hScsi = OpenScsiAdapterFromDrive(hDrive, &addr);
+    HANDLE hScsi;
     MY_INTEL_NVME_PT* pt;
     DWORD dwRet = 0;
     BOOL ok;
+    if (!DriveBehindIntelRst(hDrive))
+        return FALSE;
+    hScsi = OpenScsiAdapterFromDrive(hDrive, &addr);
     if (hScsi == INVALID_HANDLE_VALUE) return FALSE;
     pt = (MY_INTEL_NVME_PT*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(MY_INTEL_NVME_PT));
     if (!pt) { CloseHandle(hScsi); return FALSE; }
@@ -491,10 +534,13 @@ static BOOL NvmeIntelRstAdmin(HANDLE hDrive, DWORD opcode, DWORD nsid, DWORD cdw
     pt->SRB.Length = sizeof(MY_INTEL_NVME_PT) - sizeof(MY_SRB_IO_CONTROL);
     pt->Version = 1;
     pt->PathId = addr.PathId;
+    /* TargetId and Lun stay 0. CrystalDiskInfo's IntelNvm SRB does the
+     * same; a non-zero TargetId is not what iaStorVD expects.
+     * ParamBufLen is payload + SRB (0xA4), not the payload alone. */
     pt->NVMeCmd[0] = opcode;
     pt->NVMeCmd[1] = nsid;
     pt->NVMeCmd[10] = cdw10;
-    pt->ParamBufLen = sizeof(MY_INTEL_NVME_PT) - 0x1000;
+    pt->ParamBufLen = (DWORD)(sizeof(MY_INTEL_NVME_PT) - 0x1000);
     pt->ReturnBufferLen = 0x1000;
     ok = DeviceIoControl(hScsi, IOCTL_SCSI_MINIPORT, pt, sizeof(*pt), pt, sizeof(*pt), &dwRet, NULL);
     CloseHandle(hScsi);
@@ -507,6 +553,7 @@ static BOOL NvmeIntelRstAdmin(HANDLE hDrive, DWORD opcode, DWORD nsid, DWORD cdw
         HeapFree(GetProcessHeap(), 0, pt);
         return FALSE;
     }
+    if (dwOut > sizeof(pt->DataBuffer)) dwOut = (DWORD)sizeof(pt->DataBuffer);
     memcpy(pOut, pt->DataBuffer, dwOut);
     HeapFree(GetProcessHeap(), 0, pt);
     return TRUE;
@@ -530,7 +577,15 @@ BOOL GetNVMeHealthLogEx(HANDLE hDrive, DRIVE_INFO* pInfo)
      * meaningless on USB SAT). Never run this path on bus type 7. */
     if (GetStorageBusType(hDrive) == 7)
         return FALSE;
-    /* Do not call IOCTL_STORAGE_PROTOCOL_COMMAND — it bugchecked nvme.sys. */
+    /* Do not call IOCTL_STORAGE_PROTOCOL_COMMAND — it bugchecked nvme.sys.
+     * VMD does not implement that query either; IntelNvm only. */
+    if (DriveBehindIntelRst(hDrive)) {
+        ZeroMemory(health, sizeof(health));
+        if (!NvmeIntelRstAdmin(hDrive, 0x02, 0xFFFFFFFFu, 0x007f0002,
+                               health, sizeof(health)))
+            return FALSE;
+        return FillNvmeHealthFromBuf(pInfo, health, sizeof(health));
+    }
     if (GetNVMeHealthLog(hDrive, pInfo)) return TRUE;
     if (GetNVMeHealthLogFallback(hDrive, pInfo)) return TRUE;
     ZeroMemory(health, sizeof(health));
@@ -587,13 +642,20 @@ BOOL GetNVMeInfo(HANDLE hDrive, DRIVE_INFO* pInfo)
 
     if (GetNVMeHealthLogEx(hDrive, pInfo)) {
         ExtractNVMeExtendedInfo(pInfo);
-        TryNvmeLifetimeTemp(hDrive, pInfo);
-    } else {
+        /* Log page 0xCA via the Microsoft protocol query. iaStorVD
+         * does not implement it; do not send it. */
+        if (!DriveBehindIntelRst(hDrive))
+            TryNvmeLifetimeTemp(hDrive, pInfo);
+    } else if (!DriveBehindIntelRst(hDrive)) {
         GetSMARTViaLogSense(hDrive, pInfo);
     }
 
-    pInfo->eType   = DRIVE_TYPE_NVME;
-    pInfo->bIsNVMe = TRUE;
+    /* A VMD disk that did not answer IntelNvm stays non-NVMe so the
+     * caller does not pretend SMART was read. */
+    if (bIdent || pInfo->bSMART_Supported || !DriveBehindIntelRst(hDrive)) {
+        pInfo->eType   = DRIVE_TYPE_NVME;
+        pInfo->bIsNVMe = TRUE;
+    }
 
     IdentifyDriveParts(pInfo);
 

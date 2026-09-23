@@ -454,14 +454,26 @@ static int Utf8DispWidth(const char* s)
 
 static void PadUtf8(char* dst, int nDst, const char* s, int width)
 {
-    int w;
-    size_t used;
+    int w = 0;
+    size_t used = 0;
+    const unsigned char* p;
     if (!dst || nDst <= 0) return;
     dst[0] = '\0';
-    if (s)
-        safe_snprintf_n(dst, nDst, "%s", s);
-    w = Utf8DispWidth(dst);
-    used = strlen(dst);
+    p = (const unsigned char*)(s ? s : "");
+    /* Stop at `width` columns. A longer value used to run into the next column. */
+    while (*p && w < width && used + 1 < (size_t)nDst) {
+        int nb = 1;
+        if ((*p & 0xE0) == 0xC0) nb = 2;
+        else if ((*p & 0xF0) == 0xE0) nb = 3;
+        else if ((*p & 0xF8) == 0xF0) nb = 4;
+        else if (*p >= 0x80) nb = 1;
+        if (used + (size_t)nb >= (size_t)nDst) break;
+        memcpy(dst + used, p, (size_t)nb);
+        used += (size_t)nb;
+        p += nb;
+        dst[used] = '\0';
+        w++;
+    }
     while (w < width && used + 1 < (size_t)nDst) {
         dst[used++] = ' ';
         dst[used] = '\0';
@@ -1241,7 +1253,7 @@ static void LectureMatrixRow(char* buf, int nBuf,
 {
     char c1[72], c2[48], c3[40];
     PadUtf8(c1, (int)sizeof(c1), evid, 28);
-    PadUtf8(c2, (int)sizeof(c2), val, 22);
+    PadUtf8(c2, (int)sizeof(c2), val, 32);
     PadUtf8(c3, (int)sizeof(c3), infl, 16);
     LectureAddF(buf, nBuf, "  %s%s%s\r\n", c1, c2, c3);
 }
@@ -1445,12 +1457,15 @@ static void FormatHddLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
         char szC1[32];
         LectureAdd(szBuf, nBufLen, TN("\r\nМеханика\r\n", "\r\nMechanics\r\n"));
         if (pInfo->nGSenseEvents >= 0)
-            LectureAddF(szBuf, nBufLen, "  G-Sense: %d событий\r\n", pInfo->nGSenseEvents);
+            LectureAddF(szBuf, nBufLen, TN("  G-Sense: %d событий\r\n", "  G-Sense: %d events\r\n"),
+                        pInfo->nGSenseEvents);
         if (pInfo->nEmergencyRetract >= 0)
-            LectureAddF(szBuf, nBufLen, "  Аварийные парковки: %d\r\n", pInfo->nEmergencyRetract);
+            LectureAddF(szBuf, nBufLen, TN("  Аварийные парковки: %d\r\n", "  Emergency retracts: %d\r\n"),
+                        pInfo->nEmergencyRetract);
         if (pInfo->nLoadUnload >= 0) {
             FormatUintGrouped((unsigned long)pInfo->nLoadUnload, szC1, (int)sizeof(szC1));
-            LectureAddF(szBuf, nBufLen, "  Циклы парковки головок: %s\r\n", szC1);
+            LectureAddF(szBuf, nBufLen, TN("  Циклы парковки головок: %s\r\n", "  Load/unload cycles: %s\r\n"),
+                        szC1);
         }
     }
     if (pInfo->dwPowerOnHours > 0) {
@@ -1932,9 +1947,11 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
         nMediaDeg++;
 
     if (!pInfo->bIsNVMe && pInfo->eNormQuality != NORM_QUALITY_UNKNOWN) {
-        LectureAddF(szBuf, nBufLen, "Качество нормализованных SMART: %s\r\n",
+        LectureAddF(szBuf, nBufLen, TN("Качество нормализованных SMART: %s\r\n",
+                                      "Normalized SMART quality: %s\r\n"),
                     QualityNameRu(pInfo->eNormQuality, FALSE));
-        LectureAddF(szBuf, nBufLen, "Качество vendor RAW: %s\r\n",
+        LectureAddF(szBuf, nBufLen, TN("Качество vendor RAW: %s\r\n",
+                                      "Vendor RAW quality: %s\r\n"),
                     QualityNameRu(pInfo->eRawQuality, TRUE));
         if (pInfo->eNormQuality == NORM_QUALITY_LOW)
             LectureAdd(szBuf, nBufLen,
@@ -1991,20 +2008,23 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
             "  Небезопасные выключения: %llu. Журнал питания, не штраф.\r\n",
             (unsigned long long)pInfo->qwNVMeUnsafeShutdowns);
 
-        LectureAdd(szBuf, nBufLen, "\r\nМатрица улик:\r\n");
-        LectureMatrixRow(szBuf, nBufLen, "Улика", "Значение", "Влияние");
+        LectureAdd(szBuf, nBufLen, TN("\r\nМатрица улик:\r\n", "\r\nEvidence matrix:\r\n"));
+        LectureMatrixRow(szBuf, nBufLen,
+                         TN("Улика", "Evidence"),
+                         TN("Значение", "Value"),
+                         TN("Влияние", "Effect"));
         LectureMatrixRow(szBuf, nBufLen, "SMART overall",
                          pInfo->bPredictFailure ? "FAIL" : "PASS",
                          pInfo->bPredictFailure ? "−" : "+");
         safe_snprintf(szSpare, "%d%%", nSpare);
-        LectureMatrixRow(szBuf, nBufLen, "Доступный запас", szSpare,
+        LectureMatrixRow(szBuf, nBufLen, TN("Доступный запас", "Available spare"), szSpare,
                          bSpareLow ? "−" : "+");
         safe_snprintf(szMedia, "%llu", (unsigned long long)pInfo->qwNVMeMediaErrors);
-        LectureMatrixRow(szBuf, nBufLen, "Ошибки носителя", szMedia,
+        LectureMatrixRow(szBuf, nBufLen, TN("Ошибки носителя", "Media errors"), szMedia,
                          pInfo->qwNVMeMediaErrors == 0 ? "+" : "−");
         if (pInfo->nEndurancePercent >= 0) {
             safe_snprintf(szLife, "%d%%", pInfo->nEndurancePercent);
-            LectureMatrixRow(szBuf, nBufLen, "Остаток ресурса", szLife,
+            LectureMatrixRow(szBuf, nBufLen, TN("Остаток ресурса", "Life remaining"), szLife,
                              pInfo->nEndurancePercent <= 20 ? "0" : "+");
         }
         {
@@ -2012,17 +2032,17 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
             if (pInfo->nTemperatureC > 0)
                 safe_snprintf(szT, "%d °C", pInfo->nTemperatureC);
             else
-                safe_snprintf(szT, "нет данных");
-            LectureMatrixRow(szBuf, nBufLen, "Температура", szT, "0");
+                safe_snprintf(szT, "%s", Tr(STR_POH_NONE));
+            LectureMatrixRow(szBuf, nBufLen, TN("Температура", "Temperature"), szT, "0");
         }
         {
             char szH[64];
             FormatPowerOnHours(pInfo->dwPowerOnHours, szH, (int)sizeof(szH));
-            LectureMatrixRow(szBuf, nBufLen, "Наработка", szH, "0");
+            LectureMatrixRow(szBuf, nBufLen, TN("Наработка", "Power-on"), szH, "0");
         }
-        LectureMatrixRow(szBuf, nBufLen, "Контроллер",
+        LectureMatrixRow(szBuf, nBufLen, TN("Контроллер", "Controller"),
                          DriveControllerLabel(pInfo),
-                         pInfo->eController == CONTROLLER_UNKNOWN ? "−уверенность" : "0");
+                         pInfo->eController == CONTROLLER_UNKNOWN ? TN("−уверенность", "−confidence") : "0");
 
         LectureAdd(szBuf, nBufLen, TN("\r\nИтог:\r\n", "\r\nVerdict:\r\n"));
         if (pInfo->eHealthStatus == HEALTH_STATUS_GOOD) {
@@ -2138,7 +2158,8 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
                 "  CRC UltraDMA: %d. Кабель/мост/порт, не здоровье носителя.\r\n",
                 pInfo->nCrcErrors);
         else if (pInfo->nCrcErrors == 0)
-            LectureAdd(szBuf, nBufLen, "  CRC UltraDMA: 0. Контекст, не штраф.\r\n");
+            LectureAdd(szBuf, nBufLen, TN("  CRC UltraDMA: 0. Контекст, не штраф.\r\n",
+                                          "  CRC UltraDMA: 0. Context, not a penalty.\r\n"));
         {
             int n188 = AttrRawOrNeg1(pInfo, 0xBC);
             int n189 = AttrRawOrNeg1(pInfo, 0xBD);
@@ -2161,13 +2182,16 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
                         n10);
             }
         }
-        LectureAddF(szBuf, nBufLen,
+        LectureAddF(szBuf, nBufLen, TN(
             "  Температура: %s. Время на высокой температуре: нет данных.\r\n",
+            "  Temperature: %s. Time at high temperature: no data.\r\n"),
             szTempBand);
-        LectureAddF(szBuf, nBufLen,
-            "  Наработка: %s. Power-on hours ≠ признак отказа.\r\n", szPoh);
-        LectureAddF(szBuf, nBufLen,
+        LectureAddF(szBuf, nBufLen, TN(
+            "  Наработка: %s. Power-on hours ≠ признак отказа.\r\n",
+            "  Power-on: %s. Power-on hours are not a failure sign.\r\n"), szPoh);
+        LectureAddF(szBuf, nBufLen, TN(
             "  Циклы включения: %lu. Контекст, не штраф.\r\n",
+            "  Power cycles: %lu. Context, not a penalty.\r\n"),
             (unsigned long)pInfo->dwPowerCycleCount);
         if (nC0 >= 0 && DriveTreatsC0AsPowerLoss(pInfo)) {
             LectureAddF(szBuf, nBufLen,
@@ -2175,30 +2199,37 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
                 "Находка только при росте счётчика, не по абсолютному числу.\r\n",
                 nC0);
         } else if (nC0 >= 0) {
-            LectureAddF(szBuf, nBufLen,
+            LectureAddF(szBuf, nBufLen, TN(
                 "  Парковки при выключении (192): %d. Контекст, не штраф.\r\n",
+                "  Power-off retracts (192): %d. Context, not a penalty.\r\n"),
                 nC0);
         }
         if (pInfo->nGSenseEvents >= 0 || pInfo->eType == DRIVE_TYPE_HDD) {
-            LectureAdd(szBuf, nBufLen, "\r\nМеханика (отдельный канал, не штраф к состоянию):\r\n");
+            LectureAdd(szBuf, nBufLen, TN(
+                "\r\nМеханика (отдельный канал, не штраф к состоянию):\r\n",
+                "\r\nMechanics (separate channel, not a health penalty):\r\n"));
             if (pInfo->nGSenseEvents >= 0)
-                LectureAddF(szBuf, nBufLen,
+                LectureAddF(szBuf, nBufLen, TN(
                     "  G-Sense: %d событий. Зарегистрированные события, связанные с ударом/вибрацией (не обязательно столько физических ударов).\r\n",
+                    "  G-Sense: %d events. Recorded shock or vibration (not necessarily that many physical shocks).\r\n"),
                     pInfo->nGSenseEvents);
             if (pInfo->nGSensePerKh >= 0 && pInfo->dwPowerOnHours > 0)
-                LectureAddF(szBuf, nBufLen,
+                LectureAddF(szBuf, nBufLen, TN(
                     "  G-Sense / наработка: %d событий ≈ %d на 1000 ч (контекст, не оценка).\r\n",
+                    "  G-Sense / power-on: %d events ≈ %d per 1000 h (context, not a score).\r\n"),
                     pInfo->nGSenseEvents, pInfo->nGSensePerKh);
             if (pInfo->nMechRisk >= 0)
                 LectureAddF(szBuf, nBufLen,
                     "  Mechanical risk: %d/100 (рост и корреляция; абсолютный BF не входит).\r\n",
                     pInfo->nMechRisk);
             if (pInfo->nEmergencyRetract >= 0)
-                LectureAddF(szBuf, nBufLen,
-                    "  Аварийные парковки (192): %d.\r\n", pInfo->nEmergencyRetract);
+                LectureAddF(szBuf, nBufLen, TN(
+                    "  Аварийные парковки (192): %d.\r\n",
+                    "  Emergency retracts (192): %d.\r\n"), pInfo->nEmergencyRetract);
             if (pInfo->nLoadUnload >= 0)
-                LectureAddF(szBuf, nBufLen,
-                    "  Циклы парковки головок: %d.\r\n", pInfo->nLoadUnload);
+                LectureAddF(szBuf, nBufLen, TN(
+                    "  Циклы парковки головок: %d.\r\n",
+                    "  Load/unload cycles: %d.\r\n"), pInfo->nLoadUnload);
             LectureAddF(szBuf, nBufLen,
                 TN("  Механическое состояние: %s.\r\n",
                    "  Mechanical condition: %s.\r\n"),
@@ -2253,8 +2284,11 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
             }
         }
 
-        LectureAdd(szBuf, nBufLen, "\r\nМатрица улик:\r\n");
-        LectureMatrixRow(szBuf, nBufLen, "Улика", "Значение", "Влияние");
+        LectureAdd(szBuf, nBufLen, TN("\r\nМатрица улик:\r\n", "\r\nEvidence matrix:\r\n"));
+        LectureMatrixRow(szBuf, nBufLen,
+                         TN("Улика", "Evidence"),
+                         TN("Значение", "Value"),
+                         TN("Влияние", "Effect"));
         LectureMatrixRow(szBuf, nBufLen, "SMART overall",
                          pInfo->bPredictFailure ? "FAIL" : "PASS",
                          pInfo->bPredictFailure ? "−" : "+");
@@ -2262,16 +2296,16 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
                          pInfo->bPrefailNow ? "FAIL" : "PASS",
                          pInfo->bPrefailNow ? "−" : "+");
         if (pInfo->nReallocated >= 0)
-            LectureMatrixRow(szBuf, nBufLen, "Переназначенные", szR,
+            LectureMatrixRow(szBuf, nBufLen, TN("Переназначенные", "Reallocated"), szR,
                              pInfo->nReallocated == 0 ? "+" : "−");
         if (pInfo->nPendingSectors >= 0)
-            LectureMatrixRow(szBuf, nBufLen, "Ожидающие", szPend,
+            LectureMatrixRow(szBuf, nBufLen, TN("Ожидающие", "Pending"), szPend,
                              pInfo->nPendingSectors == 0 ? "+" : "−");
         if (pInfo->nUncorrectable >= 0)
-            LectureMatrixRow(szBuf, nBufLen, "Неисправимые", szU,
+            LectureMatrixRow(szBuf, nBufLen, TN("Неисправимые", "Uncorrectable"), szU,
                              pInfo->nUncorrectable == 0 ? "+" : "−");
         if (pInfo->nRemapEvents >= 0)
-            LectureMatrixRow(szBuf, nBufLen, "События переназначения", szRemap,
+            LectureMatrixRow(szBuf, nBufLen, TN("События переназначения", "Reallocation events"), szRemap,
                              pInfo->nRemapEvents == 0 ? "+" : "−");
         if (pInfo->nCrcErrors >= 0)
             LectureMatrixRow(szBuf, nBufLen, "CRC", szCrc, "0");
@@ -2280,7 +2314,7 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
             if (n187 >= 0) {
                 char sz187[24];
                 safe_snprintf(sz187, "%d", n187);
-                LectureMatrixRow(szBuf, nBufLen, "Неисправимые (187)", sz187,
+                LectureMatrixRow(szBuf, nBufLen, TN("Неисправимые (187)", "Uncorrectable (187)"), sz187,
                                  n187 == 0 ? "+" : "−");
             }
         }
@@ -2289,11 +2323,11 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
             const char* inf;
             safe_snprintf(szWe, "знач. %d", pInfo->nWriteErrorValue);
             inf = (pInfo->nWriteErrorValue <= 10) ? "−" : "0";
-            LectureMatrixRow(szBuf, nBufLen, "Ошибки записи (200)", szWe, inf);
+            LectureMatrixRow(szBuf, nBufLen, TN("Ошибки записи (200)", "Write errors (200)"), szWe, inf);
         }
         if (pInfo->nEndurancePercent >= 0) {
             safe_snprintf(szLife, "%d%%", pInfo->nEndurancePercent);
-            LectureMatrixRow(szBuf, nBufLen, "Остаток ресурса", szLife,
+            LectureMatrixRow(szBuf, nBufLen, TN("Остаток ресурса", "Life remaining"), szLife,
                              pInfo->nEndurancePercent <= 20 ? "0" : "+");
         }
         {
@@ -2301,13 +2335,13 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
             if (pInfo->nTemperatureC > 0)
                 safe_snprintf(szT, "%d °C", pInfo->nTemperatureC);
             else
-                safe_snprintf(szT, "нет данных");
-            LectureMatrixRow(szBuf, nBufLen, "Температура", szT, "0");
+                safe_snprintf(szT, "%s", Tr(STR_POH_NONE));
+            LectureMatrixRow(szBuf, nBufLen, TN("Температура", "Temperature"), szT, "0");
         }
         {
             char szH[64];
             FormatPowerOnHours(pInfo->dwPowerOnHours, szH, (int)sizeof(szH));
-            LectureMatrixRow(szBuf, nBufLen, "Наработка", szH, "0");
+            LectureMatrixRow(szBuf, nBufLen, TN("Наработка", "Power-on"), szH, "0");
         }
         if (nC3 >= 0) {
             char szEcc[24];
@@ -2337,37 +2371,46 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
                 safe_snprintf(szCtl, "Phison (RAW частично)");
             else
                 safe_snprintf(szCtl, "%s", ctl);
-            LectureMatrixRow(szBuf, nBufLen, "Контроллер", szCtl,
-                             nUnknown > 0 ? "−уверенность" : "0");
+            LectureMatrixRow(szBuf, nBufLen, TN("Контроллер", "Controller"), szCtl,
+                             nUnknown > 0 ? TN("−уверенность", "−confidence") : "0");
         }
 
         LectureAdd(szBuf, nBufLen, TN("\r\nИтог:\r\n", "\r\nVerdict:\r\n"));
         if (pInfo->eHealthStatus == HEALTH_STATUS_GOOD)
-            LectureAdd(szBuf, nBufLen, "  ХОРОШО, потому что:\r\n");
+            LectureAdd(szBuf, nBufLen, TN("  ХОРОШО, потому что:\r\n", "  GOOD because:\r\n"));
         else if (pInfo->eHealthStatus == HEALTH_STATUS_OBSERVE)
-            LectureAdd(szBuf, nBufLen, "  РИСК, потому что:\r\n");
+            LectureAdd(szBuf, nBufLen, TN("  РИСК, потому что:\r\n", "  WATCH because:\r\n"));
         else if (pInfo->eHealthStatus == HEALTH_STATUS_CAUTION)
-            LectureAdd(szBuf, nBufLen, "  ВНИМАНИЕ, потому что:\r\n");
+            LectureAdd(szBuf, nBufLen, TN("  ВНИМАНИЕ, потому что:\r\n", "  NEEDS ATTENTION because:\r\n"));
         else
-            LectureAdd(szBuf, nBufLen, "  ПЛОХО, потому что:\r\n");
-        LectureAddF(szBuf, nBufLen, "    %d сильных положительных признаков\r\n", nPos);
-        LectureAddF(szBuf, nBufLen, "    %d критических отказов\r\n", nCritFail);
-        LectureAddF(szBuf, nBufLen, "    %d признаков деградации носителя\r\n", nMediaDeg);
-        LectureAddF(szBuf, nBufLen, "    %d vendor-specific счётчиков не расшифрованы\r\n",
+            LectureAdd(szBuf, nBufLen, TN("  ПЛОХО, потому что:\r\n", "  BAD because:\r\n"));
+        LectureAddF(szBuf, nBufLen, TN("    %d сильных положительных признаков\r\n",
+                                      "    %d strong positive signs\r\n"), nPos);
+        LectureAddF(szBuf, nBufLen, TN("    %d критических отказов\r\n",
+                                      "    %d critical failures\r\n"), nCritFail);
+        LectureAddF(szBuf, nBufLen, TN("    %d признаков деградации носителя\r\n",
+                                      "    %d signs of media degradation\r\n"), nMediaDeg);
+        LectureAddF(szBuf, nBufLen, TN("    %d vendor-specific счётчиков не расшифрованы\r\n",
+                                      "    %d vendor-specific counters not decoded\r\n"),
                     nUnresolved);
 
-        LectureAdd(szBuf, nBufLen,
+        LectureAdd(szBuf, nBufLen, TN(
             "Мы не переводим SMART Value/Worst/Threshold в процент здоровья: "
             "нормализованная шкала 100 против 200 — это не «в два раза здоровее». "
-            "Сырые счётчики — факты, а не шкала от 0 до 100.\r\n");
+            "Сырые счётчики — факты, а не шкала от 0 до 100.\r\n",
+            "Value/Worst/Threshold are not turned into a health percent: "
+            "a normalized scale of 100 versus 200 is not \"twice as healthy\". "
+            "Raw counters are facts, not a 0–100 score.\r\n"));
         if (pInfo->nEndurancePercent >= 0)
             LectureAdd(szBuf, nBufLen,
                 "Заявленный остаток ресурса (A9) — цифра контроллера про износ NAND, "
                 "это не здоровье диска и не означает, что диск новый.\r\n");
         else
-            LectureAdd(szBuf, nBufLen,
+            LectureAdd(szBuf, nBufLen, TN(
                 "Для этого диска заявленный остаток ресурса (износ) не задан — "
-                "процент не выдумывается.\r\n");
+                "процент не выдумывается.\r\n",
+                "This drive does not report remaining endurance — "
+                "no percent is invented.\r\n"));
         LectureAddUnknownIdList(szBuf, nBufLen, pInfo);
     }
 }

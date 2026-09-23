@@ -2083,7 +2083,7 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
 
     case 0x0A:
         if (dw32 == 0)
-            safe_snprintf(szMain, "0  (ОК)");
+            safe_snprintf(szMain, "%s", TN("0  (ОК)", "0 (OK)"));
         else
             safe_snprintf(szMain, TN("%lu повторов  (!)", "%lu retries  (!)"), (unsigned long)dw32);
         break;
@@ -2092,7 +2092,7 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
     {
         DWORD dwSec = dw32 & 0xFFFF;
         if (dwSec == 0)
-            safe_snprintf(szMain, "0  (ОК)");
+            safe_snprintf(szMain, "%s", TN("0  (ОК)", "0 (OK)"));
         else
             safe_snprintf(szMain, TN("%lu секторов  (!)", "%lu sectors  (!)"), (unsigned long)dwSec);
         break;
@@ -2108,35 +2108,35 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
             else
                 safe_snprintf(szMain, "%s", TN("не счётчик событий", "not an event count"));
         } else if (dw32 == 0)
-            safe_snprintf(szMain, "0 событий  (ОК)");
+            safe_snprintf(szMain, "%s", TN("0 событий  (ОК)", "0 events (OK)"));
         else
             safe_snprintf(szMain, TN("%lu событий  (!)", "%lu events  (!)"), (unsigned long)dw32);
         break;
 
     case 0xC5:
         if (dw32 == 0)
-            safe_snprintf(szMain, "0  (ОК)");
+            safe_snprintf(szMain, "%s", TN("0  (ОК)", "0 (OK)"));
         else
             safe_snprintf(szMain, TN("%lu нестабильных  (!)", "%lu pending  (!)"), (unsigned long)dw32);
         break;
 
     case 0xC6:
         if (dw32 == 0)
-            safe_snprintf(szMain, "0  (ОК)");
+            safe_snprintf(szMain, "%s", TN("0  (ОК)", "0 (OK)"));
         else
             safe_snprintf(szMain, TN("%lu неисправимых  (!)", "%lu uncorrectable  (!)"), (unsigned long)dw32);
         break;
 
     case 0xC7:
         if (dw32 == 0)
-            safe_snprintf(szMain, "0  (ОК)");
+            safe_snprintf(szMain, "%s", TN("0  (ОК)", "0 (OK)"));
         else
             safe_snprintf(szMain, TN("%lu ошибок CRC  (!)", "%lu CRC errors  (!)"), (unsigned long)dw32);
         break;
 
     case 0xBB:
         if (dw32 == 0)
-            safe_snprintf(szMain, "0  (ОК)");
+            safe_snprintf(szMain, "%s", TN("0  (ОК)", "0 (OK)"));
         else
             safe_snprintf(szMain, TN("%lu неисправимых", "%lu uncorrectable"), (unsigned long)dw32);
         break;
@@ -2150,7 +2150,7 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
         }
         if (eType == DRIVE_TYPE_HDD) {
             if (dw32 == 0)
-                safe_snprintf(szMain, "0  (ОК)");
+                safe_snprintf(szMain, "%s", TN("0  (ОК)", "0 (OK)"));
             else
                 safe_snprintf(szMain, TN("%lu восстановлений ECC", "%lu ECC recovered"), (unsigned long)dw32);
             break;
@@ -2170,17 +2170,17 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
         WORD wOver5 = (WORD)pRaw[2] | ((WORD)pRaw[3] << 8);
         WORD wOver75 = (WORD)pRaw[4] | ((WORD)pRaw[5] << 8);
         if (wTotal == 0)
-            safe_snprintf(szMain, "0  (ОК)");
+            safe_snprintf(szMain, "%s", TN("0  (ОК)", "0 (OK)"));
         else
-            safe_snprintf(szMain, TN("%u таймаутов  (>%u за 5 с, >%u за 7.5 с)",
-                                     "%u timeouts (>%u over 5 s, >%u over 7.5 s)"),
+            safe_snprintf(szMain, TN("%u таймаутов (за 5 с: %u, за 7.5 с: %u)",
+                                     "%u timeouts (over 5 s: %u, over 7.5 s: %u)"),
                           wTotal, wOver5, wOver75);
         break;
     }
 
     case 0xBD:
         if (dw32 == 0)
-            safe_snprintf(szMain, "0  (ОК)");
+            safe_snprintf(szMain, "%s", TN("0  (ОК)", "0 (OK)"));
         else
             safe_snprintf(szMain, TN("%lu записей на большой высоте (вибрация)",
                                      "%lu high-fly writes (vibration)"),
@@ -2200,14 +2200,14 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
 
     case 0xB7:
         if (dw32 == 0)
-            safe_snprintf(szMain, "0  (ОК)");
+            safe_snprintf(szMain, "%s", TN("0  (ОК)", "0 (OK)"));
         else
             safe_snprintf(szMain, "%lu понижений  (!)", (unsigned long)dw32);
         break;
 
     case 0xB8:
         if (dw32 == 0)
-            safe_snprintf(szMain, "0  (ОК)");
+            safe_snprintf(szMain, "%s", TN("0  (ОК)", "0 (OK)"));
         else
             safe_snprintf(szMain, TN("%lu ошибок сквозной передачи",
                                      "%lu end-to-end errors"),
@@ -2225,7 +2225,7 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
 
     case 0xC8:
         if (dw32 == 0)
-            safe_snprintf(szMain, "0  (ОК)");
+            safe_snprintf(szMain, "%s", TN("0  (ОК)", "0 (OK)"));
         else
             safe_snprintf(szMain, "%lu  (значение важнее RAW)", (unsigned long)dw32);
         break;
@@ -2239,7 +2239,7 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
             break;
         }
         if (dw32 == 0)
-            safe_snprintf(szMain, "0  (ОК)");
+            safe_snprintf(szMain, "%s", TN("0  (ОК)", "0 (OK)"));
         else if (qw48 > 0xFFFFFFFFULL)
             safe_snprintf(szMain, "%llu", (unsigned long long)qw48);
         else
@@ -2256,7 +2256,7 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
             break;
         }
         if (dw32 == 0)
-            safe_snprintf(szMain, "0  (ОК)");
+            safe_snprintf(szMain, "%s", TN("0  (ОК)", "0 (OK)"));
         else if (qw48 > 0xFFFFFFFFULL)
             safe_snprintf(szMain, "%llu", (unsigned long long)qw48);
         else

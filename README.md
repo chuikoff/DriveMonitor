@@ -8,7 +8,7 @@
 
 Русский и английский просмотрщик S.M.A.R.T. для Windows. Язык: меню **Язык** (запоминается).
 
-**Текущий выпуск:** [1.7.3](https://github.com/chuikoff/DriveMonitor/releases/tag/1.7.3) (сборка 3) — скачать `DriveMonitor.exe`, запустить от администратора.
+**Текущий выпуск:** [1.7.6](https://github.com/chuikoff/DriveMonitor/releases/tag/1.7.6) (сборка 6) — скачать `DriveMonitor.exe`, запустить от администратора.
 
 Windows 10 / 11. Один снимок SMART (старт, hotplug, «Перечитать»), без трея, графика и теста поверхности. Интерфейс следует DPI монитора; масштаб 100–200% в меню «Вид» (Ctrl+±, Ctrl+0, Ctrl+колёсико).
 
@@ -20,7 +20,7 @@ Windows 10 / 11. Один снимок SMART (старт, hotplug, «Переч�
 |------|----------------|
 | SATA | `IOCTL_ATA_PASS_THROUGH_DIRECT` |
 | USB-бокс (Realtek, JMicron, ASMedia) | SAT сначала (SATA за мостом), затем один vendor-passthrough (NVMe). Нативного NVMe IOCTL на USB нет |
-| Внутренний NVMe | SCSI miniport / `IOCTL_STORAGE_QUERY_PROPERTY`. **Не** `IOCTL_STORAGE_PROTOCOL_COMMAND` — на `nvme.sys` это давало BSOD |
+| Внутренний NVMe | `IOCTL_STORAGE_QUERY_PROPERTY` на `stornvme`. Intel RST/VMD — только `IntelNvm`. **Не** `IOCTL_STORAGE_PROTOCOL_COMMAND` и не ATA/SCSI passthrough на RAID: это давало BSOD 0x139 |
 
 Имя USB-переходника берётся из VID/PID (например Realtek `0BDA:9201`), не из модели диска.
 
@@ -64,7 +64,7 @@ MIT. Copyright: Ari Sohandri Putra / ARImetic Inc. Изменения: [chuikoff
 
 A one-shot Windows S.M.A.R.T. viewer with Russian and English UI. Language: **Language** menu (persisted).
 
-**Current release:** [1.7.3](https://github.com/chuikoff/DriveMonitor/releases/tag/1.7.3) (build 3) — download `DriveMonitor.exe` and run it as Administrator.
+**Current release:** [1.7.6](https://github.com/chuikoff/DriveMonitor/releases/tag/1.7.6) (build 6) — download `DriveMonitor.exe` and run it as Administrator.
 
 Windows 10 / 11. One SMART snapshot (startup, hotplug, Reread). No tray, no live polling, no Health% formula. The UI follows monitor DPI; zoom 100–200% is under **View** (Ctrl+±, Ctrl+0, Ctrl+wheel).
 
@@ -76,7 +76,7 @@ It reads raw SMART via `DeviceIoControl` and shows: ID / Attribute / Value / Wor
 |------|----------------|
 | SATA | `IOCTL_ATA_PASS_THROUGH_DIRECT` |
 | USB enclosure (Realtek, JMicron, ASMedia) | SAT first (SATA behind the bridge), then one vendor NVMe passthrough. There is no native NVMe IOCTL on USB |
-| Internal NVMe | SCSI miniport / `IOCTL_STORAGE_QUERY_PROPERTY`. **Not** `IOCTL_STORAGE_PROTOCOL_COMMAND` — that bugchecked `nvme.sys` |
+| Internal NVMe | `IOCTL_STORAGE_QUERY_PROPERTY` on `stornvme`. Intel RST/VMD uses `IntelNvm` only. **Not** `IOCTL_STORAGE_PROTOCOL_COMMAND`, and no ATA/SCSI passthrough on RAID — that bugchecked 0x139 |
 
 The USB adapter name comes from VID/PID (for example Realtek `0BDA:9201`), not from the drive model.
 

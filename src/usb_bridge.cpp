@@ -110,7 +110,8 @@ BOOL GetBridgeIdentity(HANDLE hDrive, DRIVE_INFO* pInfo)
         sptwb.spt.DataBufferOffset   = offsetof(CDI_SAT_PASSTHROUGH_BUF, DataBuf);
         sptwb.spt.TimeOutValue       = 10;
 
-        /* Standard SCSI INQUIRY */
+        /* Standard SCSI INQUIRY. USB bridges only — not AHCI, RAID, or NVMe. */
+        if (DriveAllowsScsiPassthrough(hDrive)) {
         sptwb.spt.Cdb[0] = 0x12;   /* INQUIRY */
         sptwb.spt.Cdb[4] = 96;     /* Allocation length */
 
@@ -134,6 +135,7 @@ BOOL GetBridgeIdentity(HANDLE hDrive, DRIVE_INFO* pInfo)
                     TrimStr(pInfo->szBridgeProduct);
                 }
             }
+        }
         }
     }
 
@@ -368,6 +370,7 @@ static BOOL SATSendCommand12(HANDLE hDrive, BYTE bFeatures, BYTE bSectorCnt,
     BYTE* pDataBuf, DWORD dwDataLen)
 {
     CDI_SAT_PASSTHROUGH_BUF sptwb;
+    if (!DriveAllowsScsiPassthrough(hDrive)) return FALSE;
     DWORD dwBytes = 0;
     ZeroMemory(&sptwb, sizeof(sptwb));
 
@@ -431,6 +434,7 @@ static BOOL SATSendCommand16(HANDLE hDrive, BYTE bFeatures, BYTE bSectorCnt,
 {
     CDI_SAT_PASSTHROUGH_BUF sptwb;
     DWORD dwBytes = 0;
+    if (!DriveAllowsScsiPassthrough(hDrive)) return FALSE;
     ZeroMemory(&sptwb, sizeof(sptwb));
 
     sptwb.spt.Length             = sizeof(SCSI_PASS_THROUGH);
@@ -613,6 +617,7 @@ static BOOL SCSILogSense(HANDLE hDrive, BYTE bPageCode, BYTE* pOut, DWORD dwOutL
 {
     CDI_SAT_PASSTHROUGH_BUF sptwb;
     DWORD dwBytes = 0;
+    if (!DriveAllowsScsiPassthrough(hDrive)) return FALSE;
     ZeroMemory(&sptwb, sizeof(sptwb));
 
     sptwb.spt.Length              = sizeof(SCSI_PASS_THROUGH);
@@ -873,6 +878,7 @@ static void FreeSptBuf4K(CDI_SAT_PASSTHROUGH_BUF_4K* p)
 
 BOOL NVMeIdentifyJMicron(HANDLE hDrive, DRIVE_INFO* pInfo)
 {
+    if (!DriveAllowsScsiPassthrough(hDrive)) return FALSE;
     CDI_SAT_PASSTHROUGH_BUF_4K sptwb;
     DWORD dwReturned = 0;
     DWORD length;
@@ -959,6 +965,7 @@ BOOL NVMeIdentifyJMicron(HANDLE hDrive, DRIVE_INFO* pInfo)
 
 BOOL NVMeHealthLogJMicron(HANDLE hDrive, DRIVE_INFO* pInfo)
 {
+    if (!DriveAllowsScsiPassthrough(hDrive)) return FALSE;
     CDI_SAT_PASSTHROUGH_BUF_4K sptwb;
     DWORD dwReturned = 0;
     DWORD length;
@@ -1033,6 +1040,7 @@ BOOL NVMeHealthLogJMicron(HANDLE hDrive, DRIVE_INFO* pInfo)
  * ============================================================ */
 BOOL NVMeIdentifyASMedia(HANDLE hDrive, DRIVE_INFO* pInfo)
 {
+    if (!DriveAllowsScsiPassthrough(hDrive)) return FALSE;
     CDI_SAT_PASSTHROUGH_BUF_4K sptwb;
     DWORD dwReturned = 0;
     DWORD length;
@@ -1085,6 +1093,7 @@ BOOL NVMeIdentifyASMedia(HANDLE hDrive, DRIVE_INFO* pInfo)
 
 BOOL NVMeHealthLogASMedia(HANDLE hDrive, DRIVE_INFO* pInfo)
 {
+    if (!DriveAllowsScsiPassthrough(hDrive)) return FALSE;
     CDI_SAT_PASSTHROUGH_BUF_4K sptwb;
     DWORD dwReturned = 0;
     DWORD length;
@@ -1129,6 +1138,7 @@ BOOL NVMeHealthLogASMedia(HANDLE hDrive, DRIVE_INFO* pInfo)
  * ============================================================ */
 BOOL NVMeIdentifyRealtek(HANDLE hDrive, DRIVE_INFO* pInfo)
 {
+    if (!DriveAllowsScsiPassthrough(hDrive)) return FALSE;
     CDI_SAT_PASSTHROUGH_BUF_4K* psptwb;
     DWORD dwReturned = 0;
     DWORD length;
@@ -1192,6 +1202,7 @@ BOOL NVMeIdentifyRealtek(HANDLE hDrive, DRIVE_INFO* pInfo)
 
 BOOL NVMeHealthLogRealtek(HANDLE hDrive, DRIVE_INFO* pInfo)
 {
+    if (!DriveAllowsScsiPassthrough(hDrive)) return FALSE;
     CDI_SAT_PASSTHROUGH_BUF_4K* psptwb;
     DWORD dwReturned = 0;
     DWORD length;
@@ -1251,6 +1262,7 @@ BOOL NVMeHealthLogRealtek(HANDLE hDrive, DRIVE_INFO* pInfo)
  * ============================================================ */
 BOOL NVMeIdentifyVLI(HANDLE hDrive, DRIVE_INFO* pInfo)
 {
+    if (!DriveAllowsScsiPassthrough(hDrive)) return FALSE;
     CDI_SAT_PASSTHROUGH_BUF_4K sptwb;
     DWORD dwReturned = 0;
     DWORD length;
@@ -1334,6 +1346,7 @@ BOOL NVMeIdentifyVLI(HANDLE hDrive, DRIVE_INFO* pInfo)
 
 BOOL NVMeHealthLogVLI(HANDLE hDrive, DRIVE_INFO* pInfo)
 {
+    if (!DriveAllowsScsiPassthrough(hDrive)) return FALSE;
     CDI_SAT_PASSTHROUGH_BUF_4K sptwb;
     DWORD dwReturned = 0;
     DWORD length;
@@ -1415,6 +1428,7 @@ BOOL NVMeHealthLogVLI(HANDLE hDrive, DRIVE_INFO* pInfo)
  * ============================================================ */
 BOOL NVMeOverUSBTryAll(HANDLE hDrive, DRIVE_INFO* pInfo)
 {
+    if (!DriveAllowsScsiPassthrough(hDrive)) return FALSE;
     /* Try known NVMe-over-USB bridge protocols. Never shotgun JMicron /
      * ASMedia / VLI / native NvmeMini / 0xE4 at a known Realtek RTL9210.
      * Realtek 0xE4 is a one-shot in ScanDrives only. */
