@@ -1916,7 +1916,7 @@ static LPARAM AttrStatusParam(const char* s)
         return (LPARAM)ATTRST_DIM;
     if (strcmp(s, "Не оценивается") == 0)
         return (LPARAM)ATTRST_SKIP;
-    /* TODO: prefer ATTRST_* end-to-end; see issue (number TBD) */
+    /* TODO: prefer ATTRST_* end-to-end; see https://github.com/chuikoff/DriveMonitor/issues/3 */
     if (strcmp(s, "журнал питания") == 0 || strcmp(s, "power log") == 0)
         return (LPARAM)ATTRST_POWERLOG;
     if (strcmp(s, "INFO") == 0 || strcmp(s, "контекст") == 0 ||
