@@ -12,19 +12,19 @@ void FillAtaProtocolFromIdent(DRIVE_INFO* pInfo, const WORD* pIdent)
      * Use word 76 (supported) for the disk, prefix USB later. */
     neg = pInfo->bIsUSB ? 0 : (unsigned)((w77 >> 1) & 0x7);
     if (neg == 3)
-        safe_snprintf(pInfo->szProtocol, "SATA 6 Гбит/с");
+        safe_snprintf(pInfo->szProtocol, TN("SATA 6 Гбит/с", "SATA 6 Gb/s"));
     else if (neg == 2)
-        safe_snprintf(pInfo->szProtocol, "SATA 3 Гбит/с");
+        safe_snprintf(pInfo->szProtocol, TN("SATA 3 Гбит/с", "SATA 3 Gb/s"));
     else if (neg == 1)
-        safe_snprintf(pInfo->szProtocol, "SATA 1.5 Гбит/с");
+        safe_snprintf(pInfo->szProtocol, TN("SATA 1.5 Гбит/с", "SATA 1.5 Gb/s"));
     else if (w76 != 0 && w76 != 0xFFFF) {
         /* Word 76: bit1=1.5, bit2=3.0, bit3=6.0 Gb/s supported. */
         if (w76 & 0x0008)
-            safe_snprintf(pInfo->szProtocol, "SATA 6 Гбит/с");
+            safe_snprintf(pInfo->szProtocol, TN("SATA 6 Гбит/с", "SATA 6 Gb/s"));
         else if (w76 & 0x0004)
-            safe_snprintf(pInfo->szProtocol, "SATA 3 Гбит/с");
+            safe_snprintf(pInfo->szProtocol, TN("SATA 3 Гбит/с", "SATA 3 Gb/s"));
         else if (w76 & 0x0002)
-            safe_snprintf(pInfo->szProtocol, "SATA 1.5 Гбит/с");
+            safe_snprintf(pInfo->szProtocol, TN("SATA 1.5 Гбит/с", "SATA 1.5 Gb/s"));
         else
             safe_snprintf(pInfo->szProtocol, "SATA");
     } else {
@@ -504,7 +504,7 @@ BOOL GetSMARTViaStorageProtocol(HANDLE hDrive, DRIVE_INFO* pInfo)
     return TRUE;
 }
 
-static int TempCFromAtaAttr(const SMART_ATTRIBUTE* pA)
+static int TempCFromAtaAttr(const SMART_ATTRIBUTE* pA, DRIVE_VENDOR vendor)
 {
     int raw0, lo16, val;
     if (!pA) return -1;
@@ -516,10 +516,16 @@ static int TempCFromAtaAttr(const SMART_ATTRIBUTE* pA)
         return raw0;
     if (lo16 >= 1 && lo16 <= 125)
         return lo16;
-    /* Value as °C only on old drives that store temperature there.
-     * 70–100 is the inverted 100−T scale, not a hot disk. */
+    /* Value as °C only when RAW is empty. 70–100 is inverted 100−T
+     * (Seagate). WD 190 airflow is 125−T. 194 HDA is not inverted. */
     if (val >= 1 && val <= 60)
         return val;
+    if (pA->bAttrID == 0xBE && vendor == VENDOR_WDC &&
+        val >= 70 && val <= 125) {
+        int t = 125 - val;
+        if (t >= 1 && t <= 70)
+            return t;
+    }
     if (val >= 70 && val <= 100) {
         int t = 100 - val;
         if (t >= 1 && t <= 60)
@@ -535,14 +541,14 @@ void ExtractTemperatureFromATA(DRIVE_INFO* pInfo)
     for (i = 0; i < 30; i++) {
         SMART_ATTRIBUTE* pA = &pInfo->attrData.stAttributes[i];
         if (pA->bAttrID == 0xC2) {
-            int t = TempCFromAtaAttr(pA);
+            int t = TempCFromAtaAttr(pA, pInfo->eVendor);
             if (t > 0) { pInfo->nTemperatureC = t; return; }
         }
     }
     for (i = 0; i < 30; i++) {
         SMART_ATTRIBUTE* pA = &pInfo->attrData.stAttributes[i];
         if (pA->bAttrID == 0xBE) {
-            int t = TempCFromAtaAttr(pA);
+            int t = TempCFromAtaAttr(pA, pInfo->eVendor);
             if (t > 0) { pInfo->nTemperatureC = t; return; }
         }
     }

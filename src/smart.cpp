@@ -134,6 +134,34 @@ int DecodeReportedUncorrect(const BYTE* pRaw, DRIVE_VENDOR vendor)
     return (int)lo32;
 }
 
+/* Seagate 240 (and a copy some firmware writes into 196) is msec24hour32:
+ * low 32 bits = hours, upper 16 bits = milliseconds. A plain event count
+ * keeps those upper bytes at 0. Matching a small integer (both raw == 5)
+ * is not this format. */
+BOOL RemapRawIsFlyingHours(const DRIVE_INFO* pInfo, const BYTE* pRaw)
+{
+    const SMART_ATTRIBUTE* fly;
+    unsigned __int64 v;
+    if (!pInfo || !pRaw) return FALSE;
+    v = GetRawValue48(pRaw);
+    if (v == 0 || (v >> 32) == 0) return FALSE;
+    fly = FindAttr(pInfo, 0xF0);
+    if (!fly) return FALSE;
+    return GetRawValue48(fly->bRawValue) == v;
+}
+
+int DecodeRemapEvents(const DRIVE_INFO* pInfo, const BYTE* pRaw)
+{
+    unsigned __int64 v;
+    if (!pRaw) return -1;
+    if (RemapRawIsFlyingHours(pInfo, pRaw)) return -1;
+    v = GetRawValue48(pRaw);
+    /* Upper bytes set, or low 32 above a signed counter: not an event count.
+     * Clamping to INT_MAX made a flying-hours field look like 2147483647 events. */
+    if (v > (unsigned __int64)INT_MAX) return -1;
+    return (int)v;
+}
+
 DWORD SeagateRateOps(const BYTE* pRaw)
 {
     if (!pRaw) return 0;
@@ -312,57 +340,57 @@ static const ATTR_NAME g_AttrNames[] = {
 typedef struct _ATTR_OVERLAY {
     BYTE        id;
     const char* name;
+    const char* nameEn;
 } ATTR_OVERLAY;
 
 static const ATTR_OVERLAY g_OvSeagateHdd[] = {
-    { 0x01, "Частота ошибок чтения (RAW вендора)" },
-    { 0xBB, "Неисправимые ошибки" },
-    { 0xC3, "Восстановлено ECC (чтение)" },
-    { 0xF0, "Часы полёта головок" },
-    { 0x00, NULL }
+    { 0x01, "Частота ошибок чтения (RAW вендора)", "Read Error Rate (vendor RAW)" },
+    { 0xBB, "Неисправимые ошибки", "Uncorrectable errors" },
+    { 0xC3, "Восстановлено ECC (чтение)", "Hardware ECC recovered" },
+    { 0xF0, "Часы полёта головок", "Head flying hours" },
+    { 0x00, NULL, NULL }
 };
 
 static const ATTR_OVERLAY g_OvSamsungSsd[] = {
-    { 0xB1, "Выравнивание износа" },
-    { 0xB3, "Использовано резервных блоков" },
-    { 0xB5, "Ошибки программирования" },
-    { 0xB6, "Ошибки стирания" },
-    { 0xB7, "Плохие блоки (runtime)" },
-    { 0xBB, "Неисправимые ошибки" },
-    { 0xEB, "Защита от потери питания" },
-    { 0xF5, "Мин. стираний (Samsung)" },
-    { 0xF6, "Макс. стираний (Samsung)" },
-    { 0xF7, "Среднее стираний (Samsung)" },
-    { 0xF8, "Выравнивание износа (Samsung)" },
-    { 0x00, NULL }
+    { 0xB1, "Выравнивание износа", "Wear leveling" },
+    { 0xB3, "Использовано резервных блоков", "Used reserved blocks" },
+    { 0xB5, "Ошибки программирования", "Program fail count" },
+    { 0xB6, "Ошибки стирания", "Erase fail count" },
+    { 0xB7, "Плохие блоки (runtime)", "Runtime bad blocks" },
+    { 0xBB, "Неисправимые ошибки", "Uncorrectable errors" },
+    { 0xEB, "Защита от потери питания", "Power-loss protection" },
+    { 0xF5, "Мин. стираний (Samsung)", "Min erase count (Samsung)" },
+    { 0xF6, "Макс. стираний (Samsung)", "Max erase count (Samsung)" },
+    { 0xF7, "Среднее стираний (Samsung)", "Average erase count (Samsung)" },
+    { 0xF8, "Выравнивание износа (Samsung)", "Wear leveling (Samsung)" },
+    { 0x00, NULL, NULL }
 };
 
-/* Phison SATA SSD: E7 life remaining, E9 NAND writes */
 static const ATTR_OVERLAY g_OvPhisonSsd[] = {
-    { 0xE7, "Остаток ресурса SSD" },
-    { 0xE9, "Записи NAND (ГиБ)" },
-    { 0x00, NULL }
+    { 0xE7, "Остаток ресурса SSD", "SSD life remaining" },
+    { 0xE9, "Записи NAND (ГиБ)", "NAND writes (GiB)" },
+    { 0x00, NULL, NULL }
 };
 
 static const ATTR_OVERLAY g_OvToshibaHdd[] = {
-    { 0xC7, "Ошибки CRC" },
-    { 0x00, NULL }
+    { 0xC7, "Ошибки CRC", "CRC errors" },
+    { 0x00, NULL, NULL }
 };
 
 static const ATTR_OVERLAY g_OvMicronSsd[] = {
-    { 0xCA, "Остаток ресурса %" },
-    { 0xF6, "Записано секторов хоста" },
-    { 0xAD, "Среднее стираний" },
-    { 0x00, NULL }
+    { 0xCA, "Остаток ресурса %", "Percent lifetime remaining" },
+    { 0xF6, "Записано секторов хоста", "Host sectors written" },
+    { 0xAD, "Среднее стираний", "Average erase count" },
+    { 0x00, NULL, NULL }
 };
 
 static const ATTR_OVERLAY g_OvIntelSsd[] = {
-    { 0xAA, "Доступное резервное пространство" },
-    { 0xE1, "Записи хоста" },
-    { 0xE2, "Таймер нагрузки" },
-    { 0xE8, "Доступное резервное пространство" },
-    { 0xE9, "Индикатор износа" },
-    { 0x00, NULL }
+    { 0xAA, "Доступное резервное пространство", "Available reserved space" },
+    { 0xE1, "Записи хоста", "Host writes" },
+    { 0xE2, "Таймер нагрузки", "Timed workload" },
+    { 0xE8, "Доступное резервное пространство", "Available reserved space" },
+    { 0xE9, "Индикатор износа", "Media wear-out indicator" },
+    { 0x00, NULL, NULL }
 };
 
 static const char* LookupOverlay(const ATTR_OVERLAY* tab, BYTE bID)
@@ -370,7 +398,8 @@ static const char* LookupOverlay(const ATTR_OVERLAY* tab, BYTE bID)
     int i;
     if (!tab) return NULL;
     for (i = 0; tab[i].id != 0; i++) {
-        if (tab[i].id == bID) return tab[i].name;
+        if (tab[i].id == bID)
+            return (UiLangIsEn() && tab[i].nameEn) ? tab[i].nameEn : tab[i].name;
     }
     return NULL;
 }
@@ -415,18 +444,17 @@ static const ATTR_OVERLAY* OverlayFor(const DRIVE_INFO* p)
 }
 
 static char g_szVendorAttrName[256][48];
-static int  g_bVendorAttrNameReady = 0;
+static UI_LANG g_vendorAttrLang = (UI_LANG)(-1);
 
 static void InitVendorAttrNames(void)
 {
     int i;
-    if (g_bVendorAttrNameReady) return;
+    if (g_vendorAttrLang == UiLang()) return;
+    g_vendorAttrLang = UiLang();
     for (i = 0; i < 256; i++) {
-        (void)_snprintf(g_szVendorAttrName[i], 48,
-                        "Атрибут %d (vendor-specific)", i);
+        (void)_snprintf(g_szVendorAttrName[i], 48, Tr(STR_ATTR_VENDOR), i);
         g_szVendorAttrName[i][47] = '\0';
     }
-    g_bVendorAttrNameReady = 1;
 }
 
 static const char* VendorSpecificAttrName(BYTE bID)
@@ -445,25 +473,44 @@ BOOL IsPhisonFamily(const DRIVE_INFO* p)
     return FALSE;
 }
 
-unsigned __int64 ScalePhisonHostGiB(const DRIVE_INFO* pInfo, unsigned __int64 raw)
+static int HostGiBPlausible(unsigned __int64 host, unsigned __int64 nandGb,
+                            DWORD poh, unsigned __int64 capGb)
 {
-    unsigned __int64 asGb, as32mb, capGb, nandGb;
+    if (host == 0) return 0;
+    if (nandGb > 0) {
+        /* Host writes cannot exceed NAND written (WAF >= 1). */
+        if (host > nandGb) return 0;
+        if (nandGb > host * 50ULL) return 0;
+        return 1;
+    }
+    if (poh >= 24 && host > (unsigned __int64)poh * 20ULL)
+        return 0;
+    if (capGb > 0 && host > capGb * 500ULL)
+        return 0;
+    return 1;
+}
+
+unsigned __int64 ScaleAtaHostGiB(const DRIVE_INFO* pInfo, unsigned __int64 raw)
+{
+    unsigned __int64 asGb, as32mb, asLba, capGb, nandGb;
     int erase;
+    DWORD poh;
     if (!pInfo || raw == 0) return 0;
     asGb = raw;
     as32mb = (raw * 32ULL) / 1024ULL;
+    asLba = raw / (1024ULL * 1024ULL * 2ULL);
     capGb = (unsigned __int64)(pInfo->dwCapacityMB / 1024u);
     erase = pInfo->nSSDAvgEraseCount;
     if (erase < 0) erase = pInfo->nSSDMaxEraseCount;
-    if (capGb > 0 && erase > 0) {
-        nandGb = (unsigned __int64)erase * capGb;
-        if (asGb > nandGb)
-            return as32mb;
-    }
-    if (pInfo->dwPowerOnHours >= 24 &&
-        asGb > (unsigned __int64)pInfo->dwPowerOnHours * 20ULL)
+    nandGb = (capGb > 0 && erase > 0) ? (unsigned __int64)erase * capGb : 0;
+    poh = pInfo->dwPowerOnHours;
+    if (HostGiBPlausible(asGb, nandGb, poh, capGb))
+        return asGb;
+    /* 32 MiB units need a NAND figure. Without it a modest LBA count
+     * (Samsung PM871 F1) passes the POH check as tens of thousands of GB. */
+    if (nandGb > 0 && HostGiBPlausible(as32mb, nandGb, poh, capGb))
         return as32mb;
-    return asGb;
+    return asLba;
 }
 
 static BOOL IsAtaSsdTypeInfo(const DRIVE_INFO* p)
@@ -493,9 +540,9 @@ BOOL IsShockSensorAttr(BYTE bID)
 /* Vendor-SSD IDs whose RAW packing is not ATA-standard. BE/BF and F1-F4 stay out. */
 static BOOL IsVendorSpecificId(BYTE bID)
 {
-    if (bID == 0xBE || bID == 0xBF)
+    if (bID == 0xBE || bID == 0xBF || bID == 0xBC || bID == 0xBD)
         return FALSE;
-    if (bID >= 0xA0 && bID <= 0xBD)
+    if (bID >= 0xA0 && bID <= 0xBB)
         return TRUE;
     if (bID >= 0xE7 && bID <= 0xF0)
         return TRUE;
@@ -523,154 +570,154 @@ static void ApplyPhisonSsdDecode(BYTE bID, ATTR_DECODE* out)
 {
     switch (bID) {
     case 0xA0:
-        out->szName = "Внезапные выключения";
+        out->szName = TN("Внезапные выключения", "Unsafe shutdowns");
         out->eEnc = RAW_ENC_COUNTER32;
         out->eState = ATTR_DECODE_KNOWN;
         out->nSemanticConfidence = 70;
         out->eCrit = ATTR_CRIT_NONE;
         break;
     case 0xA1:
-        out->szName = "Резервные блоки (осталось)";
+        out->szName = TN("Резервные блоки (осталось)", "Spare blocks remaining");
         out->eEnc = RAW_ENC_COUNTER32;
         out->eState = ATTR_DECODE_KNOWN;
         out->nSemanticConfidence = 80;
         out->eCrit = ATTR_CRIT_ADVISORY;
         break;
     case 0xA3:
-        out->szName = "Начальные плохие блоки";
+        out->szName = TN("Начальные плохие блоки", "Initial bad blocks");
         out->eEnc = RAW_ENC_COUNTER32;
         out->eState = ATTR_DECODE_KNOWN;
         out->nSemanticConfidence = 80;
         out->eCrit = ATTR_CRIT_NONE;
         break;
     case 0xA4:
-        out->szName = "Всего стираний";
+        out->szName = TN("Всего стираний", "Total erase count");
         out->eEnc = RAW_ENC_COUNTER32;
         out->eState = ATTR_DECODE_KNOWN;
         out->nSemanticConfidence = 80;
         out->eCrit = ATTR_CRIT_NONE;
         break;
     case 0xA5:
-        out->szName = "Макс. стираний";
+        out->szName = TN("Макс. стираний", "Max erase count");
         out->eEnc = RAW_ENC_COUNTER32;
         out->eState = ATTR_DECODE_KNOWN;
         out->nSemanticConfidence = 80;
         out->eCrit = ATTR_CRIT_NONE;
         break;
     case 0xA6:
-        out->szName = "Мин. стираний";
+        out->szName = TN("Мин. стираний", "Min erase count");
         out->eEnc = RAW_ENC_COUNTER32;
         out->eState = ATTR_DECODE_KNOWN;
         out->nSemanticConfidence = 80;
         out->eCrit = ATTR_CRIT_NONE;
         break;
     case 0xA7:
-        out->szName = "Среднее стираний";
+        out->szName = TN("Среднее стираний", "Average erase count");
         out->eEnc = RAW_ENC_COUNTER32;
         out->eState = ATTR_DECODE_KNOWN;
         out->nSemanticConfidence = 80;
         out->eCrit = ATTR_CRIT_NONE;
         break;
     case 0xA8:
-        out->szName = "Макс. стираний по спецификации";
+        out->szName = TN("Макс. стираний по спецификации", "Specified max erase count");
         out->eEnc = RAW_ENC_COUNTER32;
         out->eState = ATTR_DECODE_KNOWN;
         out->nSemanticConfidence = 75;
         out->eCrit = ATTR_CRIT_NONE;
         break;
     case 0xA9:
-        out->szName = "Заявленный остаток ресурса";
+        out->szName = TN("Заявленный остаток ресурса", "Reported life remaining");
         out->eEnc = RAW_ENC_PERCENT;
         out->eState = ATTR_DECODE_KNOWN;
         out->nSemanticConfidence = 85;
         out->eCrit = ATTR_CRIT_ADVISORY;
         break;
     case 0xAF:
-        out->szName = "Сбой защиты питания";
+        out->szName = TN("Сбой защиты питания", "Power-loss protection fail");
         out->eEnc = RAW_ENC_COUNTER32;
         out->eState = ATTR_DECODE_KNOWN;
         out->nSemanticConfidence = 70;
         out->eCrit = ATTR_CRIT_CRITICAL;
         break;
     case 0xC0:
-        out->szName = "Аварийные отключения питания";
+        out->szName = TN("Аварийные отключения питания", "Unsafe power-off events");
         out->eEnc = RAW_ENC_COUNTER32;
         out->eState = ATTR_DECODE_KNOWN;
         out->nSemanticConfidence = 80;
         out->eCrit = ATTR_CRIT_NONE;
         break;
     case 0xB0:
-        out->szName = "Ошибки стирания (худший кристалл)";
+        out->szName = TN("Ошибки стирания (худший кристалл)", "Erase fails (worst die)");
         out->eEnc = RAW_ENC_UNKNOWN;
         out->eState = ATTR_DECODE_UNKNOWN;
         out->nSemanticConfidence = 70;
         out->eCrit = ATTR_CRIT_NONE;
         break;
     case 0xB1:
-        out->szName = "Всего циклов выравнивания износа";
+        out->szName = TN("Всего циклов выравнивания износа", "Wear-leveling count");
         out->eEnc = RAW_ENC_UNKNOWN;
         out->eState = ATTR_DECODE_UNKNOWN;
         out->nSemanticConfidence = 70;
         out->eCrit = ATTR_CRIT_NONE;
         break;
     case 0xB2:
-        out->szName = "Резервные блоки (использовано)";
+        out->szName = TN("Резервные блоки (использовано)", "Used spare blocks");
         out->eEnc = RAW_ENC_COUNTER32;
         out->eState = ATTR_DECODE_KNOWN;
         out->nSemanticConfidence = 70;
         out->eCrit = ATTR_CRIT_ADVISORY;
         break;
     case 0xB5:
-        out->szName = "Ошибки программирования (всего)";
+        out->szName = TN("Ошибки программирования (всего)", "Program fail count");
         out->eEnc = RAW_ENC_COUNTER32;
         out->eState = ATTR_DECODE_KNOWN;
         out->nSemanticConfidence = 85;
         out->eCrit = ATTR_CRIT_CRITICAL;
         break;
     case 0xB6:
-        out->szName = "Ошибки стирания (всего)";
+        out->szName = TN("Ошибки стирания (всего)", "Erase fail count");
         out->eEnc = RAW_ENC_COUNTER32;
         out->eState = ATTR_DECODE_KNOWN;
         out->nSemanticConfidence = 85;
         out->eCrit = ATTR_CRIT_CRITICAL;
         break;
     case 0xC3:
-        out->szName = "ECC (вендор)";
+        out->szName = TN("ECC (вендор)", "ECC (vendor)");
         out->eEnc = RAW_ENC_UNKNOWN;
         out->eState = ATTR_DECODE_UNKNOWN;
         out->nSemanticConfidence = 50;
         out->eCrit = ATTR_CRIT_NONE;
         break;
     case 0xE7:
-        out->szName = "Остаток ресурса SSD";
+        out->szName = TN("Остаток ресурса SSD", "SSD life remaining");
         out->eEnc = RAW_ENC_PERCENT;
         out->eState = ATTR_DECODE_KNOWN;
         out->nSemanticConfidence = 80;
         out->eCrit = ATTR_CRIT_ADVISORY;
         break;
     case 0xE8:
-        out->szName = "Резервное пространство";
+        out->szName = TN("Резервное пространство", "Available reserved space");
         out->eEnc = RAW_ENC_PERCENT;
         out->eState = ATTR_DECODE_KNOWN;
         out->nSemanticConfidence = 80;
         out->eCrit = ATTR_CRIT_ADVISORY;
         break;
     case 0xE9:
-        out->szName = "Записи NAND (ГиБ)";
+        out->szName = TN("Записи NAND (ГиБ)", "NAND writes (GiB)");
         out->eEnc = RAW_ENC_COUNTER32;
         out->eState = ATTR_DECODE_KNOWN;
         out->nSemanticConfidence = 75;
         out->eCrit = ATTR_CRIT_NONE;
         break;
     case 0xF1:
-        out->szName = "Записано хостом (ГБ)";
+        out->szName = TN("Записано хостом (ГБ)", "Host written (GB)");
         out->eEnc = RAW_ENC_COUNTER32;
         out->eState = ATTR_DECODE_KNOWN;
         out->nSemanticConfidence = 85;
         out->eCrit = ATTR_CRIT_NONE;
         break;
     case 0xF2:
-        out->szName = "Прочитано хостом (ГБ)";
+        out->szName = TN("Прочитано хостом (ГБ)", "Host read (GB)");
         out->eEnc = RAW_ENC_COUNTER32;
         out->eState = ATTR_DECODE_KNOWN;
         out->nSemanticConfidence = 85;
@@ -687,6 +734,71 @@ static void ApplyPhisonSsdDecode(BYTE bID, ATTR_DECODE* out)
         break;
     default:
         break;
+    }
+}
+
+static const char* AttrNameEn(BYTE id)
+{
+    switch (id) {
+    case 0x01: return "Read Error Rate";
+    case 0x02: return "Throughput Performance";
+    case 0x03: return "Spin-Up Time";
+    case 0x04: return "Start/Stop Count";
+    case 0x05: return "Reallocated Sectors";
+    case 0x06: return "Read Channel Margin";
+    case 0x07: return "Seek Error Rate";
+    case 0x08: return "Seek Time Performance";
+    case 0x09: return "Power-On Hours";
+    case 0x0A: return "Spin Retry Count";
+    case 0x0B: return "Calibration Retry Count";
+    case 0x0C: return "Power Cycle Count";
+    case 0x0D: return "Soft Read Error Rate";
+    case 0x0E: return "G-Sense";
+    case 0x10: return "Head Flying Hours";
+    case 0x16: return "Helium Level";
+    case 0xAA: return "Available Reserved Space";
+    case 0xAB: return "Program Fail Count";
+    case 0xAC: return "Erase Fail Count";
+    case 0xAD: return "Wear Leveling Count";
+    case 0xAE: return "Unexpected Power Loss";
+    case 0xAF: return "Power-Loss Protection Fail";
+    case 0xB1: return "Wear Leveling";
+    case 0xB3: return "Used Reserved Blocks";
+    case 0xB5: return "Program Fail Count (total)";
+    case 0xB6: return "Erase Fail Count (total)";
+    case 0xB7: return "SATA Downshift Errors";
+    case 0xB8: return "End-to-End Error";
+    case 0xBB: return "Reported Uncorrectable";
+    case 0xBC: return "Command Timeout";
+    case 0xBD: return "High Fly Writes";
+    case 0xBE: return "Airflow Temperature";
+    case 0xBF: return "G-Sense";
+    case 0xC0: return "Power-Off Retracts";
+    case 0xC1: return "Load/Unload Cycles";
+    case 0xC2: return "Temperature";
+    case 0xC3: return "Hardware ECC Recovered";
+    case 0xC4: return "Reallocation Events";
+    case 0xC5: return "Current Pending Sectors";
+    case 0xC6: return "Uncorrectable Sectors";
+    case 0xC7: return "UltraDMA CRC Errors";
+    case 0xC8: return "Write Error Rate";
+    case 0xC9: return "Soft Read Error Rate";
+    case 0xCA: return "Data Address Mark Errors";
+    case 0xE7: return "SSD Life Remaining";
+    case 0xE8: return "Available Reserved Space";
+    case 0xE9: return "NAND Writes (GiB)";
+    case 0xF0: return "Head Flying Hours";
+    case 0xF1: return "Host Written (GB)";
+    case 0xF2: return "Host Read (GB)";
+    case 0xA0: return "Unsafe Shutdowns";
+    case 0xA3: return "Initial Bad Blocks";
+    case 0xA4: return "Total Erase Count";
+    case 0xA5: return "Max Erase Count";
+    case 0xA6: return "Min Erase Count";
+    case 0xA7: return "Average Erase Count";
+    case 0xA8: return "Specified Max Erase Count";
+    case 0xA9: return "Reported Life Remaining";
+    default:   return NULL;
     }
 }
 
@@ -708,6 +820,10 @@ void GetAttrDecode(BYTE bID, const DRIVE_INFO* pInfo, ATTR_DECODE* out)
     while (g_AttrNames[i].szName != NULL) {
         if (g_AttrNames[i].bID == bID) {
             out->szName = g_AttrNames[i].szName;
+            if (UiLangIsEn()) {
+                const char* en = AttrNameEn(bID);
+                if (en) out->szName = en;
+            }
             out->eCrit = g_AttrNames[i].eCritLevel;
             out->eEnc = EncFromInterp(g_AttrNames[i].eInterp);
             out->nSemanticConfidence = 60;
@@ -725,6 +841,7 @@ void GetAttrDecode(BYTE bID, const DRIVE_INFO* pInfo, ATTR_DECODE* out)
     case 0xC2:
     case 0xBE: out->eEnc = RAW_ENC_TEMP_C; break;
     case 0xC4: out->eEnc = RAW_ENC_EVENTS; break;
+    case 0xBC: out->eEnc = RAW_ENC_SECTORS_LO16; break;
     case 0xF1:
     case 0xF2:
     case 0xF3:
@@ -769,7 +886,7 @@ void GetAttrDecode(BYTE bID, const DRIVE_INFO* pInfo, ATTR_DECODE* out)
             out->eCrit = ATTR_CRIT_NONE;
             out->nSemanticConfidence = (pInfo->eVendor == VENDOR_SEAGATE) ? 90 : 70;
         } else {
-            out->szName = "ECC (вендор)";
+            out->szName = TN("ECC (вендор)", "ECC (vendor)");
             out->eEnc = RAW_ENC_UNKNOWN;
             out->eCrit = ATTR_CRIT_NONE;
             out->nSemanticConfidence = 30;
@@ -818,7 +935,7 @@ void GetAttrDecode(BYTE bID, const DRIVE_INFO* pInfo, ATTR_DECODE* out)
 
     /* SSD C0 is emergency/unsafe power-off count, not HDD head-park. */
     if (bID == 0xC0 && DriveTreatsC0AsPowerLoss(pInfo)) {
-        out->szName = "Аварийные отключения питания";
+        out->szName = TN("Аварийные отключения питания", "Unsafe power-off events");
         out->eEnc = RAW_ENC_COUNTER32;
         out->eCrit = ATTR_CRIT_NONE;
         if (out->nSemanticConfidence < 80)
@@ -859,34 +976,43 @@ const char* GetDriveTypeName(DRIVE_TYPE eType)
     case DRIVE_TYPE_EMMC:     return "eMMC";
     case DRIVE_TYPE_SD:       return "SD";
     case DRIVE_TYPE_SCSI:     return "SAS";
-    default:                  return "Неизвестно";
+    default:                  return Tr(STR_UNKNOWN_TYPE);
     }
 }
 
 const char* GetHealthStatusName(DRIVE_HEALTH_STATUS eStatus)
 {
     switch (eStatus) {
-    case HEALTH_STATUS_GOOD:     return "ХОРОШО";
-    case HEALTH_STATUS_OBSERVE:  return "РИСК";
-    case HEALTH_STATUS_CAUTION:  return "ТРЕБУЕТ ВНИМАНИЯ";
-    case HEALTH_STATUS_BAD:      return "ПЛОХО";
-    case HEALTH_STATUS_WARNING:  return "ПЛОХО";
-    case HEALTH_STATUS_CRITICAL: return "КРИТИЧЕСКОЕ";
-    default:                     return "НЕИЗВЕСТНО";
+    case HEALTH_STATUS_GOOD:     return Tr(STR_HS_GOOD);
+    case HEALTH_STATUS_OBSERVE:  return Tr(STR_HS_WATCH);
+    case HEALTH_STATUS_CAUTION:  return Tr(STR_HS_ATTN);
+    case HEALTH_STATUS_BAD:      return Tr(STR_HS_BAD);
+    case HEALTH_STATUS_WARNING:  return Tr(STR_HS_BAD);
+    case HEALTH_STATUS_CRITICAL: return Tr(STR_HS_CRIT);
+    default:                     return Tr(STR_HS_UNK);
+    }
+}
+
+const char* GetHealthStatusNameShort(DRIVE_HEALTH_STATUS eStatus)
+{
+    switch (eStatus) {
+    case HEALTH_STATUS_CAUTION:  return Tr(STR_HS_ATTN_SHORT);
+    case HEALTH_STATUS_CRITICAL: return Tr(STR_HS_CRIT_SHORT);
+    default:                     return GetHealthStatusName(eStatus);
     }
 }
 
 const char* GetDiskStatusName(const DRIVE_INFO* p)
 {
     if (!p)
-        return "НЕИЗВЕСТНО";
+        return Tr(STR_HS_UNK);
     if (p->eDiskStatus != HEALTH_STATUS_UNKNOWN)
         return GetHealthStatusName(p->eDiskStatus);
     if (p->bIsUSB && p->bSMART_Supported)
-        return "нет статуса моста";
+        return Tr(STR_NO_BRIDGE_STATUS);
     if (p->bIsUSB)
-        return "нет SMART";
-    return "НЕИЗВЕСТНО";
+        return Tr(STR_NO_SMART);
+    return Tr(STR_HS_UNK);
 }
 
 const char* GetVendorName(DRIVE_VENDOR eVendor)

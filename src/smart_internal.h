@@ -18,6 +18,7 @@
 #include <cfgmgr32.h>
 #include "smart.h"
 #include "safestr.h"
+#include "lang.h"
 
 #ifndef CR_SUCCESS
 #define CR_SUCCESS 0
@@ -217,7 +218,6 @@ static inline const SMART_ATTRIBUTE* FindAttr(const DRIVE_INFO* pInfo, BYTE id)
 
 void ToUpperCopy(char* dst, int nDst, const char* src);
 BOOL HasSmartAttr(const DRIVE_INFO* p, BYTE id);
-BOOL IsPhisonFamily(const DRIVE_INFO* p);
 BOOL DriveIsHdd(const DRIVE_INFO* p);
 
 void TrimStr(char* sz);

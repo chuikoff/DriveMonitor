@@ -20,7 +20,8 @@ SRCS    = $(SRCDIR)/main.cpp \
           $(SRCDIR)/ata_smart.cpp \
           $(SRCDIR)/nvme_smart.cpp \
           $(SRCDIR)/usb_bridge.cpp \
-          $(SRCDIR)/health_assessment.cpp
+          $(SRCDIR)/health_assessment.cpp \
+          $(SRCDIR)/lang.cpp
 
 OBJS    = $(patsubst $(SRCDIR)/%.cpp, $(OBJDIR)/%.o, $(SRCS))
 RES_O   = $(OBJDIR)/app_res.o

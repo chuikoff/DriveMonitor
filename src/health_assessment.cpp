@@ -35,11 +35,21 @@ static int AttrRawOrNeg1(const DRIVE_INFO* pInfo, BYTE id)
             unsigned __int64 v;
             if (id == 0xBB)
                 return DecodeReportedUncorrect(raw, pInfo->eVendor);
-            GetAttrDecode(id, pInfo, &dec);
-            if (dec.eEnc == RAW_ENC_SECTORS_LO16)
+            /* 196: full 48-bit RAW is not an event count when it is a copy of
+             * head-flying hours, and must not clamp to INT_MAX. */
+            if (id == 0xC4)
+                return DecodeRemapEvents(pInfo, raw);
+            /* 188: three WORDs — total, completions >5 s, completions >7.5 s.
+             * Score the total. The 48-bit field is not one timeout count. */
+            if (id == 0xBC)
                 v = (unsigned __int64)((WORD)raw[0] | ((WORD)raw[1] << 8));
-            else
-                v = GetRawValue48(raw);
+            else {
+                GetAttrDecode(id, pInfo, &dec);
+                if (dec.eEnc == RAW_ENC_SECTORS_LO16)
+                    v = (unsigned __int64)((WORD)raw[0] | ((WORD)raw[1] << 8));
+                else
+                    v = GetRawValue48(raw);
+            }
             if (v > (unsigned __int64)INT_MAX) return INT_MAX;
             return (int)v;
         }
@@ -330,22 +340,28 @@ void FormatPowerOnHours(DWORD dwHours, char* szBuf, int nBufLen)
 
     if (!szBuf || nBufLen <= 0) return;
     if (dwHours == 0) {
-        safe_snprintf_n(szBuf, nBufLen, "нет данных");
+        safe_snprintf_n(szBuf, nBufLen, "%s", Tr(STR_POH_NONE));
         return;
     }
     y = dwHours / 8760u;
     d = (dwHours % 8760u) / 24u;
     h = (dwHours % 8760u) % 24u;
     if (y > 0) {
-        safe_snprintf(a, "%u %s", y, RuCountWord(y, "год", "года", "лет"));
+        safe_snprintf(a, "%u %s", y,
+            UiLangIsEn() ? ((y == 1) ? Tr(STR_YEAR) : Tr(STR_YEARS))
+                         : RuCountWord(y, Tr(STR_YEAR), Tr(STR_YEARS), Tr(STR_YEARS_MANY)));
         p[n++] = a;
     }
     if (d > 0) {
-        safe_snprintf(b, "%u %s", d, RuCountWord(d, "день", "дня", "дней"));
+        safe_snprintf(b, "%u %s", d,
+            UiLangIsEn() ? ((d == 1) ? Tr(STR_DAY) : Tr(STR_DAYS))
+                         : RuCountWord(d, Tr(STR_DAY), Tr(STR_DAYS), Tr(STR_DAYS_MANY)));
         p[n++] = b;
     }
     if (h > 0 || n == 0) {
-        safe_snprintf(c, "%u %s", h, RuCountWord(h, "час", "часа", "часов"));
+        safe_snprintf(c, "%u %s", h,
+            UiLangIsEn() ? ((h == 1) ? Tr(STR_HOUR) : Tr(STR_HOURS))
+                         : RuCountWord(h, Tr(STR_HOUR), Tr(STR_HOURS), Tr(STR_HOURS_MANY)));
         p[n++] = c;
     }
     if (n == 1)
@@ -359,11 +375,11 @@ void FormatPowerOnHours(DWORD dwHours, char* szBuf, int nBufLen)
 const char* GetTempBandName(TEMP_BAND eBand, BOOL bLowercase)
 {
     switch (eBand) {
-    case TEMP_BAND_NORMAL:   return bLowercase ? "норма" : "Норма";
-    case TEMP_BAND_ELEVATED: return bLowercase ? "повышена" : "Повышена";
-    case TEMP_BAND_HIGH:     return bLowercase ? "высокая" : "Высокая";
-    case TEMP_BAND_CRITICAL: return bLowercase ? "критическая" : "Критическая";
-    default:                 return "нет данных";
+    case TEMP_BAND_NORMAL:   return Tr(bLowercase ? STR_TEMP_OK_LO : STR_TEMP_OK);
+    case TEMP_BAND_ELEVATED: return Tr(bLowercase ? STR_TEMP_ELEV_LO : STR_TEMP_ELEV);
+    case TEMP_BAND_HIGH:     return Tr(bLowercase ? STR_TEMP_HIGH_LO : STR_TEMP_HIGH);
+    case TEMP_BAND_CRITICAL: return Tr(bLowercase ? STR_TEMP_CRIT_LO : STR_TEMP_CRIT);
+    default:                 return Tr(STR_POH_NONE);
     }
 }
 
@@ -372,7 +388,7 @@ static void FormatTempLecture(const DRIVE_INFO* p, char* buf, int nBuf)
     int warnC, critC;
     if (!buf || nBuf <= 0) return;
     if (!p || p->nTemperatureC <= 0) {
-        safe_snprintf_n(buf, nBuf, "нет данных");
+        safe_snprintf_n(buf, nBuf, "%s", Tr(STR_POH_NONE));
         return;
     }
     warnC = p->nTempWarnC > 0 ? p->nTempWarnC :
@@ -381,11 +397,13 @@ static void FormatTempLecture(const DRIVE_INFO* p, char* buf, int nBuf)
             (p->bIsNVMe ? NvmeIdentifyTempC(p->wNVMeCritTempThreshold) : -1);
     if (warnC > 0 && critC > 0 && p->nTempMaxC > 0)
         safe_snprintf_n(buf, nBuf,
-            "%d °C · %s (макс. %d °C, пред. %d, крит. %d)",
+            TN("%d °C · %s (макс. %d °C, пред. %d, крит. %d)",
+               "%d °C · %s (max %d °C, warn %d, crit %d)"),
             p->nTemperatureC, GetTempBandName(p->eTempBand, TRUE),
             p->nTempMaxC, warnC, critC);
     else if (warnC > 0 && critC > 0)
-        safe_snprintf_n(buf, nBuf, "%d °C · %s (пред. %d °C, крит. %d °C)",
+        safe_snprintf_n(buf, nBuf, TN("%d °C · %s (пред. %d °C, крит. %d °C)",
+                                      "%d °C · %s (warn %d °C, crit %d °C)"),
                         p->nTemperatureC, GetTempBandName(p->eTempBand, TRUE),
                         warnC, critC);
     else if (p->nTempMaxC > 0 && critC > 0)
@@ -412,10 +430,10 @@ static void FormatTempLecture(const DRIVE_INFO* p, char* buf, int nBuf)
 static const char* QualityNameRu(NORM_QUALITY q, BOOL bRaw)
 {
     switch (q) {
-    case NORM_QUALITY_LOW:    return "НИЗКОЕ";
-    case NORM_QUALITY_MEDIUM: return bRaw ? "СМЕШАННОЕ" : "СРЕДНЕЕ";
-    case NORM_QUALITY_HIGH:   return "ВЫСОКОЕ";
-    default:                  return "нет данных";
+    case NORM_QUALITY_LOW:    return TN("НИЗКОЕ", "LOW");
+    case NORM_QUALITY_MEDIUM: return bRaw ? TN("СМЕШАННОЕ", "MIXED") : TN("СРЕДНЕЕ", "MEDIUM");
+    case NORM_QUALITY_HIGH:   return TN("ВЫСОКОЕ", "HIGH");
+    default:                  return Tr(STR_POH_NONE);
     }
 }
 
@@ -475,23 +493,23 @@ static void FormatNvmeCritWarnBits(BYTE cw, char* buf, int nBuf)
     tmp[0] = '\0';
     if (!buf || nBuf <= 0) return;
     if (cw == 0) {
-        safe_snprintf_n(buf, nBuf, "нет");
+        safe_snprintf_n(buf, nBuf, "%s", TN("нет", "none"));
         return;
     }
     if (cw & NVME_CRIT_WARN_SPARE_BELOW_THRESH)
-        LectureAdd(tmp, (int)sizeof(tmp), tmp[0] ? ", запас" : "запас");
+        LectureAdd(tmp, (int)sizeof(tmp), tmp[0] ? TN(", запас", ", spare") : TN("запас", "spare"));
     if (cw & NVME_CRIT_WARN_TEMP_THRESHOLD)
-        LectureAdd(tmp, (int)sizeof(tmp), tmp[0] ? ", температура" : "температура");
+        LectureAdd(tmp, (int)sizeof(tmp), tmp[0] ? TN(", температура", ", temperature") : TN("температура", "temperature"));
     if (cw & NVME_CRIT_WARN_RELIABILITY_DEGRADED)
-        LectureAdd(tmp, (int)sizeof(tmp), tmp[0] ? ", надёжность" : "надёжность");
+        LectureAdd(tmp, (int)sizeof(tmp), tmp[0] ? TN(", надёжность", ", reliability") : TN("надёжность", "reliability"));
     if (cw & NVME_CRIT_WARN_READ_ONLY)
-        LectureAdd(tmp, (int)sizeof(tmp), tmp[0] ? ", только чтение" : "только чтение");
+        LectureAdd(tmp, (int)sizeof(tmp), tmp[0] ? TN(", только чтение", ", read-only") : TN("только чтение", "read-only"));
     if (cw & NVME_CRIT_WARN_VOLATILE_MEM_BACKUP)
-        LectureAdd(tmp, (int)sizeof(tmp), tmp[0] ? ", резерв энергозависимой памяти" : "резерв энергозависимой памяти");
+        LectureAdd(tmp, (int)sizeof(tmp), tmp[0] ? TN(", резерв энергозависимой памяти", ", volatile memory backup") : TN("резерв энергозависимой памяти", "volatile memory backup"));
     if (cw & NVME_CRIT_WARN_PMR_RO)
-        LectureAdd(tmp, (int)sizeof(tmp), tmp[0] ? ", постоянная память только чтение" : "постоянная память только чтение");
+        LectureAdd(tmp, (int)sizeof(tmp), tmp[0] ? TN(", постоянная память только чтение", ", persistent memory read-only") : TN("постоянная память только чтение", "persistent memory read-only"));
     if (tmp[0] == '\0')
-        safe_snprintf_n(buf, nBuf, "есть");
+        safe_snprintf_n(buf, nBuf, "%s", TN("есть", "set"));
     else
         safe_snprintf_n(buf, nBuf, "%s", tmp);
 }
@@ -604,17 +622,20 @@ void FormatHddObservePrompt(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen)
     if (!pInfo) return;
 
     if (pInfo->bPrefailPast) {
-        safe_snprintf_n(szBuf, nBufLen,
-            "Диск ещё считает себя исправным. Prefail-атрибут был ниже порога.");
+        safe_snprintf_n(szBuf, nBufLen, "%s", TN(
+            "Диск ещё считает себя исправным. Prefail-атрибут был ниже порога.",
+            "The drive still reports itself healthy. A prefail attribute was below its threshold."));
         return;
     }
     if (pInfo->bUsageFailed) {
-        safe_snprintf_n(szBuf, nBufLen,
-            "Диск ещё считает себя исправным. Usage-атрибут на пороге — следить.");
+        safe_snprintf_n(szBuf, nBufLen, "%s", TN(
+            "Диск ещё считает себя исправным. Usage-атрибут на пороге — следить.",
+            "The drive still reports itself healthy. A usage attribute is at its threshold."));
         return;
     }
-    safe_snprintf_n(szBuf, nBufLen,
-        "Есть факторы риска. Нажмите на состояние.");
+    safe_snprintf_n(szBuf, nBufLen, "%s", TN(
+        "Есть факторы риска. Нажмите на состояние.",
+        "There are risk factors. Click the status for details."));
 }
 
 /* HDD: channels are displayed separately. Overall = ATA-3 prefail/media/self-test. */
@@ -624,9 +645,10 @@ static void AssessHddHealth(DRIVE_INFO* pInfo)
     BOOL bGsenseUp = FALSE, bC5Up = FALSE, bMediaUp = FALSE;
     MECH_SNAP prev, now;
     int havePrev = 0;
-    int n187;
+    int n187, n184;
 
     n187 = AttrRawOrNeg1(pInfo, 0xBB);
+    n184 = AttrRawOrNeg1(pInfo, 0xB8);
     bMediaHurt = (pInfo->nReallocated > 0 ||
                   pInfo->nPendingSectors > 0 ||
                   pInfo->nUncorrectable > 0 ||
@@ -688,20 +710,24 @@ static void AssessHddHealth(DRIVE_INFO* pInfo)
              n187 > 0)
         pInfo->eReliability = HEALTH_STATUS_BAD;
     else if (pInfo->nPendingSectors > 0 || pInfo->nReallocated > 0 ||
-             pInfo->nRemapEvents > 0)
+             pInfo->nRemapEvents > 0 || n184 >= 5)
         pInfo->eReliability = HEALTH_STATUS_CAUTION;
-    else if (pInfo->bPrefailPast || pInfo->bUsageFailed)
+    else if (pInfo->bPrefailPast || pInfo->bUsageFailed || n184 > 0)
         pInfo->eReliability = HEALTH_STATUS_OBSERVE;
     else
         pInfo->eReliability = HEALTH_STATUS_GOOD;
 
-    /* Interface: 199 / CRC. */
-    if (pInfo->nCrcErrors >= 100)
-        pInfo->eInterface = HEALTH_STATUS_BAD;
-    else if (pInfo->nCrcErrors > 0)
-        pInfo->eInterface = HEALTH_STATUS_CAUTION;
-    else
-        pInfo->eInterface = HEALTH_STATUS_GOOD;
+    /* Interface: 199 CRC, 188 timeouts (cable/power), 10 spin retries (PSU). */
+    {
+        int n188 = AttrRawOrNeg1(pInfo, 0xBC);
+        int n10  = AttrRawOrNeg1(pInfo, 0x0A);
+        if (pInfo->nCrcErrors >= 100 || n188 >= 100)
+            pInfo->eInterface = HEALTH_STATUS_BAD;
+        else if (pInfo->nCrcErrors > 0 || n188 >= 10 || n10 > 2)
+            pInfo->eInterface = HEALTH_STATUS_CAUTION;
+        else
+            pInfo->eInterface = HEALTH_STATUS_GOOD;
+    }
 
     /* Temperature: risk without surface damage is OBSERVE, not BAD. */
     pInfo->eTempBand = TempBandFromC(pInfo->nTemperatureC);
@@ -804,12 +830,15 @@ static void AssessSsdHealth(DRIVE_INFO* pInfo)
 
     if (pInfo->bIsNVMe)
         pInfo->eInterface = HEALTH_STATUS_GOOD;
-    else if (pInfo->nCrcErrors >= 100)
-        pInfo->eInterface = HEALTH_STATUS_BAD;
-    else if (pInfo->nCrcErrors > 0)
-        pInfo->eInterface = HEALTH_STATUS_CAUTION;
-    else
-        pInfo->eInterface = HEALTH_STATUS_GOOD;
+    else {
+        int n188 = AttrRawOrNeg1(pInfo, 0xBC);
+        if (pInfo->nCrcErrors >= 100 || n188 >= 100)
+            pInfo->eInterface = HEALTH_STATUS_BAD;
+        else if (pInfo->nCrcErrors > 0 || n188 >= 10)
+            pInfo->eInterface = HEALTH_STATUS_CAUTION;
+        else
+            pInfo->eInterface = HEALTH_STATUS_GOOD;
+    }
 
     if (pInfo->bIsNVMe)
         pInfo->eTempBand = TempBandFromNvme(pInfo->nTemperatureC,
@@ -1187,22 +1216,23 @@ static void LectureAddF(char* buf, int nBuf, const char* fmt, ...)
 
 static void LectureAddSplitConfidence(char* buf, int nBuf, const DRIVE_INFO* p)
 {
-    LectureAddF(buf, nBuf, "Достоверность оценки: %d%%\r\n\r\n", p->nConfidence);
-    LectureAdd(buf, nBuf, "Причины:\r\n");
+    LectureAddF(buf, nBuf, TN("Достоверность оценки: %d%%\r\n\r\n",
+                             "Assessment confidence: %d%%\r\n\r\n"), p->nConfidence);
+    LectureAdd(buf, nBuf, TN("Причины:\r\n", "Reasons:\r\n"));
     if (p->nConfModelId >= 90)
-        LectureAdd(buf, nBuf, "  • модель определена уверенно\r\n");
+        LectureAdd(buf, nBuf, TN("  • модель определена уверенно\r\n", "  • model identified confidently\r\n"));
     else
-        LectureAdd(buf, nBuf, "  • модель определена не полностью\r\n");
+        LectureAdd(buf, nBuf, TN("  • модель определена не полностью\r\n", "  • model only partly identified\r\n"));
     if (p->bSMART_Supported)
-        LectureAdd(buf, nBuf, "  • SMART полностью прочитан\r\n");
+        LectureAdd(buf, nBuf, TN("  • SMART полностью прочитан\r\n", "  • SMART fully read\r\n"));
     else
-        LectureAdd(buf, nBuf, "  • SMART прочитан не полностью\r\n");
+        LectureAdd(buf, nBuf, TN("  • SMART прочитан не полностью\r\n", "  • SMART only partly read\r\n"));
     if (p->nConfVendorDecoder >= 90)
-        LectureAdd(buf, nBuf, "  • vendor decoder найден\r\n");
+        LectureAdd(buf, nBuf, TN("  • vendor decoder найден\r\n", "  • vendor decoder found\r\n"));
     else
-        LectureAdd(buf, nBuf, "  • vendor decoder неполный\r\n");
+        LectureAdd(buf, nBuf, TN("  • vendor decoder неполный\r\n", "  • vendor decoder incomplete\r\n"));
     if (p->nGSenseEvents > 0 && p->nGSenseDelta < 0)
-        LectureAdd(buf, nBuf, "  • динамика G-Sense отсутствует\r\n");
+        LectureAdd(buf, nBuf, TN("  • динамика G-Sense отсутствует\r\n", "  • no G-Sense trend yet\r\n"));
     LectureAdd(buf, nBuf, "\r\n");
 }
 
@@ -1293,7 +1323,8 @@ static const char* HealthStatusMark(DRIVE_HEALTH_STATUS e)
 
 static void LectureAddDualStatus(char* szBuf, int nBufLen, const DRIVE_INFO* pInfo)
 {
-    LectureAddF(szBuf, nBufLen, "Диск: %s%s\r\nОценка: %s%s\r\n\r\n",
+    LectureAddF(szBuf, nBufLen, TN("Диск: %s%s\r\nОценка: %s%s\r\n\r\n",
+                                  "Drive: %s%s\r\nAssessment: %s%s\r\n\r\n"),
                 HealthStatusMark(pInfo->eDiskStatus),
                 GetDiskStatusName(pInfo),
                 HealthStatusMark(pInfo->eHealthStatus),
@@ -1314,8 +1345,9 @@ static void FormatHddLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
     LectureAddDualStatus(szBuf, nBufLen, pInfo);
 
     if (!pInfo->bSMART_Supported) {
-        LectureAdd(szBuf, nBufLen,
-            "SMART недоступен. Без исходных данных оценка не ставится.\r\n");
+        LectureAdd(szBuf, nBufLen, TN(
+            "SMART недоступен. Без исходных данных оценка не ставится.\r\n",
+            "SMART is unavailable. No assessment without source data.\r\n"));
         return;
     }
 
@@ -1325,12 +1357,14 @@ static void FormatHddLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
 
     switch (pInfo->eHealthStatus) {
     case HEALTH_STATUS_GOOD:
-        LectureAdd(szBuf, nBufLen,
+        LectureAdd(szBuf, nBufLen, TN(
             "Критических проблем не обнаружено.\r\n"
-            "Prefail-атрибуты в норме, повреждение поверхности не подтверждено.\r\n");
+            "Prefail-атрибуты в норме, повреждение поверхности не подтверждено.\r\n",
+            "No critical problems found.\r\n"
+            "Prefail attributes are in range; no confirmed media damage.\r\n"));
         break;
     case HEALTH_STATUS_OBSERVE:
-        LectureAdd(szBuf, nBufLen, "Причина:\r\n");
+        LectureAdd(szBuf, nBufLen, TN("Причина:\r\n", "Reason:\r\n"));
         {
             BOOL bSaid = FALSE;
             if (pInfo->bPrefailPast) {
@@ -1356,12 +1390,14 @@ static void FormatHddLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
                     (pend <= 0) ? "\xE2\x9C\x93" : "\xE2\x9C\x97", pend < 0 ? 0 : pend);
         LectureAddF(szBuf, nBufLen, "  %s Неисправимые: %d\r\n\r\n",
                     (u <= 0) ? "\xE2\x9C\x93" : "\xE2\x9C\x97", u < 0 ? 0 : u);
-        LectureAdd(szBuf, nBufLen, "Рекомендация: Следить за динамикой SMART.\r\n");
+        LectureAdd(szBuf, nBufLen, TN("Рекомендация: Следить за динамикой SMART.\r\n",
+                                      "Recommendation: Watch SMART over time.\r\n"));
         break;
     case HEALTH_STATUS_CAUTION:
-        LectureAdd(szBuf, nBufLen, "Причина:\r\n");
-        LectureAdd(szBuf, nBufLen,
-            "Есть реальные признаки деградации носителя.\r\n\r\n");
+        LectureAdd(szBuf, nBufLen, TN("Причина:\r\n", "Reason:\r\n"));
+        LectureAdd(szBuf, nBufLen, TN(
+            "Есть реальные признаки деградации носителя.\r\n\r\n",
+            "There are real signs of media degradation.\r\n\r\n"));
         if (pend > 0)
             LectureAddF(szBuf, nBufLen, "Ожидающие сектора: %d\r\n", pend);
         if (r > 0)
@@ -1369,11 +1405,12 @@ static void FormatHddLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
         if (pInfo->nRemapEvents > 0)
             LectureAddF(szBuf, nBufLen, "События переназначения: %d\r\n", pInfo->nRemapEvents);
         LectureAdd(szBuf, nBufLen,
-            "\r\nРекомендация: Держать резервную копию и следить за SMART.\r\n");
+            TN("\r\nРекомендация: Держать резервную копию и следить за SMART.\r\n",
+               "\r\nRecommendation: Keep a backup and watch SMART.\r\n"));
         break;
     case HEALTH_STATUS_BAD:
     case HEALTH_STATUS_WARNING:
-        LectureAdd(szBuf, nBufLen, "Причина:\r\n");
+        LectureAdd(szBuf, nBufLen, TN("Причина:\r\n", "Reason:\r\n"));
         LectureAdd(szBuf, nBufLen,
             "Обнаружены признаки деградации носителя.\r\n\r\n");
         if (pend > 0)
@@ -1388,14 +1425,16 @@ static void FormatHddLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
                 LectureAddF(szBuf, nBufLen, "Неисправимые ошибки (187): %d\r\n", n187);
         }
         LectureAdd(szBuf, nBufLen,
-            "\r\nРекомендация: Немедленно создать резервную копию.\r\n");
+            TN("\r\nРекомендация: Немедленно создать резервную копию.\r\n",
+               "\r\nRecommendation: Back up immediately.\r\n"));
         break;
     case HEALTH_STATUS_CRITICAL:
-        LectureAdd(szBuf, nBufLen, "Причина:\r\n");
+        LectureAdd(szBuf, nBufLen, TN("Причина:\r\n", "Reason:\r\n"));
         LectureAdd(szBuf, nBufLen,
             "Высокий риск отказа (самотест failed или быстрое ухудшение).\r\n\r\n");
         LectureAdd(szBuf, nBufLen,
-            "Рекомендация: Немедленно копировать данные, диск к замене.\r\n");
+            TN("Рекомендация: Немедленно копировать данные, диск к замене.\r\n",
+               "Recommendation: Copy data now; the drive should be replaced.\r\n"));
         break;
     default:
         break;
@@ -1404,7 +1443,7 @@ static void FormatHddLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
     if (pInfo->nGSenseEvents >= 0 || pInfo->nEmergencyRetract >= 0 ||
         pInfo->nLoadUnload >= 0) {
         char szC1[32];
-        LectureAdd(szBuf, nBufLen, "\r\nМеханика\r\n");
+        LectureAdd(szBuf, nBufLen, TN("\r\nМеханика\r\n", "\r\nMechanics\r\n"));
         if (pInfo->nGSenseEvents >= 0)
             LectureAddF(szBuf, nBufLen, "  G-Sense: %d событий\r\n", pInfo->nGSenseEvents);
         if (pInfo->nEmergencyRetract >= 0)
@@ -1417,7 +1456,7 @@ static void FormatHddLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
     if (pInfo->dwPowerOnHours > 0) {
         char szPoh[64];
         FormatPowerOnHours(pInfo->dwPowerOnHours, szPoh, (int)sizeof(szPoh));
-        LectureAddF(szBuf, nBufLen, "\r\nНаработка: %s\r\n", szPoh);
+        LectureAddF(szBuf, nBufLen, TN("\r\nНаработка: %s\r\n", "\r\nPower-on: %s\r\n"), szPoh);
     }
 }
 
@@ -1428,15 +1467,17 @@ static void FormatSsdLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
     LectureAddDualStatus(szBuf, nBufLen, pInfo);
 
     if (!pInfo->bSMART_Supported) {
-        LectureAdd(szBuf, nBufLen,
-            "SMART недоступен. Без исходных данных оценка не ставится.\r\n");
+        LectureAdd(szBuf, nBufLen, TN(
+            "SMART недоступен. Без исходных данных оценка не ставится.\r\n",
+            "SMART is unavailable. No assessment without source data.\r\n"));
         return;
     }
 
     switch (pInfo->eHealthStatus) {
     case HEALTH_STATUS_GOOD:
-        LectureAdd(szBuf, nBufLen,
-            "Критических проблем не обнаружено.\r\n");
+        LectureAdd(szBuf, nBufLen, TN(
+            "Критических проблем не обнаружено.\r\n",
+            "No critical problems found.\r\n"));
         if (pInfo->nEndurancePercent >= 0 && pInfo->nEndurancePercent <= 20)
             LectureAddF(szBuf, nBufLen,
                 "Носитель, интерфейс и температура в норме. "
@@ -1444,10 +1485,11 @@ static void FormatSsdLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
                 pInfo->nEndurancePercent);
         else
             LectureAdd(szBuf, nBufLen,
-                "Носитель, ресурс, интерфейс и температура в норме.\r\n");
+                TN("Носитель, ресурс, интерфейс и температура в норме.\r\n",
+                   "Media, wear, interface and temperature are OK.\r\n"));
         break;
     case HEALTH_STATUS_OBSERVE:
-        LectureAdd(szBuf, nBufLen, "Причина:\r\n");
+        LectureAdd(szBuf, nBufLen, TN("Причина:\r\n", "Reason:\r\n"));
         if (pInfo->eWear == HEALTH_STATUS_OBSERVE && pInfo->nEndurancePercent >= 0)
             LectureAddF(szBuf, nBufLen,
                 "Остаток ресурса %d%%. Это ещё не отказ, но запас NAND снижается.\r\n",
@@ -1463,7 +1505,7 @@ static void FormatSsdLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
             "\r\nРекомендация: Следить за SMART и держать резервную копию.\r\n");
         break;
     case HEALTH_STATUS_CAUTION:
-        LectureAdd(szBuf, nBufLen, "Причина:\r\n");
+        LectureAdd(szBuf, nBufLen, TN("Причина:\r\n", "Reason:\r\n"));
         if (pInfo->nEndurancePercent >= 0 && pInfo->nEndurancePercent <= 5)
             LectureAddF(szBuf, nBufLen,
                 "Остаток ресурса %d%%. Запас NAND почти исчерпан — "
@@ -1476,16 +1518,20 @@ static void FormatSsdLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
         if (pInfo->nReallocated > 0)
             LectureAddF(szBuf, nBufLen, "Переназначенные сектора: %d\r\n", pInfo->nReallocated);
         if (pInfo->nPendingSectors > 0)
-            LectureAddF(szBuf, nBufLen, "Ожидающие сектора: %d\r\n", pInfo->nPendingSectors);
+            LectureAddF(szBuf, nBufLen,
+                TN("Ожидающие сектора: %d. Могут уменьшиться, если сектор потом прочитался.\r\n",
+                   "Pending sectors: %d. The count can drop if a sector reads later.\r\n"),
+                pInfo->nPendingSectors);
         if (pInfo->qwNVMeMediaErrors > 0)
             LectureAddF(szBuf, nBufLen, "Ошибки носителя NVMe: %llu\r\n",
                         (unsigned long long)pInfo->qwNVMeMediaErrors);
         LectureAdd(szBuf, nBufLen,
-            "\r\nРекомендация: Держать резервную копию и следить за SMART.\r\n");
+            TN("\r\nРекомендация: Держать резервную копию и следить за SMART.\r\n",
+               "\r\nRecommendation: Keep a backup and watch SMART.\r\n"));
         break;
     case HEALTH_STATUS_BAD:
     case HEALTH_STATUS_WARNING:
-        LectureAdd(szBuf, nBufLen, "Причина:\r\n");
+        LectureAdd(szBuf, nBufLen, TN("Причина:\r\n", "Reason:\r\n"));
         LectureAdd(szBuf, nBufLen,
             "Обнаружены признаки деградации носителя или ресурса.\r\n");
         if (pInfo->nEndurancePercent >= 0 && pInfo->nEndurancePercent <= 5)
@@ -1494,14 +1540,16 @@ static void FormatSsdLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
             LectureAddF(szBuf, nBufLen, "Ошибки носителя: %llu\r\n",
                         (unsigned long long)pInfo->qwNVMeMediaErrors);
         LectureAdd(szBuf, nBufLen,
-            "\r\nРекомендация: Немедленно создать резервную копию.\r\n");
+            TN("\r\nРекомендация: Немедленно создать резервную копию.\r\n",
+               "\r\nRecommendation: Back up immediately.\r\n"));
         break;
     case HEALTH_STATUS_CRITICAL:
-        LectureAdd(szBuf, nBufLen, "Причина:\r\n");
+        LectureAdd(szBuf, nBufLen, TN("Причина:\r\n", "Reason:\r\n"));
         LectureAdd(szBuf, nBufLen,
             "Контроллер сообщает о серьёзной деградации (read-only или reliability).\r\n\r\n");
         LectureAdd(szBuf, nBufLen,
-            "Рекомендация: Немедленно копировать данные, диск к замене.\r\n");
+            TN("Рекомендация: Немедленно копировать данные, диск к замене.\r\n",
+               "Recommendation: Copy data now; the drive should be replaced.\r\n"));
         break;
     default:
         break;
@@ -1568,7 +1616,8 @@ void FormatHealthLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen)
 
     switch (pInfo->eHealthStatus) {
     case HEALTH_STATUS_GOOD:
-        szHead = "Критических проблем не обнаружено.";
+        szHead = TN("Критических проблем не обнаружено.",
+                    "No critical problems found.");
         break;
     case HEALTH_STATUS_OBSERVE:
         szHead = "Есть факторы риска, повреждение поверхности не подтверждено.";
@@ -1578,13 +1627,15 @@ void FormatHealthLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen)
         break;
     case HEALTH_STATUS_BAD:
     case HEALTH_STATUS_WARNING:
-        szHead = "Обнаружены признаки физической деградации.";
+        szHead = TN("Обнаружены признаки физической деградации.",
+                    "Signs of physical degradation were found.");
         break;
     case HEALTH_STATUS_CRITICAL:
         szHead = "Высокий риск отказа.";
         break;
     default:
-        szHead = "Критических проблем не обнаружено.";
+        szHead = TN("Критических проблем не обнаружено.",
+                    "No critical problems found.");
         break;
     }
     LectureAddF(szBuf, nBufLen, "%s\r\n\r\n", szHead);
@@ -1594,7 +1645,7 @@ void FormatHealthLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen)
     else
         lstrcpynA(szSmart, "в норме", sizeof(szSmart));
 
-    LectureAdd(szBuf, nBufLen, "Носитель\r\n");
+    LectureAdd(szBuf, nBufLen, TN("Носитель\r\n", "Media\r\n"));
     LectureAddFact(szBuf, nBufLen, "SMART", szSmart);
     if (pInfo->bIsNVMe) {
         char szMedia[32], szSpare[32];
@@ -1609,7 +1660,11 @@ void FormatHealthLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen)
         FmtCountPlain(szU,    (int)sizeof(szU),    pInfo->nUncorrectable);
         FmtCountPlain(szRemap,(int)sizeof(szRemap), pInfo->nRemapEvents);
         LectureAddFact(szBuf, nBufLen, "Переназначенные", szR);
-        LectureAddFact(szBuf, nBufLen, "Ожидающие", szPend);
+        LectureAddFact(szBuf, nBufLen, TN("Ожидающие", "Pending"), szPend);
+        if (pInfo->nPendingSectors > 0)
+            LectureAdd(szBuf, nBufLen, TN(
+                "  (могут уменьшиться при повторном чтении)\r\n",
+                "  (can drop on a later read)\r\n"));
         LectureAddFact(szBuf, nBufLen, "Неисправимые", szU);
         LectureAddFact(szBuf, nBufLen, "События переназначения", szRemap);
         if (pInfo->nWriteErrorValue >= 0 && pInfo->nWriteErrorValue <= 10) {
@@ -1622,19 +1677,34 @@ void FormatHealthLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen)
         }
     }
 
-    LectureAdd(szBuf, nBufLen, "\r\nИнтерфейс\r\n");
+    LectureAdd(szBuf, nBufLen, TN("\r\nИнтерфейс\r\n", "\r\nInterface\r\n"));
     if (pInfo->nCrcErrors >= 0) {
         FmtCountPlain(szCrc, (int)sizeof(szCrc), pInfo->nCrcErrors);
-        LectureAddFact(szBuf, nBufLen, "Ошибки CRC", szCrc);
+        LectureAddFact(szBuf, nBufLen, TN("Ошибки CRC", "CRC errors"), szCrc);
     } else if (pInfo->bIsNVMe) {
         LectureAddFact(szBuf, nBufLen, "Ссылка", "в норме");
     } else {
         LectureAddFact(szBuf, nBufLen, "Ошибки CRC", "нет данных");
     }
+    {
+        int n188 = AttrRawOrNeg1(pInfo, 0xBC);
+        int n189 = AttrRawOrNeg1(pInfo, 0xBD);
+        char szTmo[24];
+        if (n188 >= 0) {
+            FmtCountPlain(szTmo, (int)sizeof(szTmo), n188);
+            LectureAddFact(szBuf, nBufLen,
+                TN("Таймауты команд (188)", "Command timeouts (188)"), szTmo);
+        }
+        if (n189 > 0) {
+            FmtCountPlain(szTmo, (int)sizeof(szTmo), n189);
+            LectureAddFact(szBuf, nBufLen,
+                TN("Записи на большой высоте (189)", "High-fly writes (189)"), szTmo);
+        }
+    }
 
     if (pInfo->eMechanics != HEALTH_STATUS_UNKNOWN || pInfo->nGSenseEvents >= 0) {
         char szGs[40], szC0[32], szC1[32], szMech[48];
-        LectureAdd(szBuf, nBufLen, "\r\nМеханика\r\n");
+        LectureAdd(szBuf, nBufLen, TN("\r\nМеханика\r\n", "\r\nMechanics\r\n"));
         if (pInfo->eMechanics == HEALTH_STATUS_GOOD)
             lstrcpynA(szMech, "НОРМА", sizeof(szMech));
         else
@@ -1688,7 +1758,7 @@ void FormatHealthLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen)
         LectureAddFact(szBuf, nBufLen, "Циклы включения", "нет данных");
     }
 
-    LectureAdd(szBuf, nBufLen, "\r\nПричина оценки\r\n\r\n");
+    LectureAdd(szBuf, nBufLen, TN("\r\nПричина оценки\r\n\r\n", "\r\nWhy this assessment\r\n\r\n"));
 
     if (pInfo->eHealthStatus == HEALTH_STATUS_GOOD) {
         if (pInfo->eMechanics == HEALTH_STATUS_OBSERVE) {
@@ -1727,8 +1797,11 @@ void FormatHealthLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen)
                 "Есть признаки возможного повреждения носителя. Зарегистрированы события G-Sense "
                 "и одновременно появились проблемные сектора.\r\n\r\n");
         else if (pInfo->nPendingSectors > 0)
-            LectureAddF(szBuf, nBufLen,
-                "Обнаружены признаки физической деградации: ожидающие сектора %d.\r\n\r\n",
+            LectureAddF(szBuf, nBufLen, TN(
+                "Обнаружены признаки физической деградации: ожидающие сектора %d. "
+                "Счётчик может уменьшиться, если сектор потом прочитался — это ещё не приговор.\r\n\r\n",
+                "Signs of physical degradation: %d pending sectors. "
+                "The count can drop if a sector reads later — not a verdict yet.\r\n\r\n"),
                 pInfo->nPendingSectors);
         else if (pInfo->nReallocated > 0)
             LectureAddF(szBuf, nBufLen,
@@ -1778,7 +1851,7 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
 
     szState = GetHealthStatusName(pInfo->eHealthStatus);
     LectureAddDualStatus(szBuf, nBufLen, pInfo);
-    LectureAddF(szBuf, nBufLen, "Сводка: %s\r\n", szState);
+    LectureAddF(szBuf, nBufLen, TN("Сводка: %s\r\n", "Summary: %s\r\n"), szState);
 
     if (!pInfo->bSMART_Supported) {
         if (pInfo->bIsUSB && IsLikelyUsbFlashDrive(pInfo)) {
@@ -1879,9 +1952,10 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
 
         FormatNvmeCritWarnBits(cw, szCW, (int)sizeof(szCW));
 
-        LectureAdd(szBuf, nBufLen, "Основные признаки:\r\n");
+        LectureAdd(szBuf, nBufLen, TN("Основные признаки:\r\n", "Main evidence:\r\n"));
         if (cw == 0) {
-            LectureAdd(szBuf, nBufLen, "  ✓ Критическое предупреждение: нет\r\n");
+            LectureAdd(szBuf, nBufLen, TN("  ✓ Критическое предупреждение: нет\r\n",
+                                          "  ✓ Critical warning: none\r\n"));
         } else {
             LectureAddF(szBuf, nBufLen, "  ✗ Критическое предупреждение: %s\r\n", szCW);
         }
@@ -1891,7 +1965,8 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
             LectureAddF(szBuf, nBufLen, "  ✗ Доступный запас: %d%% (порог %d%%)\r\n",
                         nSpare, nSpareTh);
         if (pInfo->qwNVMeMediaErrors == 0)
-            LectureAdd(szBuf, nBufLen, "  ✓ Ошибки носителя: 0\r\n");
+            LectureAdd(szBuf, nBufLen, TN("  ✓ Ошибки носителя: 0\r\n",
+                                          "  ✓ Media errors: 0\r\n"));
         else
             LectureAddF(szBuf, nBufLen, "  ✗ Ошибки носителя: %llu\r\n",
                         (unsigned long long)pInfo->qwNVMeMediaErrors);
@@ -1901,7 +1976,7 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
                 pInfo->nEndurancePercent <= 20 ? "\xE2\x9A\xA0" : "\xE2\x9C\x93",
                 pInfo->nEndurancePercent);
 
-        LectureAdd(szBuf, nBufLen, "\r\nКонтекст (не штраф):\r\n");
+        LectureAdd(szBuf, nBufLen, TN("\r\nКонтекст (не штраф):\r\n", "\r\nContext (not a penalty):\r\n"));
         LectureAddF(szBuf, nBufLen, "  Температура: %s. ", szTempBand);
         LectureAddF(szBuf, nBufLen,
             "Время на высокой температуре: предупреждение %lu мин, критическая %lu мин.\r\n",
@@ -1949,15 +2024,15 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
                          DriveControllerLabel(pInfo),
                          pInfo->eController == CONTROLLER_UNKNOWN ? "−уверенность" : "0");
 
-        LectureAdd(szBuf, nBufLen, "\r\nИтог:\r\n");
+        LectureAdd(szBuf, nBufLen, TN("\r\nИтог:\r\n", "\r\nVerdict:\r\n"));
         if (pInfo->eHealthStatus == HEALTH_STATUS_GOOD) {
-            LectureAdd(szBuf, nBufLen, "  ХОРОШО, потому что:\r\n");
+            LectureAdd(szBuf, nBufLen, TN("  ХОРОШО, потому что:\r\n", "  GOOD because:\r\n"));
         } else if (pInfo->eHealthStatus == HEALTH_STATUS_OBSERVE) {
-            LectureAdd(szBuf, nBufLen, "  РИСК, потому что:\r\n");
+            LectureAdd(szBuf, nBufLen, TN("  РИСК, потому что:\r\n", "  WATCH because:\r\n"));
         } else if (pInfo->eHealthStatus == HEALTH_STATUS_CAUTION) {
-            LectureAdd(szBuf, nBufLen, "  ВНИМАНИЕ, потому что:\r\n");
+            LectureAdd(szBuf, nBufLen, TN("  ВНИМАНИЕ, потому что:\r\n", "  NEEDS ATTENTION because:\r\n"));
         } else {
-            LectureAdd(szBuf, nBufLen, "  ПЛОХО, потому что:\r\n");
+            LectureAdd(szBuf, nBufLen, TN("  ПЛОХО, потому что:\r\n", "  BAD because:\r\n"));
         }
         LectureAddF(szBuf, nBufLen, "    %d сильных положительных признаков\r\n", nPos);
         LectureAddF(szBuf, nBufLen, "    %d критических отказов\r\n", nCritFail);
@@ -1978,23 +2053,59 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
         LectureFmtInt(szCrc,  (int)sizeof(szCrc),  pInfo->nCrcErrors);
         LectureFmtInt(szRemap,(int)sizeof(szRemap),pInfo->nRemapEvents);
 
-        LectureAdd(szBuf, nBufLen, "Основные признаки:\r\n");
+        LectureAdd(szBuf, nBufLen, TN("Основные признаки:\r\n", "Main evidence:\r\n"));
         if (pInfo->nReallocated == 0)
-            LectureAdd(szBuf, nBufLen, "  ✓ Переназначенные сектора: 0\r\n");
+            LectureAdd(szBuf, nBufLen, TN("  ✓ Переназначенные сектора: 0\r\n",
+                                          "  ✓ Reallocated sectors: 0\r\n"));
         else if (pInfo->nReallocated > 0)
             LectureAddF(szBuf, nBufLen, "  ✗ Переназначенные сектора: %d\r\n", pInfo->nReallocated);
         if (pInfo->nPendingSectors == 0)
-            LectureAdd(szBuf, nBufLen, "  ✓ Ожидающие сектора: 0\r\n");
+            LectureAdd(szBuf, nBufLen, TN("  ✓ Ожидающие сектора: 0\r\n",
+                                          "  ✓ Pending sectors: 0\r\n"));
         else if (pInfo->nPendingSectors > 0)
-            LectureAddF(szBuf, nBufLen, "  ✗ Ожидающие сектора: %d\r\n", pInfo->nPendingSectors);
+            LectureAddF(szBuf, nBufLen, TN(
+                "  ✗ Ожидающие сектора: %d (могут уменьшиться при повторном чтении)\r\n",
+                "  ✗ Pending sectors: %d (can drop on a later read)\r\n"),
+                pInfo->nPendingSectors);
         if (pInfo->nUncorrectable == 0)
-            LectureAdd(szBuf, nBufLen, "  ✓ Неисправимые сектора: 0\r\n");
+            LectureAdd(szBuf, nBufLen, TN("  ✓ Неисправимые сектора: 0\r\n",
+                                          "  ✓ Uncorrectable sectors: 0\r\n"));
         else if (pInfo->nUncorrectable > 0)
             LectureAddF(szBuf, nBufLen, "  ✗ Неисправимые сектора: %d\r\n", pInfo->nUncorrectable);
         if (pInfo->nRemapEvents == 0)
-            LectureAdd(szBuf, nBufLen, "  ✓ События переназначения: 0\r\n");
+            LectureAdd(szBuf, nBufLen, TN("  ✓ События переназначения: 0\r\n",
+                                          "  ✓ Reallocation events: 0\r\n"));
         else if (pInfo->nRemapEvents > 0)
             LectureAddF(szBuf, nBufLen, "  ✗ События переназначения: %d\r\n", pInfo->nRemapEvents);
+        if (pInfo->nReallocated >= 0 && pInfo->nRemapEvents >= 0 &&
+            (pInfo->nReallocated > 0 || pInfo->nRemapEvents > 0)) {
+            if (pInfo->nRemapEvents > 0 && pInfo->nReallocated == 0)
+                LectureAdd(szBuf, nBufLen, TN(
+                    "  196 без роста 05: кандидат оказался софт-бэдом, сектор исправили без ремапа.\r\n",
+                    "  196 without 05 growth: candidate was a soft-bad; sector repaired without remap.\r\n"));
+            else if (pInfo->nReallocated > 0 && pInfo->nRemapEvents > 0 &&
+                     pInfo->nRemapEvents < pInfo->nReallocated)
+                LectureAdd(szBuf, nBufLen, TN(
+                    "  196 < 05: за одно переназначение ушло несколько секторов.\r\n",
+                    "  196 < 05: one remap event covered several sectors.\r\n"));
+            else if (pInfo->nReallocated > 0 && pInfo->nRemapEvents > pInfo->nReallocated)
+                LectureAdd(szBuf, nBufLen, TN(
+                    "  196 > 05: часть попыток ремапа пришлась на софт-бэды, которые потом исправились.\r\n",
+                    "  196 > 05: some remap attempts were soft-bads that later recovered.\r\n"));
+        }
+        if (pInfo->nRemapEvents < 0 && FindAttr(pInfo, 0xC4) &&
+            RemapRawIsFlyingHours(pInfo, FindAttr(pInfo, 0xC4)->bRawValue))
+            LectureAdd(szBuf, nBufLen, TN(
+                "  196 совпадает с 240: прошивка записала сюда часы полёта головок, не события переназначения.\r\n",
+                "  196 matches 240: firmware stored head flying hours here, not reallocation events.\r\n"));
+        {
+            int n184 = AttrRawOrNeg1(pInfo, 0xB8);
+            if (n184 > 0)
+                LectureAddF(szBuf, nBufLen, TN(
+                    "  ✗ End-to-End (184): %d. Ошибка через кэш диска, не кабель.\r\n",
+                    "  ✗ End-to-End (184): %d. Error through the drive cache, not the cable.\r\n"),
+                    n184);
+        }
         {
             int n187 = AttrRawOrNeg1(pInfo, 0xBB);
             if (n187 == 0)
@@ -2021,13 +2132,35 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
                 "здоровье, пока декодер не доказал, что число — физические ошибки.\r\n");
         }
 
-        LectureAdd(szBuf, nBufLen, "\r\nКонтекст (не штраф):\r\n");
+        LectureAdd(szBuf, nBufLen, TN("\r\nКонтекст (не штраф):\r\n", "\r\nContext (not a penalty):\r\n"));
         if (pInfo->nCrcErrors > 0)
             LectureAddF(szBuf, nBufLen,
                 "  CRC UltraDMA: %d. Кабель/мост/порт, не здоровье носителя.\r\n",
                 pInfo->nCrcErrors);
         else if (pInfo->nCrcErrors == 0)
             LectureAdd(szBuf, nBufLen, "  CRC UltraDMA: 0. Контекст, не штраф.\r\n");
+        {
+            int n188 = AttrRawOrNeg1(pInfo, 0xBC);
+            int n189 = AttrRawOrNeg1(pInfo, 0xBD);
+            if (n188 > 0)
+                LectureAddF(szBuf, nBufLen, TN(
+                    "  Таймауты команд (188): %d. Питание или кабель, не носитель.\r\n",
+                    "  Command timeouts (188): %d. Power or cable, not media.\r\n"),
+                    n188);
+            if (n189 > 0)
+                LectureAddF(szBuf, nBufLen, TN(
+                    "  Записи на большой высоте (189): %d. Вибрация/удар, не штраф к носителю.\r\n",
+                    "  High-fly writes (189): %d. Vibration/shock, not a media penalty.\r\n"),
+                    n189);
+            {
+                int n10 = AttrRawOrNeg1(pInfo, 0x0A);
+                if (n10 > 2)
+                    LectureAddF(szBuf, nBufLen, TN(
+                        "  Повторы раскрутки (10): %d. Сначала питание/кабель, не блины.\r\n",
+                        "  Spin retries (10): %d. Check PSU/cable first, not the platters.\r\n"),
+                        n10);
+            }
+        }
         LectureAddF(szBuf, nBufLen,
             "  Температура: %s. Время на высокой температуре: нет данных.\r\n",
             szTempBand);
@@ -2067,19 +2200,33 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
                 LectureAddF(szBuf, nBufLen,
                     "  Циклы парковки головок: %d.\r\n", pInfo->nLoadUnload);
             LectureAddF(szBuf, nBufLen,
-                "  Механическое состояние: %s.\r\n",
-                pInfo->eMechanics == HEALTH_STATUS_GOOD ? "НОРМА" :
+                TN("  Механическое состояние: %s.\r\n",
+                   "  Mechanical condition: %s.\r\n"),
+                pInfo->eMechanics == HEALTH_STATUS_GOOD ? Tr(STR_AXIS_OK) :
                     GetHealthStatusName(pInfo->eMechanics));
             if (pInfo->nGSenseEvents > 0 &&
                 pInfo->nReallocated <= 0 && pInfo->nPendingSectors <= 0 &&
-                pInfo->nUncorrectable <= 0)
-                LectureAdd(szBuf, nBufLen,
-                    "  G-Sense зарегистрировал события ударов/вибрации, однако SMART не показывает "
-                    "связанных с ними признаков повреждения поверхности (5/196/197/198 = 0). "
-                    "\r\n");
+                pInfo->nUncorrectable <= 0 &&
+                pInfo->nRemapEvents <= 0) {
+                if (pInfo->nRemapEvents < 0)
+                    LectureAdd(szBuf, nBufLen, TN(
+                        "  G-Sense зарегистрировал события ударов/вибрации, однако SMART не показывает "
+                        "связанных с ними признаков повреждения поверхности (5/197/198 = 0). "
+                        "Атрибут 196 здесь не счётчик событий переназначения.\r\n",
+                        "  G-Sense recorded shock or vibration, but SMART shows no related "
+                        "surface damage (5/197/198 = 0). Attribute 196 is not a reallocation count here.\r\n"));
+                else
+                    LectureAdd(szBuf, nBufLen, TN(
+                        "  G-Sense зарегистрировал события ударов/вибрации, однако SMART не показывает "
+                        "связанных с ними признаков повреждения поверхности (5/196/197/198 = 0). "
+                        "\r\n",
+                        "  G-Sense recorded shock or vibration, but SMART shows no related "
+                        "surface damage (5/196/197/198 = 0).\r\n"));
+            }
             else if (pInfo->nGSenseEvents > 0)
-                LectureAdd(szBuf, nBufLen,
-                    "  G-Sense совпадает с проблемными секторами — это связанная улика, не отдельный штраф.\r\n");
+                LectureAdd(szBuf, nBufLen, TN(
+                    "  G-Sense совпадает с проблемными секторами — это связанная улика, не отдельный штраф.\r\n",
+                    "  G-Sense lines up with bad sectors — related evidence, not a separate penalty.\r\n"));
         }
         if (nC3 >= 0) {
             if (DriveIsHdd(pInfo) && pInfo->eVendor == VENDOR_SEAGATE) {
@@ -2194,7 +2341,7 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
                              nUnknown > 0 ? "−уверенность" : "0");
         }
 
-        LectureAdd(szBuf, nBufLen, "\r\nИтог:\r\n");
+        LectureAdd(szBuf, nBufLen, TN("\r\nИтог:\r\n", "\r\nVerdict:\r\n"));
         if (pInfo->eHealthStatus == HEALTH_STATUS_GOOD)
             LectureAdd(szBuf, nBufLen, "  ХОРОШО, потому что:\r\n");
         else if (pInfo->eHealthStatus == HEALTH_STATUS_OBSERVE)
@@ -2249,11 +2396,12 @@ void ExtractSSDIndicators(DRIVE_INFO* pInfo)
         case 0xA9:
             if (pInfo->nSSDLifeLeft < 0) {
                 int raw = (int)GetRawValue(pA->bRawValue);
-                /* Phison 169 RAW is remaining % (0 = exhausted). Value is dummy. */
-                if (raw <= 100)
+                /* Phison A9 RAW 1–100 is remaining %. RAW 0 with Value 100
+                 * is the dummy 100/100/50 scale, not 0% worn. */
+                if (raw >= 1 && raw <= 100)
                     pInfo->nSSDLifeLeft = raw;
-                else
-                    pInfo->nSSDLifeLeft = (int)pA->bAttrValue;
+                else if (raw == 0 && pA->bAttrValue < 90)
+                    pInfo->nSSDLifeLeft = 0;
             }
             break;
         case 0xE7:
@@ -2275,18 +2423,22 @@ void ExtractSSDIndicators(DRIVE_INFO* pInfo)
             if (pInfo->nSSDTotalWritesGB < 0)
                 pInfo->nSSDTotalWritesGB = (int)GetRawValue(pA->bRawValue);
             break;
-        /* Host writes. Phison 241/242 RAW is already host GB, not LBA. */
+        /* Host writes. Only Phison 241/242 is GB or 32 MiB units.
+         * Other SATA SSDs store LBAs; a sub-GiB count is not a GB total. */
         case 0xF1:
         case 0xF3: {
-            unsigned __int64 nRaw, nGiB;
+            unsigned __int64 nRaw, nGiB = 0;
             if (pInfo->nSSDTotalWritesGB >= 0) break;
             nRaw = GetRawValue48(pA->bRawValue);
-            if (IsPhisonFamily(pInfo) && (pA->bAttrID == 0xF1 || pA->bAttrID == 0xF2)) {
-                nGiB = ScalePhisonHostGiB(pInfo, nRaw);
+            if (IsPhisonFamily(pInfo) &&
+                (pInfo->eType == DRIVE_TYPE_SSD_SATA ||
+                 pInfo->eType == DRIVE_TYPE_M2_SATA)) {
+                nGiB = ScaleAtaHostGiB(pInfo, nRaw);
             } else {
                 if (nRaw < 2048ULL) break;
                 nGiB = nRaw / (1024ULL * 1024ULL * 2ULL);
             }
+            if (nGiB == 0) break;
             if (nGiB > 4000000ULL) nGiB = 4000000ULL;
             pInfo->nSSDTotalWritesGB = (int)nGiB;
             break;

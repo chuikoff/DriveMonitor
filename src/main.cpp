@@ -21,6 +21,7 @@
 #include "resource.h"
 #include "utf8ui.h"
 #include "safestr.h"
+#include "lang.h"
 
 #define MUTEX_NAME  "Global\\DriveMonitor_SingleInstance"
 
@@ -106,6 +107,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
     g_hInst = hInstance;
     UiInitScale();
+    UiLangInit();
 
     INITCOMMONCONTROLSEX icex;
     icex.dwSize = sizeof(icex);
@@ -137,6 +139,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     RECT wa;
     int nW = UiWindowW(), nH = UiWindowH();
     int nScrW, nScrH, nX, nY;
+    int nShow = nCmdShow;
     if (!SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0)) {
         wa.left = 0;
         wa.top = 0;
@@ -165,7 +168,30 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         return 1;
     }
 
-    ShowWindow(hWnd, nCmdShow);
+    /* WinX/WinY are GetWindowPlacement workspace coordinates.
+     * CreateWindow takes screen coordinates; SetWindowPlacement does not. */
+    {
+        int lx, ly, lw, lh, ls;
+        if (UiLoadWindowPlace(&lx, &ly, &lw, &lh, &ls)) {
+            WINDOWPLACEMENT wp;
+            ZeroMemory(&wp, sizeof(wp));
+            wp.length = sizeof(wp);
+            if (GetWindowPlacement(hWnd, &wp)) {
+                wp.showCmd = (ls == SW_SHOWMAXIMIZED || ls == SW_MAXIMIZE)
+                    ? (UINT)SW_SHOWMAXIMIZED : (UINT)SW_SHOWNORMAL;
+                if (ls == SW_SHOWMINIMIZED || ls == SW_MINIMIZE)
+                    wp.showCmd = SW_SHOWMINIMIZED;
+                wp.rcNormalPosition.left = lx;
+                wp.rcNormalPosition.top = ly;
+                wp.rcNormalPosition.right = lx + lw;
+                wp.rcNormalPosition.bottom = ly + lh;
+                SetWindowPlacement(hWnd, &wp);
+                nShow = (int)wp.showCmd;
+            }
+        }
+    }
+
+    ShowWindow(hWnd, nShow);
     UpdateWindow(hWnd);
 
     {

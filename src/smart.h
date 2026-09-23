@@ -579,6 +579,7 @@ void GetAttrDecode(BYTE bID, const DRIVE_INFO* pInfo, ATTR_DECODE* out);
 const char* GetAttrNameEx(BYTE bID, const DRIVE_INFO* pInfo);
 const char* GetDriveTypeName(DRIVE_TYPE eType);
 const char* GetHealthStatusName(DRIVE_HEALTH_STATUS eStatus);
+const char* GetHealthStatusNameShort(DRIVE_HEALTH_STATUS eStatus);
 const char* GetDiskStatusName(const DRIVE_INFO* p);
 const char* GetVendorName(DRIVE_VENDOR eVendor);
 const char* GetControllerName(DRIVE_CONTROLLER eController);
@@ -668,13 +669,20 @@ DWORD GetRawValue(const BYTE* pRaw);
 unsigned __int64 GetRawValue48(const BYTE* pRaw);
 /* 187 Reported Uncorrect. -1 = absent or vendor packing (do not score). */
 int DecodeReportedUncorrect(const BYTE* pRaw, DRIVE_VENDOR vendor);
+/* 196 reallocation events. >=0 is the count. -1 = not a count: the 48-bit
+ * RAW is a copy of head-flying hours (240), or it does not fit in a counter.
+ * Never clamps that RAW to INT_MAX. */
+int DecodeRemapEvents(const DRIVE_INFO* pInfo, const BYTE* pRaw);
+/* 196 RAW is the same 48-bit field as 240, including the millisecond half. */
+BOOL RemapRawIsFlyingHours(const DRIVE_INFO* pInfo, const BYTE* pRaw);
 /* Seagate ID 1/7/195: low 32 = operations, high 16 = errors (SMART attrib spec). */
 DWORD    SeagateRateOps(const BYTE* pRaw);
 unsigned SeagateRateErrs(const BYTE* pRaw);
-/* Phison 241/242: RAW is GB on some firmwares, 32 MB units on S11-class.
- * If RAW-as-GB exceeds NAND written (erase×capacity) or >20 GB/h lifetime,
- * treat as 32 MB units. */
-unsigned __int64 ScalePhisonHostGiB(const DRIVE_INFO* pInfo, unsigned __int64 raw);
+/* ATA 241/242 host writes: RAW may be GB, 32 MB units, or 512-byte LBA.
+ * Pick the encoding that fits erase×capacity and lifetime GB/h.
+ * Callers use this for Phison; other SATA SSDs keep the LBA line. */
+unsigned __int64 ScaleAtaHostGiB(const DRIVE_INFO* pInfo, unsigned __int64 raw);
+BOOL IsPhisonFamily(const DRIVE_INFO* p);
 
 #ifdef __cplusplus
 }

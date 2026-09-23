@@ -48,6 +48,8 @@
 #define IDM_ZOOM_150         2014
 #define IDM_ZOOM_175         2015
 #define IDM_ZOOM_200         2016
+#define IDM_LANG_RU          2020
+#define IDM_LANG_EN          2021
 #define IDT_HOTPLUG          3002
 #define WM_APP_REFRESH_DONE  (WM_APP + 1)
 #define DRIVE_BTN_H    56
@@ -110,5 +112,7 @@ int     UiWindowW(void);
 int     UiWindowH(void);
 int     UiWindowHMin(void);
 HACCEL  UiCreateAccelTable(void);
+int     UiLoadWindowPlace(int* x, int* y, int* w, int* h, int* showCmd);
+void    UiSaveWindowPlace(HWND hWnd);
 
 #endif
