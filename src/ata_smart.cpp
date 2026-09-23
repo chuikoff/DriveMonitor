@@ -526,7 +526,10 @@ static int TempCFromAtaAttr(const SMART_ATTRIBUTE* pA, DRIVE_VENDOR vendor)
         if (t >= 1 && t <= 70)
             return t;
     }
-    if (val >= 70 && val <= 100) {
+    /* 100−T only for known inverted-value temp IDs when RAW is empty. */
+    if ((pA->bAttrID == 0xBE || pA->bAttrID == 0xC2) &&
+        raw0 == 0 && lo16 == 0 &&
+        val >= 70 && val <= 100) {
         int t = 100 - val;
         if (t >= 1 && t <= 60)
             return t;

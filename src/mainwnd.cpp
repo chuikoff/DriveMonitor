@@ -919,11 +919,17 @@ static void DoSaveDriveReport(HWND hWnd)
     hList = GetDlgItem(hWnd, IDC_ATTR_LIST);
     nItems = hList ? (int)ListView_GetItemCount(hList) : 0;
     if (nItems <= 0) {
-        ReportCat(buf, kCap, &len, "_Таблица SMART пуста._\r\n");
+        ReportCat(buf, kCap, &len, TN("_Таблица SMART пуста._\r\n", "_SMART table is empty._\r\n"));
     } else {
         int r, c;
-        static const char* headers[7] = {
-            "ID", "Параметр", "Значение", "Худший", "Порог", "RAW", "Статус"
+        const char* headers[7] = {
+            "ID",
+            Tr(STR_COL_PARAM),
+            Tr(STR_COL_VALUE),
+            Tr(STR_COL_WORST),
+            Tr(STR_COL_THRESH),
+            "RAW",
+            Tr(STR_COL_STATUS)
         };
         ReportCat(buf, kCap, &len, "| ");
         for (c = 0; c < 7; c++) {
@@ -1887,6 +1893,7 @@ enum {
     ATTRST_DIM,
     ATTRST_SKIP,
     ATTRST_INFO,
+    ATTRST_POWERLOG,
     ATTRST_RISK,
     ATTRST_PAST
 };
@@ -1909,9 +1916,11 @@ static LPARAM AttrStatusParam(const char* s)
         return (LPARAM)ATTRST_DIM;
     if (strcmp(s, "Не оценивается") == 0)
         return (LPARAM)ATTRST_SKIP;
+    /* TODO: prefer ATTRST_* end-to-end; see issue (number TBD) */
+    if (strcmp(s, "журнал питания") == 0 || strcmp(s, "power log") == 0)
+        return (LPARAM)ATTRST_POWERLOG;
     if (strcmp(s, "INFO") == 0 || strcmp(s, "контекст") == 0 ||
-        strcmp(s, "журнал питания") == 0 ||
-        strcmp(s, "context") == 0 || strcmp(s, "power log") == 0)
+        strcmp(s, "context") == 0)
         return (LPARAM)ATTRST_INFO;
     if (strcmp(s, "OK") == 0)
         return (LPARAM)ATTRST_OK;
@@ -2489,7 +2498,7 @@ static const char* AtaRowStatus(const DRIVE_INFO* p, const SMART_ATTRIBUTE* a,
 
     if (ssd && (id == 0xE7 || id == 0xA9)) {
         int nLeft = p->nEndurancePercent;
-        if (nLeft >= 0 && nLeft <= 5) return "ПЛОХО";
+        if (nLeft >= 0 && nLeft <= 5) return "Внимание";
         if (nLeft >= 0 && nLeft <= 10) return "Внимание";
         if (nLeft >= 0 && nLeft <= 20) return "Риск";
         return "ОК";
@@ -2727,7 +2736,7 @@ void UpdateAttrList(HWND hWnd, int nDriveIdx)
             const char* szWearSt = "ОК";
             int nLeft = 100 - (int)pLog->PercentageUsed;
             if (nLeft < 0) nLeft = 0;
-            if (pLog->PercentageUsed >= 100 || nLeft <= 5) szWearSt = "ПЛОХО";
+            if (pLog->PercentageUsed >= 100 || nLeft <= 5) szWearSt = "Внимание";
             else if (nLeft <= 10) szWearSt = "Внимание";
             else if (nLeft <= 20) szWearSt = "Риск";
             NVME_ROW("05h", TN("Износ", "Percentage used"), szPctU, szWearSt);
@@ -2799,22 +2808,22 @@ void UpdateAttrList(HWND hWnd, int nDriveIdx)
         if (pLog->ThermalMgmtTemp1TransCnt) {
             char sz[32];
             safe_snprintf(sz, "%lu", (unsigned long)pLog->ThermalMgmtTemp1TransCnt);
-            NVME_ROW("--", "Thermal Mgmt T1 переходов", sz, "ОК");
+            NVME_ROW("--", TN("Thermal Mgmt T1 переходов", "Thermal Mgmt T1 transitions"), sz, "ОК");
         }
         if (pLog->ThermalMgmtTemp2TransCnt) {
             char sz[32];
             safe_snprintf(sz, "%lu", (unsigned long)pLog->ThermalMgmtTemp2TransCnt);
-            NVME_ROW("--", "Thermal Mgmt T2 переходов", sz, "ОК");
+            NVME_ROW("--", TN("Thermal Mgmt T2 переходов", "Thermal Mgmt T2 transitions"), sz, "ОК");
         }
         if (pLog->TotalTimeThermalMgmtTemp1) {
             char sz[32];
             safe_snprintf(sz, "%lu с", (unsigned long)pLog->TotalTimeThermalMgmtTemp1);
-            NVME_ROW("--", "Thermal Mgmt T1 время", sz, "ОК");
+            NVME_ROW("--", TN("Thermal Mgmt T1 время", "Thermal Mgmt T1 time"), sz, "ОК");
         }
         if (pLog->TotalTimeThermalMgmtTemp2) {
             char sz[32];
             safe_snprintf(sz, "%lu с", (unsigned long)pLog->TotalTimeThermalMgmtTemp2);
-            NVME_ROW("--", "Thermal Mgmt T2 время", sz, "ОК");
+            NVME_ROW("--", TN("Thermal Mgmt T2 время", "Thermal Mgmt T2 time"), sz, "ОК");
         }
 
         #undef NVME_ROW
@@ -4026,6 +4035,10 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                             clrBadgeBg = RGB(71, 99, 128);
                             psz = Tr(STR_ST_INFO);
                             break;
+                        case ATTRST_POWERLOG:
+                            clrBadgeBg = RGB(71, 99, 128);
+                            psz = Tr(STR_ST_POWERLOG);
+                            break;
                         default:
                             return CDRF_DODEFAULT;
                         }
@@ -4037,7 +4050,7 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
                         HFONT hOldFont = (HFONT)SelectObject(hdc, g_hFontSmall);
                         WCHAR wz[40];
-                        if (nSt == ATTRST_INFO) {
+                        if (nSt == ATTRST_INFO || nSt == ATTRST_POWERLOG) {
                             LVITEMW li;
                             ZeroMemory(&li, sizeof(li));
                             li.mask = LVIF_TEXT;
@@ -4047,7 +4060,7 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                             li.cchTextMax = 40;
                             if (!SendMessageW(pCD->nmcd.hdr.hwndFrom, LVM_GETITEMW,
                                               0, (LPARAM)&li) || !wz[0])
-                                U8ToW(Tr(STR_ST_INFO), wz, 40);
+                                U8ToW(psz, wz, 40);
                         } else {
                             U8ToW(psz, wz, 40);
                         }
@@ -4076,8 +4089,12 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
                         SetBkMode(hdc, TRANSPARENT);
                         SetTextColor(hdc, RGB(255, 255, 255));
-                        DrawTextU8(hdc, psz, &rcBadge,
-                                   DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                        if (nSt == ATTRST_INFO || nSt == ATTRST_POWERLOG)
+                            DrawTextW(hdc, wz, -1, &rcBadge,
+                                      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                        else
+                            DrawTextU8(hdc, psz, &rcBadge,
+                                       DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 
                         SelectObject(hdc, hOldFont);
                         return CDRF_SKIPDEFAULT;
