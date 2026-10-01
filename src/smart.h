@@ -163,6 +163,7 @@ typedef enum _DRIVE_VENDOR {
     VENDOR_PATRIOT     = 22,
     VENDOR_MSI         = 23,
     VENDOR_RADEON      = 24,
+    VENDOR_APACER      = 25,
     VENDOR_OTHER       = 99
 } DRIVE_VENDOR;
 
@@ -646,6 +647,8 @@ void  FormatHealthLecture(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen);
 void  FormatHealthLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen);
 void  FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen);
 void  FormatHddObservePrompt(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen);
+void  FormatHddCautionPrompt(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen);
+void  FormatSsdCautionPrompt(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen);
 const char* GetTempBandName(TEMP_BAND eBand, BOOL bLowercase);
 /* Identify WCTEMP/CCTEMP (Kelvin) → °C, or -1 if the drive omitted the field. */
 int NvmeIdentifyTempC(USHORT kelvin);

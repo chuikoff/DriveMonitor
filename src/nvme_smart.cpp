@@ -206,10 +206,14 @@ static BOOL QueryNVMeProtocolOnHandle(HANDLE h, ULONG dataType, ULONG requestVal
         subValues[1] = 0xFFFFFFFFu;
         subValues[2] = 1;
         nSub = 3;
-        /* Log page 02h is 512 bytes. ProtocolDataLength 4096 makes
-         * iaStorVD overrun a stack cookie (bugcheck 0x139). */
+        /* Log page 02h is 512 bytes. A 4096-byte length is only tried
+         * for inbox NVMe (identLen 4096). iaStorVD bugchecks on it. */
         lengths[0] = 512;
         nLen = 1;
+        if (identLen >= 4096) {
+            lengths[1] = 4096;
+            nLen = 2;
+        }
     }
 
     ZeroMemory(bestIdent, sizeof(bestIdent));

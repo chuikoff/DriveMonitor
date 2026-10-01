@@ -933,6 +933,40 @@ void GetAttrDecode(BYTE bID, const DRIVE_INFO* pInfo, ATTR_DECODE* out)
     if (IsPhisonFamily(pInfo))
         ApplyPhisonSsdDecode(bID, out);
 
+    /* A9/E7 are life remaining only for a known profile. The ID alone is not. */
+    if (pInfo && bID == 0xA9 && !IsPhisonFamily(pInfo)) {
+        out->szName = VendorSpecificAttrName(bID);
+        out->eEnc = RAW_ENC_UNKNOWN;
+        out->eState = ATTR_DECODE_UNKNOWN;
+        out->eCrit = ATTR_CRIT_NONE;
+        out->nSemanticConfidence = 30;
+    }
+    if (pInfo && bID == 0xE7 && !IsPhisonFamily(pInfo) &&
+        pInfo->eController != CONTROLLER_SAMSUNG) {
+        out->szName = VendorSpecificAttrName(bID);
+        out->eEnc = RAW_ENC_UNKNOWN;
+        out->eState = ATTR_DECODE_UNKNOWN;
+        out->eCrit = ATTR_CRIT_NONE;
+        out->nSemanticConfidence = 30;
+    }
+    /* 252 is "new bad NAND blocks" only as a generic name. Samsung 870
+     * does not document that meaning; do not print 133 as bad blocks. */
+    if (pInfo && bID == 0xFC && pInfo->eController == CONTROLLER_SAMSUNG) {
+        out->szName = VendorSpecificAttrName(bID);
+        out->eEnc = RAW_ENC_UNKNOWN;
+        out->eState = ATTR_DECODE_UNKNOWN;
+        out->eCrit = ATTR_CRIT_NONE;
+        out->nSemanticConfidence = 30;
+    }
+    if (pInfo && bID == 0xE7 && pInfo->eController == CONTROLLER_SAMSUNG &&
+        !IsPhisonFamily(pInfo)) {
+        out->szName = TN("Остаток ресурса SSD", "SSD life remaining");
+        out->eEnc = RAW_ENC_PERCENT;
+        out->eState = ATTR_DECODE_KNOWN;
+        out->eCrit = ATTR_CRIT_ADVISORY;
+        out->nSemanticConfidence = 80;
+    }
+
     /* SSD C0 is emergency/unsafe power-off count, not HDD head-park. */
     if (bID == 0xC0 && DriveTreatsC0AsPowerLoss(pInfo)) {
         out->szName = TN("Аварийные отключения питания", "Unsafe power-off events");
@@ -1042,6 +1076,7 @@ const char* GetVendorName(DRIVE_VENDOR eVendor)
     case VENDOR_PATRIOT:       return "Patriot";
     case VENDOR_MSI:           return "MSI";
     case VENDOR_RADEON:        return "Radeon";
+    case VENDOR_APACER:        return "Apacer";
     case VENDOR_OTHER:         return "Other";
     default:                   return "Unknown";
     }
@@ -1121,11 +1156,9 @@ DRIVE_VENDOR DetectDriveVendor(const char* szModel)
         (strstr(szUpper, "SSD ") && strstr(szUpper, "PRO")))
         return VENDOR_SAMSUNG;
 
+    /* Colors (BLUE/BLACK/GREEN/…) are not a brand. They appear on other makers. */
     if (strstr(szUpper, "WDC") || strstr(szUpper, "WD ") ||
-        strstr(szUpper, "WESTERN") || strstr(szUpper, "BLUE") ||
-        strstr(szUpper, "BLACK") || strstr(szUpper, "GREEN") ||
-        strstr(szUpper, "RED ") || strstr(szUpper, "PURPLE") ||
-        strstr(szUpper, "GOLD") || strstr(szUpper, "WD20") ||
+        strstr(szUpper, "WESTERN") || strstr(szUpper, "WD20") ||
         strstr(szUpper, "WD30") || strstr(szUpper, "WD40") ||
         strstr(szUpper, "WD50") || strstr(szUpper, "WD60") ||
         strstr(szUpper, "WD80") || strstr(szUpper, "WD10"))
@@ -1139,10 +1172,10 @@ DRIVE_VENDOR DetectDriveVendor(const char* szModel)
     if (ModelLooksSeagate(szUpper))
         return VENDOR_SEAGATE;
 
-    if (strstr(szUpper, "TOSHIBA") || strstr(szUpper, "MK") ||
+    /* MK/MG are two letters and match unrelated models. */
+    if (strstr(szUpper, "TOSHIBA") ||
         strstr(szUpper, "DT01") || strstr(szUpper, "DT02") ||
-        strstr(szUpper, "MQ01") || strstr(szUpper, "MQ02") ||
-        strstr(szUpper, "MG"))
+        strstr(szUpper, "MQ01") || strstr(szUpper, "MQ02"))
         return VENDOR_TOSHIBA;
 
     if (strstr(szUpper, "HITACHI") || strstr(szUpper, "HGST") ||
@@ -1158,8 +1191,8 @@ DRIVE_VENDOR DetectDriveVendor(const char* szModel)
         strstr(szUpper, "SOLIDIGM"))
         return VENDOR_INTEL;
 
+    /* CT/MX match inside other model strings (and sit above ADATA). */
     if (strstr(szUpper, "MICRON") || strstr(szUpper, "CRUCIAL") ||
-        strstr(szUpper, "CT") || strstr(szUpper, "MX") ||
         strstr(szUpper, "M4-") || strstr(szUpper, "MTF"))
         return VENDOR_MICRON;
 
@@ -1180,7 +1213,7 @@ DRIVE_VENDOR DetectDriveVendor(const char* szModel)
         return VENDOR_SKHYNIX;
 
     if (strstr(szUpper, "KIOXIA") || strstr(szUpper, "EXCERIA") ||
-        strstr(szUpper, "KXG") || strstr(szUpper, "BG"))
+        strstr(szUpper, "KXG"))
         return VENDOR_KIOXIA;
 
     if (strstr(szUpper, "ADATA") || strstr(szUpper, "SX8") ||
@@ -1188,14 +1221,15 @@ DRIVE_VENDOR DetectDriveVendor(const char* szModel)
         strstr(szUpper, "IM2P"))
         return VENDOR_ADATA;
 
-    if (strstr(szUpper, "PNY") || strstr(szUpper, "CS"))
+    /* CS also matches Corsair CSSD, which is checked below. */
+    if (strstr(szUpper, "PNY"))
         return VENDOR_PNY;
 
     if (strstr(szUpper, "CORSAIR") || strstr(szUpper, "CSSD") ||
         strstr(szUpper, "FORCE"))
         return VENDOR_CORSAIR;
 
-    if (strstr(szUpper, "LEXAR") || strstr(szUpper, "NM"))
+    if (strstr(szUpper, "LEXAR"))
         return VENDOR_LEXAR;
 
     if (strstr(szUpper, "SILICON POWER") || strstr(szUpper, "SPCC"))
@@ -1229,6 +1263,10 @@ DRIVE_VENDOR DetectDriveVendor(const char* szModel)
         strstr(szUpper, "R3SL") || strstr(szUpper, "R7SL"))
         return VENDOR_RADEON;
 
+    if (strstr(szUpper, "APACER") || strstr(szUpper, "AS340") ||
+        strstr(szUpper, "AS350"))
+        return VENDOR_APACER;
+
     /* If model has SSD keyword but vendor unknown */
     if (strstr(szUpper, "SSD") || strstr(szUpper, "NVME"))
         return VENDOR_OTHER;
@@ -1256,16 +1294,6 @@ BOOL HasSmartAttr(const DRIVE_INFO* p, BYTE id)
             return TRUE;
     }
     return FALSE;
-}
-
-static int CountSmartAttrRange(const DRIVE_INFO* p, BYTE lo, BYTE hi)
-{
-    int n = 0;
-    unsigned id;
-    for (id = (unsigned)lo; id <= (unsigned)hi; id++) {
-        if (HasSmartAttr(p, (BYTE)id)) n++;
-    }
-    return n;
 }
 
 /* NVMe Identify Controller bytes 0-1 are PCI VID (spec). Named fields of
@@ -1323,16 +1351,11 @@ static DRIVE_CONTROLLER DetectDriveController(const DRIVE_INFO* p)
 {
     USHORT vid;
     char szModelU[48], szFwU[16];
-    int nPhison;
-    BOOL hdd, ssd;
+    BOOL hdd;
 
     if (!p) return CONTROLLER_UNKNOWN;
 
     hdd = (p->eType == DRIVE_TYPE_HDD);
-    ssd = (p->eType == DRIVE_TYPE_SSD_SATA ||
-           p->eType == DRIVE_TYPE_M2_SATA ||
-           p->eType == DRIVE_TYPE_NVME ||
-           p->bIsNVMe);
 
     ToUpperCopy(szFwU, sizeof(szFwU), p->szFirmware);
     ToUpperCopy(szModelU, sizeof(szModelU), p->szModel);
@@ -1365,14 +1388,20 @@ static DRIVE_CONTROLLER DetectDriveController(const DRIVE_INFO* p)
         strncmp(szFwU, "U11", 3) == 0 ||
         strncmp(szFwU, "U10", 3) == 0 ||
         strncmp(szFwU, "T07", 3) == 0 ||
-        strncmp(szFwU, "EJFM", 4) == 0)
+        strncmp(szFwU, "EJFM", 4) == 0 ||
+        /* PS3111-S11, e.g. Radeon R5SL firmware S1127B0. */
+        (szFwU[0] == 'S' && szFwU[1] == '1' && szFwU[2] == '1' &&
+         szFwU[3] >= '0' && szFwU[3] <= '9'))
         return CONTROLLER_PHISON;
 
     /* Token match: "ASM225" must not count as SM225. */
     if (ModelHasChipToken(szModelU, "SM226") || ModelHasChipToken(szModelU, "SM225") ||
         ModelHasChipToken(szModelU, "SM232") || ModelHasChipToken(szModelU, "SM250") ||
         strstr(szFwU, "SM226") || strstr(szFwU, "SM225") ||
-        strstr(szFwU, "SM232"))
+        strstr(szFwU, "SM232") ||
+        /* SM2258 SATA: VE + digit, e.g. Apacer AS340 VE1R9008. */
+        (szFwU[0] == 'V' && szFwU[1] == 'E' &&
+         szFwU[2] >= '0' && szFwU[2] <= '9'))
         return CONTROLLER_SMI;
 
     /* ADATA/XPG on Silicon Motion (HDS: SX8200PNP → SM2262EN).
@@ -1395,31 +1424,9 @@ static DRIVE_CONTROLLER DetectDriveController(const DRIVE_INFO* p)
         strstr(szModelU, "INNOGRIT"))
         return CONTROLLER_INNOGRIT;
 
-    /* 3. SATA SMART fingerprint. 0xCA is not Micron-only (Samsung has it). */
-    nPhison = CountSmartAttrRange(p, 0xA0, 0xA9);
-    if (HasSmartAttr(p, 0xA9) || nPhison >= 3)
-        return CONTROLLER_PHISON;
-    if (HasSmartAttr(p, 0xE7) && HasSmartAttr(p, 0xE9))
-        return CONTROLLER_PHISON;
-
-    if (p->eVendor == VENDOR_SAMSUNG && !hdd)
-        return CONTROLLER_SAMSUNG;
-
-    if (HasSmartAttr(p, 0xE1) &&
-        (p->eVendor == VENDOR_INTEL || p->eVendor == VENDOR_UNKNOWN))
-        return CONTROLLER_INTEL;
-
-    if (HasSmartAttr(p, 0xCA) && p->eVendor == VENDOR_MICRON)
-        return CONTROLLER_MICRON;
-
-    /* Kingston A400 and similar: consumer SATA is Phison. */
-    if (!hdd && p->eVendor == VENDOR_KINGSTON &&
-        (HasSmartAttr(p, 0xE7) || HasSmartAttr(p, 0xE9) ||
-         HasSmartAttr(p, 0xA9) || p->eType == DRIVE_TYPE_SSD_SATA ||
-         p->eType == DRIVE_TYPE_M2_SATA))
-        return CONTROLLER_PHISON;
-
-    /* 4. HDD MCU follows brand. In-house SSD silicon too. */
+    /* 3. HDD MCU follows the brand. Those makers build the drive.
+     * SSD brand is a label: Kingston is not Phison, SanDisk is not one ASIC.
+     * Controller comes from VID, firmware, or ApplySsdPartIds. */
     if (hdd) {
         switch (p->eVendor) {
         case VENDOR_SEAGATE: return CONTROLLER_SEAGATE;
@@ -1427,17 +1434,6 @@ static DRIVE_CONTROLLER DetectDriveController(const DRIVE_INFO* p)
         case VENDOR_TOSHIBA: return CONTROLLER_TOSHIBA;
         case VENDOR_HITACHI: return CONTROLLER_HITACHI;
         case VENDOR_SAMSUNG: return CONTROLLER_SAMSUNG;
-        default: break;
-        }
-    } else if (ssd || !hdd) {
-        /* Rebrands (Kingston/ADATA/PNY/…) stay UNKNOWN unless fingerprinted. */
-        switch (p->eVendor) {
-        case VENDOR_SAMSUNG: return CONTROLLER_SAMSUNG;
-        case VENDOR_INTEL:   return CONTROLLER_INTEL;
-        case VENDOR_MICRON:  return CONTROLLER_MICRON;
-        case VENDOR_SKHYNIX: return CONTROLLER_HYNIX;
-        case VENDOR_SANDISK: return CONTROLLER_SANDISK;
-        case VENDOR_KIOXIA:  return CONTROLLER_KIOXIA;
         default: break;
         }
     }
@@ -1471,6 +1467,24 @@ static void ApplySsdPartIds(DRIVE_INFO* p)
           "Silicon Motion SM2262EN/SM2262ENG/SM2262G", "1.3.0" },
         { "SU800", NULL, CONTROLLER_SMI,
           "Silicon Motion SM2258/SM2259", NULL },
+        { "AS340", NULL, CONTROLLER_SMI,
+          "Silicon Motion SM2258", NULL },
+        { "AS350", NULL, CONTROLLER_SMI,
+          "Silicon Motion SM2258", NULL },
+        { "", "VE1", CONTROLLER_SMI,
+          "Silicon Motion SM2258", NULL },
+        /* 870 EVO is Samsung's own MKX. Firmware SVT… is that family.
+         * Brand alone does not set the controller. */
+        { "870 EVO", NULL, CONTROLLER_SAMSUNG,
+          "Samsung MKX", NULL },
+        { "870EVO", NULL, CONTROLLER_SAMSUNG,
+          "Samsung MKX", NULL },
+        { "", "SVT", CONTROLLER_SAMSUNG,
+          "Samsung MKX", NULL },
+        { "R5SL", NULL, CONTROLLER_PHISON,
+          "Phison PS3111-S11", NULL },
+        { "", "S11", CONTROLLER_PHISON,
+          "Phison PS3111-S11", NULL },
         { "GAMMIX S70", NULL, CONTROLLER_INNOGRIT,
           "Innogrit IG5236", "1.4.0" },
         { "P210", "U11", CONTROLLER_PHISON,
@@ -1497,8 +1511,13 @@ static void ApplySsdPartIds(DRIVE_INFO* p)
           "Phison PS3109-S9", NULL },
         { "", "T07", CONTROLLER_PHISON,
           "Phison PS3111-S11", NULL },
+        /* EJ firmware is PS5019-E19. E16 firmware is EGFM, not EJFM.
+         * E19T is the DRAM-less Spatium M450; other EJFM drives stay E19.
+         * Do not invent an NVMe version: Identify already reports 1.4. */
+        { "M450", NULL, CONTROLLER_PHISON,
+          "Phison PS5019-E19T", NULL },
         { "", "EJFM", CONTROLLER_PHISON,
-          "Phison PS5016-E16", "1.3.0" },
+          "Phison PS5019-E19", NULL },
     };
     char modelU[48], fwU[16];
     unsigned i;
@@ -1829,14 +1848,19 @@ BOOL DriveAllowsNvmeMini(HANDLE hDrive)
 {
     if (DriveStackKind(hDrive) != DRIVE_STACK_NVME)
         return FALSE;
-    return s_stackMini;
+    /* secnvme answers the protocol query and bugchecks on NvmeMini.
+     * stornvme, and a bus-17 disk whose service name the walk missed,
+     * need the miniport: the disk handle often returns error 1. */
+    if (s_stackFullIdent && !s_stackMini)
+        return FALSE;
+    return TRUE;
 }
 
 BOOL DriveAllowsFullNvmeIdentify(HANDLE hDrive)
 {
-    if (DriveStackKind(hDrive) != DRIVE_STACK_NVME)
-        return FALSE;
-    return s_stackFullIdent;
+    /* 4096-byte identify and the \\.\ScsiN: retry. Safe on inbox NVMe.
+     * iaStor and RAID are other stack kinds and stay at 512. */
+    return DriveStackKind(hDrive) == DRIVE_STACK_NVME;
 }
 
 static BOOL DismountDiskVolumes(DWORD nDisk)
@@ -2331,8 +2355,9 @@ int ScanDrives(DRIVE_INFO* pDrives, int nMaxDrives)
                 pInfo->bSMART_Supported = FALSE;
                 pInfo->eType = DRIVE_TYPE_UNKNOWN;
             }
-            AssessDriveHealth(pInfo);
+            /* Confidence is frozen inside Assess; name the chip first. */
             IdentifyDriveParts(pInfo);
+            AssessDriveHealth(pInfo);
             FillDriveProtocol(pInfo);
             CloseHandle(hDrive);
             nFound++;
@@ -2348,8 +2373,8 @@ int ScanDrives(DRIVE_INFO* pDrives, int nMaxDrives)
 
             pInfo->eType               = DRIVE_TYPE_NVME;
             pInfo->bIsNVMe             = TRUE;
-            AssessDriveHealth(pInfo);
             IdentifyDriveParts(pInfo);
+            AssessDriveHealth(pInfo);
             FillDriveProtocol(pInfo);
 
             CloseHandle(hDrive);
@@ -2388,8 +2413,8 @@ int ScanDrives(DRIVE_INFO* pDrives, int nMaxDrives)
             } else {
                 pInfo->eType = DRIVE_TYPE_UNKNOWN;
             }
-            AssessDriveHealth(pInfo);
             IdentifyDriveParts(pInfo);
+            AssessDriveHealth(pInfo);
             FillDriveProtocol(pInfo);
             CloseHandle(hDrive);
             nFound++;
@@ -2674,8 +2699,10 @@ int ScanDrives(DRIVE_INFO* pDrives, int nMaxDrives)
             AcquireATASMART(hDrive, nDrive, pInfo, TRUE);
         }
 
-        AssessDriveHealth(pInfo);
+        /* USB NVMe identify (RTL9210 and the other bridges) fills VID
+         * after the earlier IdentifyDriveParts. Score only after that. */
         IdentifyDriveParts(pInfo);
+        AssessDriveHealth(pInfo);
         FillDriveProtocol(pInfo);
 
         CloseHandle(hDrive);

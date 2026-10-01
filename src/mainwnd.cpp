@@ -190,17 +190,18 @@ HWND        g_hDriveBtn[MAX_DRIVES];
 static HDEVNOTIFY      g_hDevNotify    = NULL;
 static DRIVE_INFO      g_PrevDrives[MAX_DRIVES];
 static int             g_nPrevCount    = 0;
-#define HOTPLUG_DELAY_MS  1200
+static int             g_nTrayIcons    = 0;
+static int             g_bMonitorOn    = 0;
+static int             g_bMonitorAlert = 0;
+static int             g_bMonitorQuiet = 0;
+static char            g_szMonitor[384];
+#define HOTPLUG_DELAY_MS      1200
+#define MONITOR_INTERVAL_MS  60000
 
 /* Note: the previous WinRAR-style nag timer state variables
    (g_nagSecondsLeft, g_bNagPending) have been removed because the
    program is 100% free and open source
    reminder to show anymore. */
-
-static void UpdateWindowTitle(HWND hWnd)
-{
-    SetWindowTextU8(hWnd, "DriveMonitor");
-}
 
 HBRUSH  g_hbrBG     = NULL;
 HBRUSH  g_hbrPanel  = NULL;
@@ -411,6 +412,7 @@ HACCEL UiCreateAccelTable(void)
         { (BYTE)(FVIRTKEY | FCONTROL),           (WORD)VK_SUBTRACT,   IDM_ZOOM_OUT },
         { (BYTE)(FVIRTKEY | FCONTROL),           (WORD)'0',           IDM_ZOOM_100 },
         { (BYTE)(FVIRTKEY | FCONTROL),           (WORD)VK_NUMPAD0,    IDM_ZOOM_100 },
+        { (BYTE)(FVIRTKEY | FCONTROL),           (WORD)'M',           IDM_MONITOR },
     };
     return CreateAcceleratorTable(a, (int)(sizeof(a) / sizeof(a[0])));
 }
@@ -1085,10 +1087,341 @@ static void Snapshot_Save(void)
         g_PrevDrives[i] = g_Drives[i];
 }
 
+static void MonitorShow(HWND hWnd)
+{
+    char title[448];
+    if (!hWnd) hWnd = g_hMainWnd;
+    if (!hWnd) return;
+    SetDlgItemTextU8(hWnd, IDC_MONITOR_STATIC, g_szMonitor);
+    if (g_bMonitorAlert && g_szMonitor[0])
+        safe_snprintf(title, "DriveMonitor — %s", g_szMonitor);
+    else
+        lstrcpynA(title, "DriveMonitor", (int)sizeof(title));
+    SetWindowTextU8(hWnd, title);
+    InvalidateRect(GetDlgItem(hWnd, IDC_MONITOR_STATIC), NULL, FALSE);
+}
+
+static void MonitorSetIdle(void)
+{
+    if (g_bMonitorAlert) return;
+    g_bMonitorQuiet = 0;
+    if (g_bMonitorOn)
+        lstrcpynA(g_szMonitor,
+                  TN("Следит · чтение раз в минуту", "Watching · once a minute"),
+                  (int)sizeof(g_szMonitor));
+    else
+        lstrcpynA(g_szMonitor,
+                  TN("Мониторинг выключен", "Monitor is off"),
+                  (int)sizeof(g_szMonitor));
+}
+
+static void MonitorLoad(void)
+{
+    HKEY k;
+    DWORD v = 0, sz = sizeof(v), t = 0;
+    g_bMonitorOn = 0;
+    g_bMonitorAlert = 0;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\chuikoff\\DriveMonitor",
+                      0, KEY_READ, &k) == ERROR_SUCCESS) {
+        if (RegQueryValueExA(k, "Monitor", NULL, &t, (LPBYTE)&v, &sz) == ERROR_SUCCESS &&
+            t == REG_DWORD)
+            g_bMonitorOn = (v != 0);
+        RegCloseKey(k);
+    }
+    MonitorSetIdle();
+}
+
+static void MonitorSave(void)
+{
+    HKEY k;
+    DWORD d = g_bMonitorOn ? 1u : 0u;
+    if (RegCreateKeyExA(HKEY_CURRENT_USER, "Software\\chuikoff\\DriveMonitor",
+                        0, NULL, 0, KEY_WRITE, NULL, &k, NULL) == ERROR_SUCCESS) {
+        RegSetValueExA(k, "Monitor", 0, REG_DWORD, (const BYTE*)&d, sizeof(d));
+        RegCloseKey(k);
+    }
+}
+
+static void MonitorApplyTimer(HWND hWnd)
+{
+    if (!hWnd) return;
+    KillTimer(hWnd, IDT_MONITOR);
+    if (g_bMonitorOn)
+        SetTimer(hWnd, IDT_MONITOR, MONITOR_INTERVAL_MS, NULL);
+}
+
+static void TrayUpdate(HWND hWnd);
+
+static void MonitorToggle(HWND hWnd)
+{
+    g_bMonitorOn = !g_bMonitorOn;
+    MonitorSave();
+    if (g_hViewMenu)
+        CheckMenuItem(g_hViewMenu, IDM_MONITOR,
+                      MF_BYCOMMAND | (g_bMonitorOn ? MF_CHECKED : MF_UNCHECKED));
+    MonitorApplyTimer(hWnd);
+    MonitorSetIdle();
+    MonitorShow(hWnd);
+    /* Icons exist only while monitoring is on. If the window was hidden
+     * in the tray, bring it back when monitoring stops. */
+    if (!g_bMonitorOn && hWnd && !IsWindowVisible(hWnd))
+        ShowWindow(hWnd, SW_SHOW);
+    TrayUpdate(hWnd);
+}
+
+static void MonitorAlert(HWND hWnd)
+{
+    FLASHWINFO fw;
+    if (!g_bMonitorOn || !hWnd) return;
+    MessageBeep(MB_ICONEXCLAMATION);
+    ZeroMemory(&fw, sizeof(fw));
+    fw.cbSize = sizeof(fw);
+    fw.hwnd = hWnd;
+    fw.dwFlags = FLASHW_TRAY | FLASHW_TIMERNOFG;
+    fw.uCount = 4;
+    FlashWindowEx(&fw);
+}
+
+static int HealthRankUi(DRIVE_HEALTH_STATUS e)
+{
+    switch (e) {
+    case HEALTH_STATUS_GOOD:     return 1;
+    case HEALTH_STATUS_OBSERVE:  return 2;
+    case HEALTH_STATUS_CAUTION:  return 3;
+    case HEALTH_STATUS_BAD:      return 4;
+    case HEALTH_STATUS_WARNING:  return 4;
+    case HEALTH_STATUS_CRITICAL: return 5;
+    default:                     return 0;
+    }
+}
+
+static int SerialEq(const char* a, const char* b)
+{
+    char aa[24], bb[24];
+    int i;
+    if (!a || !b || !a[0] || !b[0]) return 0;
+    lstrcpynA(aa, a, (int)sizeof(aa));
+    lstrcpynA(bb, b, (int)sizeof(bb));
+    for (i = lstrlenA(aa); i > 0 && (aa[i - 1] == ' ' || aa[i - 1] == '\t'); i--)
+        aa[i - 1] = '\0';
+    for (i = lstrlenA(bb); i > 0 && (bb[i - 1] == ' ' || bb[i - 1] == '\t'); i--)
+        bb[i - 1] = '\0';
+    if (!aa[0] || !bb[0]) return 0;
+    for (i = 0; aa[i] && bb[i]; i++) {
+        unsigned char ca = (unsigned char)aa[i];
+        unsigned char cb = (unsigned char)bb[i];
+        if (ca >= 'a' && ca <= 'z') ca = (unsigned char)(ca - ('a' - 'A'));
+        if (cb >= 'a' && cb <= 'z') cb = (unsigned char)(cb - ('a' - 'A'));
+        if (ca != cb) return 0;
+    }
+    return aa[i] == '\0' && bb[i] == '\0';
+}
+
+static void ShortModel(const DRIVE_INFO* p, char* dst, int nDst)
+{
+    const char* s;
+    int i, n = 0;
+    if (!dst || nDst <= 0) return;
+    s = (p && p->szModel[0]) ? p->szModel : TN("диск", "drive");
+    for (i = 0; s[i] && n < nDst - 1 && n < 22; i++) {
+        if (s[i] == ' ' && n > 0 && dst[n - 1] == ' ') continue;
+        dst[n++] = s[i];
+    }
+    while (n > 0 && dst[n - 1] == ' ') n--;
+    dst[n] = '\0';
+    if (!dst[0])
+        lstrcpynA(dst, TN("диск", "drive"), nDst);
+}
+
+static void AddBit(char* bits, int nBits, const char* s)
+{
+    int n;
+    if (!bits || nBits <= 0 || !s || !s[0]) return;
+    n = lstrlenA(bits);
+    if (n > 0) {
+        if (n + 2 >= nBits) return;
+        bits[n++] = ',';
+        bits[n++] = ' ';
+        bits[n] = '\0';
+    }
+    if (n >= nBits) return;
+    lstrcpynA(bits + n, s, nBits - n);
+}
+
+static void AddNote(char* buf, int nBuf, const char* s)
+{
+    int n;
+    if (!buf || nBuf <= 0 || !s || !s[0]) return;
+    n = lstrlenA(buf);
+    if (n > 0) {
+        if (n + 2 >= nBuf) return;
+        buf[n++] = ';';
+        buf[n++] = ' ';
+        buf[n] = '\0';
+    }
+    if (n >= nBuf) return;
+    lstrcpynA(buf + n, s, nBuf - n);
+}
+
+static void AddUp(char* bits, int nBits, const char* name, int prev, int now, int* beep)
+{
+    char tmp[48];
+    if (prev < 0 || now < 0 || now <= prev) return;
+    safe_snprintf(tmp, "%s +%d", name, now - prev);
+    AddBit(bits, nBits, tmp);
+    if (beep) *beep = 1;
+}
+
+static int FindPrevIndex(const DRIVE_INFO* now)
+{
+    int i;
+    if (!now) return -1;
+    if (now->szSerial[0]) {
+        for (i = 0; i < g_nPrevCount; i++)
+            if (SerialEq(g_PrevDrives[i].szSerial, now->szSerial))
+                return i;
+        return -1;
+    }
+    for (i = 0; i < g_nPrevCount; i++) {
+        if (g_PrevDrives[i].szSerial[0]) continue;
+        if (g_PrevDrives[i].nDriveIndex == now->nDriveIndex)
+            return i;
+    }
+    return -1;
+}
+
+static void DiffOneDrive(char* buf, int nBuf, const DRIVE_INFO* prev,
+                         const DRIVE_INFO* now, int* beep)
+{
+    char model[24];
+    char bits[240];
+    char line[300];
+    char tmp[96];
+    int rp, rn;
+
+    if (!prev || !now) return;
+    ShortModel(now, model, (int)sizeof(model));
+    bits[0] = '\0';
+
+    AddUp(bits, (int)sizeof(bits), TN("переназначено", "reallocated"),
+          prev->nReallocated, now->nReallocated, beep);
+    AddUp(bits, (int)sizeof(bits), TN("ожидающие", "pending"),
+          prev->nPendingSectors, now->nPendingSectors, beep);
+    AddUp(bits, (int)sizeof(bits), TN("неисправимые", "uncorrectable"),
+          prev->nUncorrectable, now->nUncorrectable, beep);
+    AddUp(bits, (int)sizeof(bits), TN("переназначения", "remap events"),
+          prev->nRemapEvents, now->nRemapEvents, beep);
+    AddUp(bits, (int)sizeof(bits), "CRC",
+          prev->nCrcErrors, now->nCrcErrors, beep);
+
+    if (prev->bIsNVMe && now->bIsNVMe &&
+        now->qwNVMeMediaErrors > prev->qwNVMeMediaErrors) {
+        safe_snprintf(tmp, TN("ошибки носителя +%llu", "media errors +%llu"),
+                      (unsigned long long)(now->qwNVMeMediaErrors - prev->qwNVMeMediaErrors));
+        AddBit(bits, (int)sizeof(bits), tmp);
+        if (beep) *beep = 1;
+    }
+    if (prev->bIsNVMe && now->bIsNVMe &&
+        (now->nvmeHealth.CriticalWarning & (BYTE)~prev->nvmeHealth.CriticalWarning) != 0) {
+        AddBit(bits, (int)sizeof(bits),
+               TN("критическое предупреждение", "critical warning"));
+        if (beep) *beep = 1;
+    }
+    if (prev->bIsNVMe && now->bIsNVMe &&
+        now->nvmeHealth.PercentageUsed > prev->nvmeHealth.PercentageUsed) {
+        safe_snprintf(tmp, TN("износ +%d%%", "wear +%d%%"),
+                      (int)now->nvmeHealth.PercentageUsed - (int)prev->nvmeHealth.PercentageUsed);
+        AddBit(bits, (int)sizeof(bits), tmp);
+    }
+    if (prev->nEndurancePercent >= 0 && now->nEndurancePercent >= 0 &&
+        now->nEndurancePercent < prev->nEndurancePercent) {
+        safe_snprintf(tmp, TN("ресурс %d%%→%d%%", "life %d%%→%d%%"),
+                      prev->nEndurancePercent, now->nEndurancePercent);
+        AddBit(bits, (int)sizeof(bits), tmp);
+    }
+    if (prev->nTemperatureC > 0 && now->nTemperatureC > 0 &&
+        prev->eTempBand != TEMP_BAND_UNKNOWN &&
+        now->eTempBand != TEMP_BAND_UNKNOWN &&
+        prev->eTempBand != now->eTempBand) {
+        safe_snprintf(tmp, TN("температура %d→%d", "temperature %d→%d"),
+                      prev->nTemperatureC, now->nTemperatureC);
+        AddBit(bits, (int)sizeof(bits), tmp);
+        if (beep && (int)now->eTempBand >= (int)TEMP_BAND_HIGH &&
+            (int)now->eTempBand > (int)prev->eTempBand)
+            *beep = 1;
+    }
+
+    rp = HealthRankUi(prev->eHealthStatus);
+    rn = HealthRankUi(now->eHealthStatus);
+    if (rp > 0 && rn > 0 && rp != rn) {
+        safe_snprintf(tmp, TN("оценка %s→%s", "status %s→%s"),
+                      GetHealthStatusName(prev->eHealthStatus),
+                      GetHealthStatusName(now->eHealthStatus));
+        AddBit(bits, (int)sizeof(bits), tmp);
+        if (beep && rn > rp) *beep = 1;
+    }
+
+    if (!bits[0]) return;
+    safe_snprintf(line, "%s: %s", model, bits);
+    AddNote(buf, nBuf, line);
+}
+
 static void Snapshot_Diff(void)
 {
+    char buf[384];
+    int seen[MAX_DRIVES];
+    int i, beep = 0;
 
-    (void)g_nPrevCount;
+    buf[0] = '\0';
+    for (i = 0; i < MAX_DRIVES; i++) seen[i] = 0;
+
+    if (g_nPrevCount <= 0) {
+        g_bMonitorAlert = 0;
+        MonitorSetIdle();
+        MonitorShow(g_hMainWnd);
+        return;
+    }
+
+    for (i = 0; i < g_nDriveCount; i++) {
+        int pi = FindPrevIndex(&g_Drives[i]);
+        char model[24];
+        char line[80];
+        if (pi >= 0) {
+            seen[pi] = 1;
+            DiffOneDrive(buf, (int)sizeof(buf), &g_PrevDrives[pi], &g_Drives[i], &beep);
+        } else {
+            ShortModel(&g_Drives[i], model, (int)sizeof(model));
+            safe_snprintf(line, TN("%s: появился", "%s: appeared"), model);
+            AddNote(buf, (int)sizeof(buf), line);
+        }
+    }
+    for (i = 0; i < g_nPrevCount; i++) {
+        char model[24];
+        char line[80];
+        if (seen[i]) continue;
+        ShortModel(&g_PrevDrives[i], model, (int)sizeof(model));
+        safe_snprintf(line, TN("%s: пропал", "%s: removed"), model);
+        AddNote(buf, (int)sizeof(buf), line);
+        beep = 1;
+    }
+
+    if (!buf[0]) {
+        g_bMonitorAlert = 0;
+        if (g_bMonitorOn) {
+            g_bMonitorQuiet = 1;
+            lstrcpynA(g_szMonitor,
+                      TN("Следит · без изменений", "Watching · no change"),
+                      (int)sizeof(g_szMonitor));
+        } else {
+            MonitorSetIdle();
+        }
+    } else {
+        g_bMonitorAlert = 1;
+        g_bMonitorQuiet = 0;
+        lstrcpynA(g_szMonitor, buf, (int)sizeof(g_szMonitor));
+        if (beep) MonitorAlert(g_hMainWnd);
+    }
+    MonitorShow(g_hMainWnd);
 }
 
 static void DeviceNotify_Register(HWND hWnd)
@@ -1111,6 +1444,265 @@ static void DeviceNotify_Unregister(void)
     if (g_hDevNotify) {
         UnregisterDeviceNotification(g_hDevNotify);
         g_hDevNotify = NULL;
+    }
+}
+
+/* Tray disc: green = normal, orange = hot, red = overheating.
+ * Saturated on purpose. The window palette yellow/orange pair is too close
+ * at tray size, and a mask icon never shows that color in the Win10 tray. */
+static COLORREF TrayTempColor(const DRIVE_INFO* p)
+{
+    if (!p || p->nTemperatureC <= 0)
+        return RGB(90, 98, 110);
+    if (p->eTempBand == TEMP_BAND_CRITICAL)
+        return RGB(220, 32, 32);
+    if (p->eTempBand == TEMP_BAND_HIGH || p->eTempBand == TEMP_BAND_ELEVATED)
+        return RGB(255, 120, 0);
+    if (p->eTempBand == TEMP_BAND_NORMAL)
+        return RGB(16, 170, 64);
+    if (p->nTemperatureC >= 70) return RGB(220, 32, 32);
+    if (p->nTemperatureC >= 50) return RGB(255, 120, 0);
+    return RGB(16, 170, 64);
+}
+
+/* GDI leaves the alpha byte at 0. The tray then keeps the old black mask. */
+static void TrayFixAlpha(DWORD* pix, int n)
+{
+    int i;
+    for (i = 0; i < n; i++) {
+        DWORD c = pix[i];
+        BYTE b = (BYTE)(c & 0xFFu);
+        BYTE g = (BYTE)((c >> 8) & 0xFFu);
+        BYTE r = (BYTE)((c >> 16) & 0xFFu);
+        if (r < 12 && g < 12 && b < 12)
+            pix[i] = 0;
+        else
+            pix[i] = 0xFF000000u | ((DWORD)r << 16) | ((DWORD)g << 8) | (DWORD)b;
+    }
+}
+
+static HICON TrayMakeIcon(const DRIVE_INFO* p)
+{
+    int cx = GetSystemMetrics(SM_CXSMICON);
+    int cy = GetSystemMetrics(SM_CYSMICON);
+    BITMAPINFO bi;
+    DWORD* pix = NULL;
+    HDC hdcScreen, hdc = NULL;
+    HBITMAP dib = NULL, oldBm = NULL, hbmMask = NULL;
+    HICON hIcon = NULL;
+    ICONINFO ii;
+    WCHAR wz[8];
+    int t, px, digits;
+    RECT rc;
+    COLORREF bg;
+
+    if (cx < 32) cx = 32;
+    if (cy < 32) cy = 32;
+    if (cx > 64) cx = 64;
+    if (cy > 64) cy = 64;
+
+    t = (p && p->nTemperatureC > 0) ? p->nTemperatureC : -1;
+    if (t < 0)
+        lstrcpynW(wz, L"--", 8);
+    else if (t > 999)
+        lstrcpynW(wz, L"999", 8);
+    else
+        wsprintfW(wz, L"%d", t);
+    digits = lstrlenW(wz);
+    bg = TrayTempColor(p);
+
+    ZeroMemory(&bi, sizeof(bi));
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = cx;
+    bi.bmiHeader.biHeight = -cy;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+
+    hdcScreen = GetDC(NULL);
+    if (!hdcScreen) return NULL;
+    hdc = CreateCompatibleDC(hdcScreen);
+    dib = CreateDIBSection(hdcScreen, &bi, DIB_RGB_COLORS, (void**)&pix, NULL, 0);
+    ReleaseDC(NULL, hdcScreen);
+    if (!hdc || !dib || !pix) {
+        if (dib) DeleteObject(dib);
+        if (hdc) DeleteDC(hdc);
+        return NULL;
+    }
+
+    oldBm = (HBITMAP)SelectObject(hdc, dib);
+    {
+        HBRUSH br = CreateSolidBrush(bg);
+        HPEN pen = CreatePen(PS_SOLID, 1, bg);
+        HGDIOBJ oldBr = SelectObject(hdc, br);
+        HGDIOBJ oldPen = SelectObject(hdc, pen);
+        Ellipse(hdc, 0, 0, cx, cy);
+        SelectObject(hdc, oldBr);
+        SelectObject(hdc, oldPen);
+        DeleteObject(br);
+        DeleteObject(pen);
+    }
+
+    px = (digits >= 3) ? (cy * 2 / 5) : (cy * 11 / 20);
+    if (px < 10) px = 10;
+    {
+        HFONT font = CreateFontW(-px, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                                 DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                 NONANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+                                 L"Segoe UI");
+        HFONT oldFont = (HFONT)SelectObject(hdc, font);
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, RGB(255, 255, 255));
+        rc.left = 0;
+        rc.top = 0;
+        rc.right = cx;
+        rc.bottom = cy;
+        DrawTextW(hdc, wz, -1, &rc,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(hdc, oldFont);
+        DeleteObject(font);
+    }
+    SelectObject(hdc, oldBm);
+    DeleteDC(hdc);
+    hdc = NULL;
+
+    TrayFixAlpha(pix, cx * cy);
+
+    hbmMask = CreateBitmap(cx, cy, 1, 1, NULL);
+    if (hbmMask) {
+        HDC hdcMask = CreateCompatibleDC(NULL);
+        if (hdcMask) {
+            HGDIOBJ old = SelectObject(hdcMask, hbmMask);
+            PatBlt(hdcMask, 0, 0, cx, cy, BLACKNESS);
+            SelectObject(hdcMask, old);
+            DeleteDC(hdcMask);
+        }
+    }
+
+    ZeroMemory(&ii, sizeof(ii));
+    ii.fIcon = TRUE;
+    ii.hbmMask = hbmMask;
+    ii.hbmColor = dib;
+    hIcon = CreateIconIndirect(&ii);
+    if (hbmMask) DeleteObject(hbmMask);
+    DeleteObject(dib);
+    return hIcon;
+}
+
+static BOOL TraySet(HWND hWnd, int index, BOOL add)
+{
+    NOTIFYICONDATAW nid;
+    HICON hIcon;
+    char tip[160];
+    const DRIVE_INFO* p;
+    BOOL ok;
+    const char* model;
+
+    if (!hWnd || index < 0 || index >= g_nDriveCount) return FALSE;
+    p = &g_Drives[index];
+    hIcon = TrayMakeIcon(p);
+    if (!hIcon) return FALSE;
+
+    model = p->szModel[0] ? p->szModel : TN("диск", "drive");
+    if (p->nTemperatureC > 0)
+        safe_snprintf(tip, "%s · %d \xC2\xB0""C", model, p->nTemperatureC);
+    else
+        safe_snprintf(tip, "%s · %s", model,
+                      TN("нет температуры", "no temperature"));
+
+    ZeroMemory(&nid, sizeof(nid));
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = hWnd;
+    nid.uID = (UINT)(index + 1);
+    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    nid.uCallbackMessage = WM_TRAYICON;
+    nid.hIcon = hIcon;
+    U8ToW(tip, nid.szTip, (int)(sizeof(nid.szTip) / sizeof(nid.szTip[0])));
+    ok = Shell_NotifyIconW(add ? NIM_ADD : NIM_MODIFY, &nid);
+    if (!ok && !add)
+        ok = Shell_NotifyIconW(NIM_ADD, &nid);
+    DestroyIcon(hIcon);
+    return ok;
+}
+
+static void TrayRemoveFrom(HWND hWnd, int first)
+{
+    int i;
+    if (first < 0) first = 0;
+    for (i = first; i < g_nTrayIcons && i < MAX_DRIVES; i++) {
+        NOTIFYICONDATAW nid;
+        ZeroMemory(&nid, sizeof(nid));
+        nid.cbSize = sizeof(nid);
+        nid.hWnd = hWnd;
+        nid.uID = (UINT)(i + 1);
+        Shell_NotifyIconW(NIM_DELETE, &nid);
+    }
+    if (first < g_nTrayIcons)
+        g_nTrayIcons = first;
+}
+
+static void TrayUpdate(HWND hWnd)
+{
+    int i, n;
+    if (!hWnd) return;
+    if (!g_bMonitorOn) {
+        TrayRemoveFrom(hWnd, 0);
+        return;
+    }
+    n = g_nDriveCount;
+    if (n < 0) n = 0;
+    if (n > MAX_DRIVES) n = MAX_DRIVES;
+    /* Delete and add again. NIM_MODIFY keeps the previous mask icon. */
+    TrayRemoveFrom(hWnd, 0);
+    for (i = 0; i < n; i++)
+        TraySet(hWnd, i, TRUE);
+    g_nTrayIcons = n;
+}
+
+static void TrayOpenDrive(HWND hWnd, int index)
+{
+    int i;
+    if (IsIconic(hWnd))
+        ShowWindow(hWnd, SW_RESTORE);
+    else
+        ShowWindow(hWnd, SW_SHOW);
+    SetForegroundWindow(hWnd);
+    if (index < 0 || index >= g_nDriveCount) return;
+    g_nSelectedDrive = index;
+    for (i = 0; i < g_nDriveCount; i++)
+        if (g_hDriveBtn[i]) InvalidateRect(g_hDriveBtn[i], NULL, TRUE);
+    UpdateDriveInfo(hWnd, index);
+    UpdateAttrList(hWnd, index);
+    RepaintHealthBar();
+    InvalidateRect(hWnd, NULL, FALSE);
+}
+
+static void TrayOnClick(HWND hWnd, int index, UINT mouseMsg)
+{
+    if (mouseMsg == WM_LBUTTONUP || mouseMsg == WM_LBUTTONDBLCLK ||
+        mouseMsg == NIN_SELECT) {
+        TrayOpenDrive(hWnd, index);
+        return;
+    }
+    if (mouseMsg != WM_RBUTTONUP && mouseMsg != WM_CONTEXTMENU)
+        return;
+    {
+        HMENU menu = CreatePopupMenu();
+        POINT pt;
+        int cmd;
+        if (!menu) return;
+        AppendMenuU8(menu, MF_STRING, 1, TN("Открыть", "Open"));
+        AppendMenuU8(menu, MF_STRING, 2, Tr(STR_EXIT));
+        GetCursorPos(&pt);
+        SetForegroundWindow(hWnd);
+        cmd = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+                             pt.x, pt.y, 0, hWnd, NULL);
+        DestroyMenu(menu);
+        PostMessage(hWnd, WM_NULL, 0, 0);
+        if (cmd == 1)
+            TrayOpenDrive(hWnd, index);
+        else if (cmd == 2)
+            DestroyWindow(hWnd);
     }
 }
 
@@ -1745,8 +2337,13 @@ void UpdateDriveInfo(HWND hWnd, int nDriveIdx)
                                 "There are risk factors. Click the status for details.");
                 break;
             case HEALTH_STATUS_CAUTION:
-                szPred = TN("Есть признаки деградации. Нажмите на состояние.",
-                            "There are signs of degradation. Click the status for details.");
+                if (pInfo->eType == DRIVE_TYPE_HDD && !pInfo->bIsNVMe) {
+                    FormatHddCautionPrompt(pInfo, szObs, (int)sizeof(szObs));
+                    szPred = szObs;
+                } else {
+                    FormatSsdCautionPrompt(pInfo, szObs, (int)sizeof(szObs));
+                    szPred = szObs;
+                }
                 break;
             case HEALTH_STATUS_BAD:
             case HEALTH_STATUS_WARNING:
@@ -1887,6 +2484,7 @@ enum {
     ATTRST_DIM,
     ATTRST_SKIP,
     ATTRST_INFO,
+    ATTRST_POWERLOG,
     ATTRST_RISK,
     ATTRST_PAST
 };
@@ -1909,9 +2507,11 @@ static LPARAM AttrStatusParam(const char* s)
         return (LPARAM)ATTRST_DIM;
     if (strcmp(s, "Не оценивается") == 0)
         return (LPARAM)ATTRST_SKIP;
+    /* Power-log is not «контекст». Same blue badge, different label. */
+    if (strcmp(s, "журнал питания") == 0 || strcmp(s, "power log") == 0)
+        return (LPARAM)ATTRST_POWERLOG;
     if (strcmp(s, "INFO") == 0 || strcmp(s, "контекст") == 0 ||
-        strcmp(s, "журнал питания") == 0 ||
-        strcmp(s, "context") == 0 || strcmp(s, "power log") == 0)
+        strcmp(s, "context") == 0)
         return (LPARAM)ATTRST_INFO;
     if (strcmp(s, "OK") == 0)
         return (LPARAM)ATTRST_OK;
@@ -1934,17 +2534,12 @@ static LPARAM AttrStatusParam(const char* s)
     return (LPARAM)ATTRST_NONE;
 }
 
-static BOOL IsAtaSsdType(DRIVE_TYPE t)
-{
-    return t == DRIVE_TYPE_SSD_SATA || t == DRIVE_TYPE_M2_SATA;
-}
-
 static BOOL VendorUsesE7AsLife(DRIVE_CONTROLLER c, DRIVE_TYPE t)
 {
     (void)t;
-    /* Only Phison is known-sure: E7 is SSD life, not temperature.
-     * SMI is left alone — E7 meaning varies by SM225/SM226 firmware. */
-    return c == CONTROLLER_PHISON;
+    /* Phison E7 is SSD life, not temperature. Samsung 231 is SSD Life Left
+     * once the controller is identified. SMI E7 varies by firmware. */
+    return c == CONTROLLER_PHISON || c == CONTROLLER_SAMSUNG;
 }
 
 static void FormatSmartValue(BYTE bID, BYTE* pRaw,
@@ -2031,18 +2626,6 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
                 safe_snprintf(szMain, TN("%d%% остаток ресурса", "%d%% life remaining"), nLife);
             else
                 safe_snprintf(szMain, "%lu", (unsigned long)dw32);
-            break;
-        }
-        if (eCtl == CONTROLLER_UNKNOWN &&
-            IsAtaSsdType(eType)) {
-            if (nLife >= 0 && nLife <= 100)
-                safe_snprintf(szMain, TN("%d%% остаток ресурса", "%d%% life remaining"), nLife);
-            else if (bVal > 0 && bVal <= 100) {
-                int nF = (int)bVal * 9 / 5 + 32;
-                safe_snprintf(szMain, "%d \xC2\xB0""C (%d \xC2\xB0""F)", (int)bVal, nF);
-            } else {
-                safe_snprintf(szMain, "%lu", (unsigned long)dw32);
-            }
             break;
         }
         if (bVal > 0 && bVal <= 100) {
@@ -2289,17 +2872,20 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
         }
         {
             unsigned __int64 nLBA = qw48;
-            unsigned __int64 nGB  = nLBA / (1024ULL * 1024ULL * 2ULL);
-            if (nGB >= 1024)
-                safe_snprintf(szMain, "%llu LBA  (~%llu TB)",
+            unsigned __int64 nBytes = nLBA * 512ULL;
+            if (nBytes >= 1000000000000ULL) {
+                unsigned long long tenths =
+                    (unsigned long long)(nBytes / 100000000000ULL);
+                safe_snprintf(szMain, "%llu LBA  (~%llu.%llu TB)",
                               (unsigned long long)nLBA,
-                              (unsigned long long)(nGB / 1024ULL));
-            else if (nGB > 0)
+                              tenths / 10ULL, tenths % 10ULL);
+            } else if (nBytes >= 1000000000ULL) {
                 safe_snprintf(szMain, "%llu LBA  (~%llu GB)",
                               (unsigned long long)nLBA,
-                              (unsigned long long)nGB);
-            else
+                              (unsigned long long)(nBytes / 1000000000ULL));
+            } else {
                 safe_snprintf(szMain, "%llu LBA", (unsigned long long)nLBA);
+            }
         }
         break;
     }
@@ -2330,17 +2916,25 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
 
     case 0xA9:
     {
-        if (dw32 >= 1 && dw32 <= 100)
-            safe_snprintf(szMain, TN("%lu%%  заявленный остаток ресурса",
-                                     "%lu%% reported life remaining"),
-                          (unsigned long)dw32);
-        else if (dw32 == 0 && bVal >= 90)
-            safe_snprintf(szMain, "%s", TN("не задан (dummy Value)", "not set (dummy Value)"));
-        else if (dw32 == 0)
-            safe_snprintf(szMain, TN("0%%  заявленный остаток ресурса",
-                                     "0%% reported life remaining"));
-        else
+        /* A9 is life remaining only on Phison. Elsewhere it is just RAW. */
+        if (pDrv && IsPhisonFamily(pDrv)) {
+            /* Summary picked another counter (E7). Do not also call this RAW life. */
+            if (dw32 >= 1 && dw32 <= 100 &&
+                !(pDrv->nEndurancePercent >= 0 &&
+                  (int)dw32 != pDrv->nEndurancePercent))
+                safe_snprintf(szMain, TN("%lu%%  заявленный остаток ресурса",
+                                         "%lu%% reported life remaining"),
+                              (unsigned long)dw32);
+            else if (dw32 == 0 && bVal >= 90)
+                safe_snprintf(szMain, "%s", TN("не задан (dummy Value)", "not set (dummy Value)"));
+            else if (dw32 == 0)
+                safe_snprintf(szMain, TN("0%%  заявленный остаток ресурса",
+                                         "0%% reported life remaining"));
+            else
+                safe_snprintf(szMain, "%lu", (unsigned long)dw32);
+        } else {
             safe_snprintf(szMain, "%lu", (unsigned long)dw32);
+        }
         break;
     }
 
@@ -2489,6 +3083,10 @@ static const char* AtaRowStatus(const DRIVE_INFO* p, const SMART_ATTRIBUTE* a,
 
     if (ssd && (id == 0xE7 || id == 0xA9)) {
         int nLeft = p->nEndurancePercent;
+        BOOL lifeId = (id == 0xA9 && IsPhisonFamily(p)) ||
+                      (id == 0xE7 && (IsPhisonFamily(p) ||
+                                      p->eController == CONTROLLER_SAMSUNG));
+        if (!lifeId || nLeft < 0) return "Не оценивается";
         if (nLeft >= 0 && nLeft <= 5) return "ПЛОХО";
         if (nLeft >= 0 && nLeft <= 10) return "Внимание";
         if (nLeft >= 0 && nLeft <= 20) return "Риск";
@@ -2767,8 +3365,11 @@ void UpdateAttrList(HWND hWnd, int nDriveIdx)
             (qwMediaErr>0?"ПЛОХО":"ОК"));
 
         safe_snprintf(szEL,"%llu",(unsigned long long)qwErrLog);
+        /* Samsung 960 EVO and others count aborts and internal events
+         * here. Media errors are the fault counter. A non-zero log
+         * is not a warning. */
         NVME_ROW("0Fh", TN("Записи в журнале ошибок", "Error log entries"), szEL,
-            (qwErrLog>0?"Внимание":"ОК"));
+            (qwErrLog>0?"Не оценивается":"ОК"));
 
         safe_snprintf(szWCT,"%lu мин",(unsigned long)pLog->WarningCompTempTime);
         NVME_ROW("--", TN("Время при высокой температуре", "Time above warning temp"),
@@ -3421,6 +4022,10 @@ static void CreateMenuBar(HWND hWnd)
     AppendMenuU8(hMenuBar, MF_POPUP, (UINT_PTR)hFile, Tr(STR_FILE));
 
     g_hViewMenu = CreatePopupMenu();
+    AppendMenuU8(g_hViewMenu,
+                 MF_STRING | (g_bMonitorOn ? MF_CHECKED : MF_UNCHECKED),
+                 IDM_MONITOR, TN("Мониторинг\tCtrl+M", "Monitor\tCtrl+M"));
+    AppendMenuU8(g_hViewMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuU8(g_hViewMenu, MF_STRING, IDM_ZOOM_IN,  Tr(STR_ZOOM_IN));
     AppendMenuU8(g_hViewMenu, MF_STRING, IDM_ZOOM_OUT, Tr(STR_ZOOM_OUT));
     AppendMenuU8(g_hViewMenu, MF_SEPARATOR, 0, NULL);
@@ -3516,10 +4121,20 @@ static void ApplyUiLanguage(HWND hWnd)
         SendMessageW(hList, LVM_SETCOLUMNW, 6, (LPARAM)&col);
     }
     DrawMenuBar(hWnd);
+    if (!g_bMonitorAlert) {
+        if (g_bMonitorOn && g_bMonitorQuiet)
+            lstrcpynA(g_szMonitor,
+                      TN("Следит · без изменений", "Watching · no change"),
+                      (int)sizeof(g_szMonitor));
+        else
+            MonitorSetIdle();
+    }
+    MonitorShow(hWnd);
     if (g_nDriveCount > 0)
         UpdateDriveInfo(hWnd, g_nSelectedDrive);
     UpdateAttrList(hWnd, g_nSelectedDrive);
     UpdateDriveButtons(hWnd);
+    TrayUpdate(hWnd);
     InvalidateRect(hWnd, NULL, TRUE);
 }
 
@@ -3639,10 +4254,18 @@ void CreateControls(HWND hWnd)
 
     SendMessage(hPred, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
 
+    {
+        HWND hMon = CreateWindowExU8(0, "STATIC", "",
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS | SS_NOPREFIX,
+            nRightX, 276, 430, 18,
+            hWnd, (HMENU)IDC_MONITOR_STATIC, g_hInst, NULL);
+        SendMessage(hMon, WM_SETFONT, (WPARAM)g_hFontSmall, TRUE);
+    }
+
     HWND hList = CreateWindowExU8(
         WS_EX_CLIENTEDGE, "SysListView32", "",
         WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER,
-        nRightX, 283, 540, 590,
+        nRightX, 298, 540, 575,
         hWnd, (HMENU)IDC_ATTR_LIST, g_hInst, NULL
     );
     SendMessage(hList, WM_SETFONT, (WPARAM)g_hFontSmall, TRUE);
@@ -3762,6 +4385,16 @@ static LRESULT HandleCtlColor(HWND hWnd, WPARAM wParam)
             SetBkColor(hdc, CLR_BG);
             return (LRESULT)g_hbrBG;
         }
+        if (id == IDC_MONITOR_STATIC) {
+            COLORREF clr = CLR_TEXT_DIM;
+            if (g_bMonitorAlert)
+                clr = CLR_ORANGE;
+            else if (g_bMonitorOn)
+                clr = CLR_GREEN;
+            SetTextColor(hdc, clr);
+            SetBkColor(hdc, CLR_BG);
+            return (LRESULT)g_hbrBG;
+        }
     }
     SetTextColor(hdc, CLR_TEXT);
     SetBkColor(hdc, CLR_BG);
@@ -3851,10 +4484,15 @@ static void LayoutMainWindow(HWND hWnd)
     hPred = GetDlgItem(hWnd, IDC_PREDICT_STATIC);
     if (hPred) SetWindowPos(hPred, NULL, nRightX, UiScale(258),
                             cxClient - nRightX - UiScale(8), UiScale(17), SWP_NOZORDER);
+    {
+        HWND hMon = GetDlgItem(hWnd, IDC_MONITOR_STATIC);
+        if (hMon) SetWindowPos(hMon, NULL, nRightX, UiScale(276),
+                               cxClient - nRightX - UiScale(8), UiScale(18), SWP_NOZORDER);
+    }
 
     hList = GetDlgItem(hWnd, IDC_ATTR_LIST);
     if (hList) {
-        int nListTop = UiScale(283);
+        int nListTop = UiScale(298);
         int nListH   = cyClient - nListTop - UiScale(8);
         int nListW   = cxClient - nRightX - UiScale(8);
         int nRaw;
@@ -3886,13 +4524,14 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         }
         RegisterHealthBarClass(g_hInst);
         CreateGDIObjects();
+        MonitorLoad();
         CreateMenuBar(hWnd);
         CreateControls(hWnd);
-        /* No tray: close exits, no background monitoring. */
+        /* Tray icons show each disk temperature. With monitoring on, minimize
+         * hides the window and the timer keeps running. Close still exits. */
         DeviceNotify_Register(hWnd);
-        /* SMART is read once at create and on hotplug — no periodic refresh. */
-
-        UpdateWindowTitle(hWnd);
+        MonitorApplyTimer(hWnd);
+        MonitorShow(hWnd);
         RefreshData(hWnd);
         {
             GdiplusStartupInput gdipInput;
@@ -4026,6 +4665,10 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                             clrBadgeBg = RGB(71, 99, 128);
                             psz = Tr(STR_ST_INFO);
                             break;
+                        case ATTRST_POWERLOG:
+                            clrBadgeBg = RGB(71, 99, 128);
+                            psz = Tr(STR_ST_POWERLOG);
+                            break;
                         default:
                             return CDRF_DODEFAULT;
                         }
@@ -4037,7 +4680,7 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
                         HFONT hOldFont = (HFONT)SelectObject(hdc, g_hFontSmall);
                         WCHAR wz[40];
-                        if (nSt == ATTRST_INFO) {
+                        if (nSt == ATTRST_INFO || nSt == ATTRST_POWERLOG) {
                             LVITEMW li;
                             ZeroMemory(&li, sizeof(li));
                             li.mask = LVIF_TEXT;
@@ -4047,7 +4690,7 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                             li.cchTextMax = 40;
                             if (!SendMessageW(pCD->nmcd.hdr.hwndFrom, LVM_GETITEMW,
                                               0, (LPARAM)&li) || !wz[0])
-                                U8ToW(Tr(STR_ST_INFO), wz, 40);
+                                U8ToW(psz, wz, 40);
                         } else {
                             U8ToW(psz, wz, 40);
                         }
@@ -4076,8 +4719,14 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
                         SetBkMode(hdc, TRANSPARENT);
                         SetTextColor(hdc, RGB(255, 255, 255));
-                        DrawTextU8(hdc, psz, &rcBadge,
-                                   DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                        /* INFO and power-log share a color but not a label.
+                         * Paint the list text: psz for INFO is always «контекст». */
+                        if (nSt == ATTRST_INFO || nSt == ATTRST_POWERLOG)
+                            DrawTextW(hdc, wz, -1, &rcBadge,
+                                      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                        else
+                            DrawTextU8(hdc, psz, &rcBadge,
+                                       DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 
                         SelectObject(hdc, hOldFont);
                         return CDRF_SKIPDEFAULT;
@@ -4172,6 +4821,9 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                 UiSetLang(UI_LANG_EN);
                 ApplyUiLanguage(hWnd);
             }
+            else if (nCtrl == IDM_MONITOR) {
+                MonitorToggle(hWnd);
+            }
         }
         return 0;
 
@@ -4206,13 +4858,28 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
             InvalidateRect(hWnd, NULL, FALSE);
             UpdateWindow(hWnd);
+            TrayUpdate(hWnd);
         }
         return 0;
+
+    case WM_TRAYICON:
+        TrayOnClick(hWnd, (int)wParam - 1, (UINT)lParam);
+        return 0;
+
+    case WM_SYSCOMMAND:
+        /* Minimize goes to the tray only while monitoring is on. */
+        if (g_bMonitorOn && (wParam & 0xFFF0) == SC_MINIMIZE) {
+            ShowWindow(hWnd, SW_HIDE);
+            return 0;
+        }
+        break;
 
     case WM_TIMER:
         if (wParam == IDT_HOTPLUG) {
             KillTimer(hWnd, IDT_HOTPLUG);
             RefreshData(hWnd);    /* one-shot full scan on plug/unplug */
+        } else if (wParam == IDT_MONITOR) {
+            RefreshData(hWnd);    /* skipped while a scan is already running */
         }
         return 0;
 
@@ -4226,6 +4893,7 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
     case WM_DPICHANGED:
         UiOnDpiChanged(hWnd, (UINT)HIWORD(wParam), (const RECT*)lParam);
+        TrayUpdate(hWnd);
         return 0;
 
     case WM_SIZE:
@@ -4236,6 +4904,8 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
     case WM_DESTROY:
         UiSaveWindowPlace(hWnd);
         KillTimer(hWnd, IDT_HOTPLUG);
+        KillTimer(hWnd, IDT_MONITOR);
+        TrayRemoveFrom(hWnd, 0);
         DeviceNotify_Unregister();
         DestroyGDIObjects();
         if (g_gdiplusToken) { GdiplusShutdown(g_gdiplusToken); g_gdiplusToken = 0; }

@@ -8,9 +8,9 @@
 
 Русский и английский просмотрщик S.M.A.R.T. для Windows. Язык: меню **Язык** (запоминается).
 
-**Текущий выпуск:** [1.7.6](https://github.com/chuikoff/DriveMonitor/releases/tag/1.7.6) (сборка 6) — скачать `DriveMonitor.exe`, запустить от администратора.
+**Текущий выпуск:** [1.7.23](https://github.com/chuikoff/DriveMonitor/releases/tag/1.7.23) (сборка 23) — скачать `DriveMonitor.exe`, запустить от администратора.
 
-Windows 10 / 11. Один снимок SMART (старт, hotplug, «Перечитать»), без трея, графика и теста поверхности. Интерфейс следует DPI монитора; масштаб 100–200% в меню «Вид» (Ctrl+±, Ctrl+0, Ctrl+колёсико).
+Windows 10 / 11. Снимок SMART на старте, при hotplug и по «Перечитать». «Вид → Мониторинг» (Ctrl+M) раз в минуту перечитывает диски; по умолчанию выключен. Пока мониторинг включён, в трее по иконке на диск с температурой, а кнопка «Свернуть» убирает окно в трей и чтение продолжается. Без мониторинга иконок в трее нет. Закрытие окна завершает программу. Без графика и теста поверхности. Интерфейс следует DPI монитора; масштаб 100–200% в меню «Вид» (Ctrl+±, Ctrl+0, Ctrl+колёсико).
 
 ### Что внутри
 
@@ -64,9 +64,9 @@ MIT. Copyright: Ari Sohandri Putra / ARImetic Inc. Изменения: [chuikoff
 
 A one-shot Windows S.M.A.R.T. viewer with Russian and English UI. Language: **Language** menu (persisted).
 
-**Current release:** [1.7.6](https://github.com/chuikoff/DriveMonitor/releases/tag/1.7.6) (build 6) — download `DriveMonitor.exe` and run it as Administrator.
+**Current release:** [1.7.23](https://github.com/chuikoff/DriveMonitor/releases/tag/1.7.23) (build 23) — download `DriveMonitor.exe` and run it as Administrator.
 
-Windows 10 / 11. One SMART snapshot (startup, hotplug, Reread). No tray, no live polling, no Health% formula. The UI follows monitor DPI; zoom 100–200% is under **View** (Ctrl+±, Ctrl+0, Ctrl+wheel).
+Windows 10 / 11. One SMART snapshot at startup, on hotplug, and on Reread. **View → Monitor** (Ctrl+M) rereads once a minute; it is off by default. While monitoring is on, the tray shows one icon per disk with its temperature, and Minimize hides the window there while reading continues. With monitoring off there are no tray icons. Closing the window exits. No Health% formula. The UI follows monitor DPI; zoom 100–200% is under **View** (Ctrl+±, Ctrl+0, Ctrl+wheel).
 
 ### What it does
 

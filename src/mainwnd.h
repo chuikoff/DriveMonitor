@@ -34,6 +34,7 @@
 #define IDC_REREAD_BTN         1026
 #define IDC_REPORT_BTN         1035
 #define IDC_EJECT_BTN          1039
+#define IDC_MONITOR_STATIC   1048
 #define IDC_DRIVE_BTN_BASE   1100
 #define IDM_ABOUT            2001
 #define IDM_EXIT             2002
@@ -50,8 +51,11 @@
 #define IDM_ZOOM_200         2016
 #define IDM_LANG_RU          2020
 #define IDM_LANG_EN          2021
+#define IDM_MONITOR          2022
 #define IDT_HOTPLUG          3002
+#define IDT_MONITOR          3003
 #define WM_APP_REFRESH_DONE  (WM_APP + 1)
+#define WM_TRAYICON          (WM_APP + 2)
 #define DRIVE_BTN_H    56
 #define DRIVE_BTN_GAP   6
 #define DRIVE_BTN_PANEL_W 200

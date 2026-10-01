@@ -650,7 +650,91 @@ void FormatHddObservePrompt(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen)
         "There are risk factors. Click the status for details."));
 }
 
-/* HDD: channels are displayed separately. Overall = ATA-3 prefail/media/self-test. */
+void FormatHddCautionPrompt(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen)
+{
+    int cau;
+    if (!szBuf || nBufLen <= 0) return;
+    szBuf[0] = '\0';
+    if (!pInfo) return;
+    cau = HealthRank(HEALTH_STATUS_CAUTION);
+    /* Media already explains a CAUTION/BAD headline. */
+    if (HealthRank(pInfo->eReliability) >= cau) {
+        safe_snprintf_n(szBuf, nBufLen, "%s", TN(
+            "Есть признаки деградации носителя. Нажмите на состояние.",
+            "There are signs of media degradation. Click the status for details."));
+        return;
+    }
+    if (HealthRank(pInfo->eInterface) >= cau) {
+        safe_snprintf_n(szBuf, nBufLen, "%s", TN(
+            "Проблема интерфейса: CRC, таймауты или повторы раскрутки. Носитель в норме — кабель, контакт или питание.",
+            "Interface problem: CRC, timeouts, or spin retries. The media is fine — cable, contact, or power."));
+        return;
+    }
+    if (HealthRank(pInfo->eTempStatus) >= cau) {
+        safe_snprintf_n(szBuf, nBufLen, "%s", TN(
+            "Диск перегрет. Носитель в норме — охладить, это не приговор пластинам.",
+            "The drive is too hot. The media is fine — cool it; this is not a platter failure."));
+        return;
+    }
+    if (HealthRank(pInfo->eMechanics) >= cau) {
+        safe_snprintf_n(szBuf, nBufLen, "%s", TN(
+            "Механика требует внимания. Плохих секторов нет — это не смерть диска.",
+            "Mechanics need attention. There are no bad sectors — the drive is not dying."));
+        return;
+    }
+    safe_snprintf_n(szBuf, nBufLen, "%s", TN(
+        "Есть признаки, требующие наблюдения. Нажмите на состояние.",
+        "There are signs that need watching. Click the status for details."));
+}
+
+void FormatSsdCautionPrompt(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen)
+{
+    int cau;
+    if (!szBuf || nBufLen <= 0) return;
+    szBuf[0] = '\0';
+    if (!pInfo) return;
+    cau = HealthRank(HEALTH_STATUS_CAUTION);
+    if (HealthRank(pInfo->eReliability) >= cau) {
+        safe_snprintf_n(szBuf, nBufLen, "%s", TN(
+            "Есть признаки деградации носителя. Нажмите на состояние.",
+            "There are signs of media degradation. Click the status for details."));
+        return;
+    }
+    if (!pInfo->bIsNVMe && HealthRank(pInfo->eInterface) >= cau) {
+        safe_snprintf_n(szBuf, nBufLen, "%s", TN(
+            "Проблема интерфейса: CRC или таймауты. NAND в норме — кабель, контакт или питание.",
+            "Interface problem: CRC or timeouts. The NAND is fine — cable, contact, or power."));
+        return;
+    }
+    if (HealthRank(pInfo->eTempStatus) >= cau) {
+        safe_snprintf_n(szBuf, nBufLen, "%s", TN(
+            "Диск перегрет. NAND в норме — охладить, это не износ флеша.",
+            "The drive is too hot. The NAND is fine — cool it; this is not flash wear."));
+        return;
+    }
+    if (HealthRank(pInfo->eWear) >= cau) {
+        safe_snprintf_n(szBuf, nBufLen, "%s", TN(
+            "Запас ресурса NAND на исходе. Ошибок носителя при этом нет.",
+            "NAND endurance is nearly used up. There are no media errors."));
+        return;
+    }
+    safe_snprintf_n(szBuf, nBufLen, "%s", TN(
+        "Есть признаки, требующие наблюдения. Нажмите на состояние.",
+        "There are signs that need watching. Click the status for details."));
+}
+
+/* A side axis may raise the HDD headline at most to CAUTION.
+ * OBSERVE (a G-Sense count on a clean surface, a warm drive) stays
+ * on its own row. BAD on CRC or temperature does not become "drive dying". */
+static DRIVE_HEALTH_STATUS SideRaisesHeadline(DRIVE_HEALTH_STATUS e)
+{
+    if (HealthRank(e) >= HealthRank(HEALTH_STATUS_CAUTION))
+        return HEALTH_STATUS_CAUTION;
+    return HEALTH_STATUS_GOOD;
+}
+
+/* HDD: media sets the headline as-is. Mechanics from CAUTION up, and
+ * interface/temperature, can raise it only to CAUTION. */
 static void AssessHddHealth(DRIVE_INFO* pInfo)
 {
     BOOL bMediaHurt, bMediaClean;
@@ -780,8 +864,14 @@ static void AssessHddHealth(DRIVE_INFO* pInfo)
     else
         pInfo->eMechanics = HEALTH_STATUS_UNKNOWN;
 
-    /* Overall = reliability only. Mechanics / CRC / temp stay in their rows. */
+    /* Media as-is. Side axes raise the headline at most to CAUTION. */
     pInfo->eHealthStatus = pInfo->eReliability;
+    pInfo->eHealthStatus = WorstHealth(pInfo->eHealthStatus,
+                                       SideRaisesHeadline(pInfo->eMechanics));
+    pInfo->eHealthStatus = WorstHealth(pInfo->eHealthStatus,
+                                       SideRaisesHeadline(pInfo->eInterface));
+    pInfo->eHealthStatus = WorstHealth(pInfo->eHealthStatus,
+                                       SideRaisesHeadline(pInfo->eTempStatus));
     }
 
     if (SelfTestFailed(pInfo))
@@ -873,15 +963,16 @@ static void AssessSsdHealth(DRIVE_INFO* pInfo)
 
     pInfo->eMechanics = HEALTH_STATUS_UNKNOWN;
 
+    /* Media as-is. Wear, temperature, and (SATA only) interface raise the
+     * headline at most to CAUTION. OBSERVE wear (11–20% left) stays on its axis. */
     pInfo->eHealthStatus = pInfo->eReliability;
-    /* Wear is not health. Only remaining ≤5% (NAND nearly exhausted) may
-     * raise overall, and never above CAUTION. */
-    if (pInfo->nEndurancePercent >= 0 && pInfo->nEndurancePercent <= 5)
+    pInfo->eHealthStatus = WorstHealth(pInfo->eHealthStatus,
+                                       SideRaisesHeadline(pInfo->eWear));
+    pInfo->eHealthStatus = WorstHealth(pInfo->eHealthStatus,
+                                       SideRaisesHeadline(pInfo->eTempStatus));
+    if (!pInfo->bIsNVMe)
         pInfo->eHealthStatus = WorstHealth(pInfo->eHealthStatus,
-                                           HEALTH_STATUS_CAUTION);
-    else if (pInfo->bIsNVMe && (int)pInfo->nvmeHealth.PercentageUsed > 95)
-        pInfo->eHealthStatus = WorstHealth(pInfo->eHealthStatus,
-                                           HEALTH_STATUS_OBSERVE);
+                                           SideRaisesHeadline(pInfo->eInterface));
 }
 
 /* ATA 194/190 extra bytes often hold lifetime min/max. NVMe: Identify
@@ -1521,6 +1612,16 @@ static void FormatSsdLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
         break;
     case HEALTH_STATUS_CAUTION:
         LectureAdd(szBuf, nBufLen, TN("Причина:\r\n", "Reason:\r\n"));
+        if (HealthRank(pInfo->eReliability) < HealthRank(HEALTH_STATUS_CAUTION) &&
+            HealthRank(pInfo->eInterface) >= HealthRank(HEALTH_STATUS_CAUTION)) {
+            LectureAdd(szBuf, nBufLen, TN(
+                "Интерфейс: CRC или таймауты. Носитель в норме — кабель, контакт или порт, не износ NAND.\r\n",
+                "Interface: CRC or timeouts. The media is fine — cable, contact, or port, not NAND wear.\r\n"));
+            LectureAdd(szBuf, nBufLen, TN(
+                "\r\nРекомендация: Проверить кабель и порт. Рост CRC важнее абсолютного числа.\r\n",
+                "\r\nRecommendation: Check the cable and port. A rising CRC count matters more than the total.\r\n"));
+            break;
+        }
         if (pInfo->nEndurancePercent >= 0 && pInfo->nEndurancePercent <= 5)
             LectureAddF(szBuf, nBufLen,
                 "Остаток ресурса %d%%. Запас NAND почти исчерпан — "
@@ -1791,7 +1892,22 @@ void FormatHealthLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen)
                 "нет переназначенных, ожидающих или неисправимых секторов, а также ошибок интерфейса.\r\n\r\n");
         }
     } else if (pInfo->eHealthStatus == HEALTH_STATUS_CAUTION) {
-        if (pInfo->eMechanics == HEALTH_STATUS_CAUTION || pInfo->eMechanics == HEALTH_STATUS_BAD)
+        if (HealthRank(pInfo->eReliability) < HealthRank(HEALTH_STATUS_CAUTION)) {
+            if (HealthRank(pInfo->eInterface) >= HealthRank(HEALTH_STATUS_CAUTION))
+                LectureAdd(szBuf, nBufLen, TN(
+                    "Итог поднят из-за интерфейса: CRC, таймауты команд или повторы раскрутки. "
+                    "Переназначенных и неисправимых секторов нет. Это кабель, контакт или питание, не смерть диска.\r\n\r\n",
+                    "The headline is raised by the interface: CRC, command timeouts, or spin retries. "
+                    "There are no reallocated or uncorrectable sectors. That is the cable, contact, or power, not a dying drive.\r\n\r\n"));
+            else if (HealthRank(pInfo->eTempStatus) >= HealthRank(HEALTH_STATUS_CAUTION))
+                LectureAdd(szBuf, nBufLen, TN(
+                    "Итог поднят из-за температуры. Поверхность в норме. Диск нужно охладить, это не приговор пластинам.\r\n\r\n",
+                    "The headline is raised by temperature. The surface is fine. Cool the drive; this is not a platter failure.\r\n\r\n"));
+            else
+                LectureAdd(szBuf, nBufLen, TN(
+                    "Итог поднят из-за механики. Плохих секторов нет, абсолютное число G-Sense само по себе оценку не снижает.\r\n\r\n",
+                    "The headline is raised by mechanics. There are no bad sectors; the raw G-Sense count alone does not lower the assessment.\r\n\r\n"));
+        } else if (pInfo->eMechanics == HEALTH_STATUS_CAUTION || pInfo->eMechanics == HEALTH_STATUS_BAD)
             LectureAdd(szBuf, nBufLen,
                 "Есть связанная улика: события G-Sense совпадают с проблемными секторами. "
                 "Это не штраф за абсолютное число G-Sense, а корреляция механики и поверхности.\r\n\r\n");
@@ -2403,7 +2519,7 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
             "Raw counters are facts, not a 0–100 score.\r\n"));
         if (pInfo->nEndurancePercent >= 0)
             LectureAdd(szBuf, nBufLen,
-                "Заявленный остаток ресурса (A9) — цифра контроллера про износ NAND, "
+                "Заявленный остаток ресурса — цифра контроллера про износ NAND, "
                 "это не здоровье диска и не означает, что диск новый.\r\n");
         else
             LectureAdd(szBuf, nBufLen, TN(
@@ -2422,6 +2538,11 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
 void ExtractSSDIndicators(DRIVE_INFO* pInfo)
 {
     int i;
+    int nA9 = -1;
+    int nA9Val = -1;
+    int nE7 = -1;
+    int nE7Agrees = 0;
+    int nB1 = -1;
     IdentifyDriveParts(pInfo);
     pInfo->nSSDLifeLeft     = -1;
     pInfo->nSSDTotalWritesGB = -1;
@@ -2435,25 +2556,41 @@ void ExtractSSDIndicators(DRIVE_INFO* pInfo)
         if (pA->bAttrID == 0) continue;
 
         switch (pA->bAttrID) {
-        /* Remaining Life / SSD Life Left */
+        /* Collected here. Assigned only when the controller profile says
+         * this ID is life remaining — not because the RAW looks like 1..100. */
         case 0xA9:
-            if (pInfo->nSSDLifeLeft < 0) {
+            if (nA9 < 0) {
                 int raw = (int)GetRawValue(pA->bRawValue);
+                nA9Val = (int)pA->bAttrValue;
                 /* Phison A9 RAW 1–100 is remaining %. RAW 0 with Value 100
                  * is the dummy 100/100/50 scale, not 0% worn. */
                 if (raw >= 1 && raw <= 100)
-                    pInfo->nSSDLifeLeft = raw;
+                    nA9 = raw;
                 else if (raw == 0 && pA->bAttrValue < 90)
-                    pInfo->nSSDLifeLeft = 0;
+                    nA9 = 0;
             }
             break;
+        case 0xB1:
+            /* Samsung 177: normalized Value is remaining life. RAW is the
+             * erase count (26 on this 870 EVO), not the percent. */
+            if (nB1 < 0 && pInfo->eController == CONTROLLER_SAMSUNG &&
+                pA->bAttrValue <= 100)
+                nB1 = (int)pA->bAttrValue;
+            break;
         case 0xE7:
-            if (pInfo->nSSDLifeLeft < 0) {
-                int v = (int)GetRawValue16Lo(pA->bRawValue);
-                if (v >= 0 && v <= 100)
-                    pInfo->nSSDLifeLeft = v;
-                else if (pA->bAttrValue >= 0 && pA->bAttrValue <= 100)
-                    pInfo->nSSDLifeLeft = (int)pA->bAttrValue;
+            if (nE7 < 0) {
+                if (pInfo->eController == CONTROLLER_SAMSUNG) {
+                    if (pA->bAttrValue <= 100)
+                        nE7 = (int)pA->bAttrValue;
+                } else {
+                    int v = (int)GetRawValue16Lo(pA->bRawValue);
+                    if (v >= 0 && v <= 100 && (int)pA->bAttrValue == v)
+                        nE7Agrees = 1;
+                    if (v >= 0 && v <= 100)
+                        nE7 = v;
+                    else if (pA->bAttrValue <= 100)
+                        nE7 = (int)pA->bAttrValue;
+                }
             }
             break;
 
@@ -2527,6 +2664,24 @@ void ExtractSSDIndicators(DRIVE_INFO* pInfo)
                 pInfo->nSSDMinEraseCount = (int)GetRawValue(pA->bRawValue);
             break;
         }
+    }
+
+    /* Phison: A9, else E7. If A9's Value is still the dummy 100 and E7's
+     * Value and RAW are the same percent, E7 is the maintained life counter
+     * (Kingston A400: A9 RAW 40, E7 78/78). Samsung: E7, else attribute 177.
+     * SMI and unknown: no percent. */
+    if (IsPhisonFamily(pInfo)) {
+        if (nE7Agrees && nE7 >= 0 && nA9 >= 0 && nA9 != nE7 && nA9Val >= 90)
+            pInfo->nSSDLifeLeft = nE7;
+        else if (nA9 >= 0)
+            pInfo->nSSDLifeLeft = nA9;
+        else if (nE7 >= 0)
+            pInfo->nSSDLifeLeft = nE7;
+    } else if (pInfo->eController == CONTROLLER_SAMSUNG) {
+        if (nE7 >= 0)
+            pInfo->nSSDLifeLeft = nE7;
+        else if (nB1 >= 0)
+            pInfo->nSSDLifeLeft = nB1;
     }
 }
 

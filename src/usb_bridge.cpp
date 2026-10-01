@@ -363,90 +363,162 @@ BOOL GetUSBVidPid(HANDLE hDrive, WORD* pwVid, WORD* pwPid)
 }
 
 /* ============================================================
- * SAT (SCSI/ATA Translation) — for USB enclosures & SAS
+ * SAT (SCSI/ATA Translation) — USB enclosures.
+ * uaspstor does not serve IOCTL_SCSI_PASS_THROUGH, so the first
+ * tries are IOCTL_SCSI_PASS_THROUGH_DIRECT without CK_COND.
+ * An empty data buffer is not success: SAT-16 then falls through
+ * to SAT-12. Buffered SPT with CK_COND stays for JMicron USBSTOR.
+ * ATA passthrough is not sent on this path.
  * ============================================================ */
-static BOOL SATSendCommand12(HANDLE hDrive, BYTE bFeatures, BYTE bSectorCnt,
-    BYTE bLBALow, BYTE bCylLow, BYTE bCylHigh, BYTE bCommand, BYTE bProtocol,
+
+static BYTE SATCdbFlags(BOOL bDataIn, BOOL bCkCond)
+{
+    BYTE f = 0;
+    if (bCkCond)
+        f = (BYTE)(f | SAT_FLAGS_CK_COND);
+    if (bDataIn)
+        f = (BYTE)(f | SAT_FLAGS_TDIR_FROM_DEV | SAT_FLAGS_BYTE_BLOCK |
+                   SAT_FLAGS_TLEN_SECTOR_CNT);
+    return f;
+}
+
+static void SATFillCdb(UCHAR* pCdb, BOOL b16, BYTE bProtocol, BYTE bFlags,
+    BYTE bFeatures, BYTE bSectorCnt, BYTE bLBALow, BYTE bCylLow,
+    BYTE bCylHigh, BYTE bCommand)
+{
+    ZeroMemory(pCdb, 16);
+    if (!b16) {
+        pCdb[0] = SAT_ATA_PASSTHROUGH_12;
+        pCdb[1] = bProtocol;
+        pCdb[2] = bFlags;
+        pCdb[3] = bFeatures;
+        pCdb[4] = bSectorCnt;
+        pCdb[5] = bLBALow;
+        pCdb[6] = bCylLow;
+        pCdb[7] = bCylHigh;
+        pCdb[8] = 0xA0;
+        pCdb[9] = bCommand;
+        return;
+    }
+    pCdb[0]  = SAT_ATA_PASSTHROUGH_16;
+    pCdb[1]  = bProtocol;
+    pCdb[2]  = bFlags;
+    pCdb[4]  = bFeatures;
+    pCdb[6]  = bSectorCnt;
+    pCdb[8]  = bLBALow;
+    pCdb[10] = bCylLow;
+    pCdb[12] = bCylHigh;
+    pCdb[13] = 0xA0;
+    pCdb[14] = bCommand;
+}
+
+/* BUSY, CONDITION MET, RESERVATION CONFLICT. CHECK CONDITION (0x02)
+ * is normal when CK_COND is set and is also accepted on a data-in
+ * command that actually returned a sector. */
+static BOOL SATStatusStops(UCHAR scsiStatus)
+{
+    return scsiStatus == 0x08 || scsiStatus == 0x04 || scsiStatus == 0x18;
+}
+
+static BOOL SATPayloadOk(UCHAR scsiStatus, BOOL bCkCond, BOOL bDataIn,
+                          const BYTE* pData, DWORD nCopy)
+{
+    if (SATStatusStops(scsiStatus))
+        return FALSE;
+    if (bDataIn) {
+        if (nCopy == 0 || !pData)
+            return FALSE;
+        if (IsBufferAllZero(pData, (int)nCopy))
+            return FALSE;
+        return TRUE;
+    }
+    if (scsiStatus == 0)
+        return TRUE;
+    return bCkCond && scsiStatus == 0x02;
+}
+
+static BOOL SATSendDirect(HANDLE hDrive, BOOL b16, BOOL bCkCond,
+    BYTE bFeatures, BYTE bSectorCnt, BYTE bLBALow, BYTE bCylLow,
+    BYTE bCylHigh, BYTE bCommand, BYTE bProtocol,
     BYTE* pDataBuf, DWORD dwDataLen)
 {
-    CDI_SAT_PASSTHROUGH_BUF sptwb;
-    if (!DriveAllowsScsiPassthrough(hDrive)) return FALSE;
+    SAT_PASSTHROUGH_BUF sb;
+    ULONGLONG stage[64];
     DWORD dwBytes = 0;
-    ZeroMemory(&sptwb, sizeof(sptwb));
+    DWORD nCopy = 0;
+    BOOL bDataIn = (pDataBuf && dwDataLen > 0);
 
-    sptwb.spt.Length             = sizeof(SCSI_PASS_THROUGH);
-    sptwb.spt.PathId             = 0;
-    sptwb.spt.TargetId           = 0;
-    sptwb.spt.Lun                = 0;
-    sptwb.spt.CdbLength          = 12;
-    sptwb.spt.SenseInfoLength    = 32;
-    sptwb.spt.SenseInfoOffset    = offsetof(CDI_SAT_PASSTHROUGH_BUF, SenseBuf);
-    sptwb.spt.TimeOutValue       = 30;
+    if (!DriveAllowsScsiPassthrough(hDrive))
+        return FALSE;
+    if (bDataIn && dwDataLen > sizeof(stage))
+        return FALSE;
 
-    if (pDataBuf && dwDataLen > 0) {
-        sptwb.spt.DataIn             = SCSI_IOCTL_DATA_IN;
-        sptwb.spt.DataTransferLength = dwDataLen;
-        sptwb.spt.DataBufferOffset   = offsetof(CDI_SAT_PASSTHROUGH_BUF, DataBuf);
+    ZeroMemory(&sb, sizeof(sb));
+    ZeroMemory(stage, sizeof(stage));
+    sb.sptd.Length           = sizeof(SCSI_PASS_THROUGH_DIRECT);
+    sb.sptd.PathId           = 0;
+    sb.sptd.TargetId         = 0;
+    sb.sptd.Lun              = 0;
+    sb.sptd.CdbLength        = b16 ? 16 : 12;
+    sb.sptd.SenseInfoLength  = sizeof(sb.SenseBuf);
+    sb.sptd.SenseInfoOffset  = offsetof(SAT_PASSTHROUGH_BUF, SenseBuf);
+    sb.sptd.TimeOutValue     = 30;
+    if (bDataIn) {
+        sb.sptd.DataIn             = SCSI_IOCTL_DATA_IN;
+        sb.sptd.DataTransferLength = dwDataLen;
+        sb.sptd.DataBuffer         = stage;
     } else {
-        sptwb.spt.DataIn             = SCSI_IOCTL_DATA_UNSPECIFIED;
-        sptwb.spt.DataTransferLength = 0;
-        sptwb.spt.DataBufferOffset   = 0;
+        sb.sptd.DataIn             = SCSI_IOCTL_DATA_UNSPECIFIED;
+        sb.sptd.DataTransferLength = 0;
+        sb.sptd.DataBuffer         = NULL;
     }
+    SATFillCdb(sb.sptd.Cdb, b16, bProtocol, SATCdbFlags(bDataIn, bCkCond),
+               bFeatures, bSectorCnt, bLBALow, bCylLow, bCylHigh, bCommand);
 
-    sptwb.spt.Cdb[0] = SAT_ATA_PASSTHROUGH_12;
-    sptwb.spt.Cdb[1] = bProtocol;
-    sptwb.spt.Cdb[2] = (pDataBuf && dwDataLen > 0)
-                         ? (SAT_FLAGS_CK_COND | SAT_FLAGS_TDIR_FROM_DEV | SAT_FLAGS_BYTE_BLOCK | SAT_FLAGS_TLEN_SECTOR_CNT)
-                         : SAT_FLAGS_CK_COND;
-    sptwb.spt.Cdb[3] = bFeatures;
-    sptwb.spt.Cdb[4] = bSectorCnt;
-    sptwb.spt.Cdb[5] = bLBALow;
-    sptwb.spt.Cdb[6] = bCylLow;
-    sptwb.spt.Cdb[7] = bCylHigh;
-    sptwb.spt.Cdb[8] = 0xA0;
-    sptwb.spt.Cdb[9] = bCommand;
-
-    DWORD dwInLen = offsetof(CDI_SAT_PASSTHROUGH_BUF, DataBuf);
-    if (pDataBuf && dwDataLen > 0) {
-        dwInLen += dwDataLen;
-    }
-
-    if (!DeviceIoControl(hDrive, IOCTL_SCSI_PASS_THROUGH,
-            &sptwb, dwInLen, &sptwb, sizeof(sptwb), &dwBytes, NULL))
+    if (!DeviceIoControl(hDrive, IOCTL_SCSI_PASS_THROUGH_DIRECT,
+            &sb, sizeof(sb), &sb, sizeof(sb), &dwBytes, NULL))
         return FALSE;
 
-    if (sptwb.spt.ScsiStatus == 0x08 || sptwb.spt.ScsiStatus == 0x04)
-        return FALSE;
-
-    if (pDataBuf && dwDataLen > 0 && sptwb.spt.DataTransferLength > 0) {
-        DWORD dwCopy = dwDataLen;
-        if (dwCopy > sptwb.spt.DataTransferLength) dwCopy = sptwb.spt.DataTransferLength;
-        if (dwCopy > 512) dwCopy = 512;
-        memcpy(pDataBuf, sptwb.DataBuf, dwCopy);
+    if (bDataIn) {
+        nCopy = dwDataLen;
+        if (nCopy > sb.sptd.DataTransferLength)
+            nCopy = sb.sptd.DataTransferLength;
+        if (nCopy > sizeof(stage))
+            nCopy = (DWORD)sizeof(stage);
     }
-
+    if (!SATPayloadOk(sb.sptd.ScsiStatus, bCkCond, bDataIn, (BYTE*)stage, nCopy))
+        return FALSE;
+    if (bDataIn)
+        memcpy(pDataBuf, stage, nCopy);
     return TRUE;
 }
 
-static BOOL SATSendCommand16(HANDLE hDrive, BYTE bFeatures, BYTE bSectorCnt,
-    BYTE bLBALow, BYTE bCylLow, BYTE bCylHigh, BYTE bCommand, BYTE bProtocol,
+static BOOL SATSendBuffered(HANDLE hDrive, BOOL b16, BOOL bCkCond,
+    BYTE bFeatures, BYTE bSectorCnt, BYTE bLBALow, BYTE bCylLow,
+    BYTE bCylHigh, BYTE bCommand, BYTE bProtocol,
     BYTE* pDataBuf, DWORD dwDataLen)
 {
     CDI_SAT_PASSTHROUGH_BUF sptwb;
     DWORD dwBytes = 0;
-    if (!DriveAllowsScsiPassthrough(hDrive)) return FALSE;
+    DWORD dwInLen;
+    DWORD nCopy = 0;
+    BOOL bDataIn = (pDataBuf && dwDataLen > 0);
+
+    if (!DriveAllowsScsiPassthrough(hDrive))
+        return FALSE;
+    if (bDataIn && dwDataLen > sizeof(sptwb.DataBuf))
+        return FALSE;
+
     ZeroMemory(&sptwb, sizeof(sptwb));
-
-    sptwb.spt.Length             = sizeof(SCSI_PASS_THROUGH);
-    sptwb.spt.PathId             = 0;
-    sptwb.spt.TargetId           = 0;
-    sptwb.spt.Lun                = 0;
-    sptwb.spt.CdbLength          = 16;
-    sptwb.spt.SenseInfoLength    = 32;
-    sptwb.spt.SenseInfoOffset    = offsetof(CDI_SAT_PASSTHROUGH_BUF, SenseBuf);
-    sptwb.spt.TimeOutValue       = 30;
-
-    if (pDataBuf && dwDataLen > 0) {
+    sptwb.spt.Length          = sizeof(SCSI_PASS_THROUGH);
+    sptwb.spt.PathId          = 0;
+    sptwb.spt.TargetId        = 0;
+    sptwb.spt.Lun             = 0;
+    sptwb.spt.CdbLength       = b16 ? 16 : 12;
+    sptwb.spt.SenseInfoLength = 32;
+    sptwb.spt.SenseInfoOffset = offsetof(CDI_SAT_PASSTHROUGH_BUF, SenseBuf);
+    sptwb.spt.TimeOutValue    = 30;
+    if (bDataIn) {
         sptwb.spt.DataIn             = SCSI_IOCTL_DATA_IN;
         sptwb.spt.DataTransferLength = dwDataLen;
         sptwb.spt.DataBufferOffset   = offsetof(CDI_SAT_PASSTHROUGH_BUF, DataBuf);
@@ -455,53 +527,28 @@ static BOOL SATSendCommand16(HANDLE hDrive, BYTE bFeatures, BYTE bSectorCnt,
         sptwb.spt.DataTransferLength = 0;
         sptwb.spt.DataBufferOffset   = 0;
     }
+    SATFillCdb(sptwb.spt.Cdb, b16, bProtocol, SATCdbFlags(bDataIn, bCkCond),
+               bFeatures, bSectorCnt, bLBALow, bCylLow, bCylHigh, bCommand);
 
-    /* CK_COND flag (0x20) for SAT commands.
-     * Many USB-SATA bridge chips (especially JMicron) require this flag. */
-    sptwb.spt.Cdb[0]  = SAT_ATA_PASSTHROUGH_16;
-    sptwb.spt.Cdb[1]  = bProtocol;
-    sptwb.spt.Cdb[2]  = (pDataBuf && dwDataLen > 0)
-                          ? (SAT_FLAGS_CK_COND | SAT_FLAGS_TDIR_FROM_DEV | SAT_FLAGS_BYTE_BLOCK | SAT_FLAGS_TLEN_SECTOR_CNT)
-                          : SAT_FLAGS_CK_COND;
-    sptwb.spt.Cdb[3]  = 0;
-    sptwb.spt.Cdb[4]  = bFeatures;
-    sptwb.spt.Cdb[5]  = 0;
-    sptwb.spt.Cdb[6]  = bSectorCnt;
-    sptwb.spt.Cdb[7]  = 0;
-    sptwb.spt.Cdb[8]  = bLBALow;
-    sptwb.spt.Cdb[9]  = 0;
-    sptwb.spt.Cdb[10] = bCylLow;
-    sptwb.spt.Cdb[11] = 0;
-    sptwb.spt.Cdb[12] = bCylHigh;
-    sptwb.spt.Cdb[13] = 0xA0;  /* LBA mode */
-    sptwb.spt.Cdb[14] = bCommand;
-    sptwb.spt.Cdb[15] = 0;
-
-    DWORD dwInLen = offsetof(CDI_SAT_PASSTHROUGH_BUF, DataBuf);
-    if (pDataBuf && dwDataLen > 0) {
+    dwInLen = offsetof(CDI_SAT_PASSTHROUGH_BUF, DataBuf);
+    if (bDataIn)
         dwInLen += dwDataLen;
-    }
 
     if (!DeviceIoControl(hDrive, IOCTL_SCSI_PASS_THROUGH,
             &sptwb, dwInLen, &sptwb, sizeof(sptwb), &dwBytes, NULL))
         return FALSE;
 
-    /* When CK_COND is set, ScsiStatus may be 0x02 (CHECK CONDITION)
-     * which is NORMAL per SAT spec — the ATA status is returned in sense data.
-     * Only treat it as failure if ScsiStatus indicates a transport error. */
-    if (sptwb.spt.ScsiStatus == 0x08 ||   /* BUSY */
-        sptwb.spt.ScsiStatus == 0x04 ||   /* CONDITION MET (abnormal for SAT) */
-        sptwb.spt.ScsiStatus == 0x18)     /* RESERVATION CONFLICT */
-        return FALSE;
-
-    /* Copy data from embedded buffer to caller's buffer */
-    if (pDataBuf && dwDataLen > 0 && sptwb.spt.DataTransferLength > 0) {
-        DWORD dwCopy = dwDataLen;
-        if (dwCopy > sptwb.spt.DataTransferLength) dwCopy = sptwb.spt.DataTransferLength;
-        if (dwCopy > 512) dwCopy = 512;
-        memcpy(pDataBuf, sptwb.DataBuf, dwCopy);
+    if (bDataIn) {
+        nCopy = dwDataLen;
+        if (nCopy > sptwb.spt.DataTransferLength)
+            nCopy = sptwb.spt.DataTransferLength;
+        if (nCopy > sizeof(sptwb.DataBuf))
+            nCopy = (DWORD)sizeof(sptwb.DataBuf);
     }
-
+    if (!SATPayloadOk(sptwb.spt.ScsiStatus, bCkCond, bDataIn, sptwb.DataBuf, nCopy))
+        return FALSE;
+    if (bDataIn)
+        memcpy(pDataBuf, sptwb.DataBuf, nCopy);
     return TRUE;
 }
 
@@ -509,13 +556,25 @@ static BOOL SATSendCommand(HANDLE hDrive, BYTE bFeatures, BYTE bSectorCnt,
     BYTE bLBALow, BYTE bCylLow, BYTE bCylHigh, BYTE bCommand, BYTE bProtocol,
     BYTE* pDataBuf, DWORD dwDataLen, SMART_ACCESS_METHOD* pMethod)
 {
-    if (SATSendCommand16(hDrive, bFeatures, bSectorCnt, bLBALow,
-                         bCylLow, bCylHigh, bCommand, bProtocol, pDataBuf, dwDataLen)) {
+    /* DIRECT, no CK_COND, 16 then 12. Then the JMicron buffered CK_COND pair.
+     * A zero sector does not count, so a quiet SAT-16 still reaches SAT-12. */
+    if (SATSendDirect(hDrive, TRUE, FALSE, bFeatures, bSectorCnt, bLBALow,
+                      bCylLow, bCylHigh, bCommand, bProtocol, pDataBuf, dwDataLen)) {
         if (pMethod) *pMethod = SMART_ACCESS_SAT16;
         return TRUE;
     }
-    if (SATSendCommand12(hDrive, bFeatures, bSectorCnt, bLBALow,
-                         bCylLow, bCylHigh, bCommand, bProtocol, pDataBuf, dwDataLen)) {
+    if (SATSendDirect(hDrive, FALSE, FALSE, bFeatures, bSectorCnt, bLBALow,
+                      bCylLow, bCylHigh, bCommand, bProtocol, pDataBuf, dwDataLen)) {
+        if (pMethod) *pMethod = SMART_ACCESS_SAT12;
+        return TRUE;
+    }
+    if (SATSendBuffered(hDrive, TRUE, TRUE, bFeatures, bSectorCnt, bLBALow,
+                        bCylLow, bCylHigh, bCommand, bProtocol, pDataBuf, dwDataLen)) {
+        if (pMethod) *pMethod = SMART_ACCESS_SAT16;
+        return TRUE;
+    }
+    if (SATSendBuffered(hDrive, FALSE, TRUE, bFeatures, bSectorCnt, bLBALow,
+                        bCylLow, bCylHigh, bCommand, bProtocol, pDataBuf, dwDataLen)) {
         if (pMethod) *pMethod = SMART_ACCESS_SAT12;
         return TRUE;
     }
