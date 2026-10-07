@@ -1,5 +1,5 @@
 # ============================================================================
-#  DriveMonitor - MinGW build. MIT: see LICENSE.
+#  DriveMonitor - MinGW build. GPL-2.0-or-later. See LICENSE.
 # ============================================================================
 
 ifeq ($(OS),Windows_NT)
@@ -17,6 +17,8 @@ TARGET  = $(OUTDIR)/DriveMonitor.exe
 SRCS    = $(SRCDIR)/main.cpp \
           $(SRCDIR)/mainwnd.cpp \
           $(SRCDIR)/smart.cpp \
+          $(SRCDIR)/profile.cpp \
+          $(SRCDIR)/drivedb.cpp \
           $(SRCDIR)/ata_smart.cpp \
           $(SRCDIR)/nvme_smart.cpp \
           $(SRCDIR)/usb_bridge.cpp \

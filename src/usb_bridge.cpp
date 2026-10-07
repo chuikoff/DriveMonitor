@@ -1,26 +1,44 @@
-/* DriveMonitor - USB VID/PID, SAT, NVMe-over-USB bridges. MIT: see LICENSE. */
+/* DriveMonitor - USB VID/PID, SAT, NVMe-over-USB bridges. GPL-2.0-or-later. See LICENSE. */
 #include "smart_internal.h"
+
+void FormatUsbCapability(const DRIVE_INFO* p, char* buf, int nBuf)
+{
+    int sat, smart, thresh, nvme;
+    if (!buf || nBuf <= 0) return;
+    buf[0] = '\0';
+    if (!p || !p->bIsUSB) return;
+    sat = p->bCapAtaIdentify || (p->bCapSmartData && !p->bIsNVMe);
+    smart = p->bCapSmartData || (p->bSMART_Supported && !p->bIsNVMe &&
+                                 p->bCapAtaIdentify);
+    thresh = p->bCapSmartThresh;
+    nvme = p->bGotNVMeIdent || (p->bIsNVMe && p->bSMART_Supported);
+    safe_snprintf_n(buf, nBuf,
+        TN("SAT %s · SMART %s · пороги %s · NVMe %s",
+           "SAT %s · SMART %s · thresholds %s · NVMe %s"),
+        sat ? TN("да", "yes") : TN("нет", "no"),
+        smart ? TN("да", "yes") : TN("нет", "no"),
+        thresh ? TN("да", "yes") : TN("нет", "no"),
+        nvme ? TN("да", "yes") : TN("нет", "no"));
+}
 
 void PrefixUsbProtocol(DRIVE_INFO* pInfo)
 {
     char disk[64];
     const char* pre = "USB";
-    char hay[384];
     if (!pInfo || !pInfo->bIsUSB || !pInfo->szProtocol[0])
         return;
     if (strncmp(pInfo->szProtocol, "USB", 3) == 0)
         return;
     lstrcpynA(disk, pInfo->szProtocol, (int)sizeof(disk));
-    safe_snprintf(hay, "%s %s %s",
-              pInfo->szModel, pInfo->szBridgeVendor, pInfo->szBridgeProduct);
-    if (IsRealtekNvmeUsbBridge(pInfo) ||
-        pInfo->eUsbBridgeType == USB_BRIDGE_NVME_REALTEK ||
-        strstr(hay, "RTL9210") || strstr(hay, "RTL921"))
-        pre = "USB RTL9210";
-    else if (pInfo->bIsNVMe)
-        pre = "USB";
-    else
+    /* The label follows the probe that worked. VID/PID stays a quirk
+     * for which commands are safe, and does not rename the link. */
+    if (pInfo->bGotNVMeIdent || pInfo->bIsNVMe)
+        pre = "USB NVMe";
+    else if (pInfo->bCapAtaIdentify || pInfo->bCapSmartData ||
+             pInfo->bSMART_Supported)
         pre = "USB SAT";
+    else
+        pre = "USB";
     safe_snprintf(pInfo->szProtocol, "%s · %s", pre, disk);
 }
 
@@ -581,6 +599,113 @@ static BOOL SATSendCommand(HANDLE hDrive, BYTE bFeatures, BYTE bSectorCnt,
     return FALSE;
 }
 
+/* ATA Status Return descriptor (SAT): 28-bit LBA mid/high are bytes 9 and 11.
+ * Fixed sense (SAT-2, ASC/ASCQ 00/1Dh) carries them at bytes 10 and 11.
+ * 4F/C2 = threshold not exceeded, F4/2C = exceeded. */
+static BOOL SATSenseSmartStatus(const BYTE* sense, DWORD nSense, BOOL* pbFail)
+{
+    BYTE rc, mid, hi;
+    DWORD add, off, end, step;
+    if (!sense || !pbFail || nSense < 14)
+        return FALSE;
+    rc = (BYTE)(sense[0] & 0x7F);
+    if (rc == 0x72 || rc == 0x73) {
+        add = sense[7];
+        off = 8;
+        end = 8 + add;
+        if (end > nSense) end = nSense;
+        while (off + 14 <= end) {
+            if (sense[off] == 0x09 && sense[off + 1] >= 0x0C) {
+                mid = sense[off + 9];
+                hi  = sense[off + 11];
+                if (mid == 0x4F && hi == 0xC2) { *pbFail = FALSE; return TRUE; }
+                if (mid == 0xF4 && hi == 0x2C) { *pbFail = TRUE;  return TRUE; }
+                return FALSE;
+            }
+            step = (DWORD)sense[off + 1] + 2;
+            if (step < 2) break;
+            off += step;
+        }
+        return FALSE;
+    }
+    if ((rc == 0x70 || rc == 0x71) && sense[7] >= 6 &&
+        sense[12] == 0x00 && sense[13] == 0x1D && sense[4] != 0) {
+        mid = sense[10];
+        hi  = sense[11];
+        if (mid == 0x4F && hi == 0xC2) { *pbFail = FALSE; return TRUE; }
+        if (mid == 0xF4 && hi == 0x2C) { *pbFail = TRUE;  return TRUE; }
+    }
+    return FALSE;
+}
+
+/* Non-data SMART RETURN STATUS. CK_COND is required: the answer is the
+ * ATA registers in sense, not a data sector. Same CDB byte 2 as
+ * smartmontools (CK_COND | T_DIR | BYTE_BLOCK, T_LENGTH 0). */
+static BOOL SATReturnStatusOnce(HANDLE hDrive, BOOL bDirect, BOOL b16, BOOL* pbFail)
+{
+    BYTE flags = (BYTE)(SAT_FLAGS_CK_COND | SAT_FLAGS_TDIR_FROM_DEV |
+                        SAT_FLAGS_BYTE_BLOCK);
+    DWORD dwBytes = 0;
+
+    if (bDirect) {
+        SAT_PASSTHROUGH_BUF sb;
+        ZeroMemory(&sb, sizeof(sb));
+        sb.sptd.Length             = sizeof(SCSI_PASS_THROUGH_DIRECT);
+        sb.sptd.CdbLength          = b16 ? 16 : 12;
+        sb.sptd.SenseInfoLength    = sizeof(sb.SenseBuf);
+        sb.sptd.SenseInfoOffset    = offsetof(SAT_PASSTHROUGH_BUF, SenseBuf);
+        sb.sptd.DataIn             = SCSI_IOCTL_DATA_UNSPECIFIED;
+        sb.sptd.DataTransferLength = 0;
+        sb.sptd.DataBuffer         = NULL;
+        sb.sptd.TimeOutValue       = 20;
+        SATFillCdb(sb.sptd.Cdb, b16, SAT_PROTO_NON_DATA, flags,
+                   SMART_RETURN_STATUS, 0, 0,
+                   SMART_CYL_LOW, SMART_CYL_HI, SMART_CMD);
+        if (!DeviceIoControl(hDrive, IOCTL_SCSI_PASS_THROUGH_DIRECT,
+                &sb, sizeof(sb), &sb, sizeof(sb), &dwBytes, NULL))
+            return FALSE;
+        if (SATStatusStops(sb.sptd.ScsiStatus))
+            return FALSE;
+        return SATSenseSmartStatus(sb.SenseBuf, sizeof(sb.SenseBuf), pbFail);
+    }
+
+    {
+        CDI_SAT_PASSTHROUGH_BUF sptwb;
+        DWORD dwInLen;
+        ZeroMemory(&sptwb, sizeof(sptwb));
+        sptwb.spt.Length          = sizeof(SCSI_PASS_THROUGH);
+        sptwb.spt.CdbLength       = b16 ? 16 : 12;
+        sptwb.spt.SenseInfoLength = sizeof(sptwb.SenseBuf);
+        sptwb.spt.SenseInfoOffset = offsetof(CDI_SAT_PASSTHROUGH_BUF, SenseBuf);
+        sptwb.spt.DataIn          = SCSI_IOCTL_DATA_UNSPECIFIED;
+        sptwb.spt.DataTransferLength = 0;
+        sptwb.spt.DataBufferOffset   = 0;
+        sptwb.spt.TimeOutValue    = 20;
+        SATFillCdb(sptwb.spt.Cdb, b16, SAT_PROTO_NON_DATA, flags,
+                   SMART_RETURN_STATUS, 0, 0,
+                   SMART_CYL_LOW, SMART_CYL_HI, SMART_CMD);
+        dwInLen = offsetof(CDI_SAT_PASSTHROUGH_BUF, DataBuf);
+        if (!DeviceIoControl(hDrive, IOCTL_SCSI_PASS_THROUGH,
+                &sptwb, dwInLen, &sptwb, sizeof(sptwb), &dwBytes, NULL))
+            return FALSE;
+        if (SATStatusStops(sptwb.spt.ScsiStatus))
+            return FALSE;
+        return SATSenseSmartStatus(sptwb.SenseBuf, sizeof(sptwb.SenseBuf), pbFail);
+    }
+}
+
+BOOL GetSMARTReturnStatusSAT(HANDLE hDrive, BOOL* pbFail)
+{
+    if (!pbFail || !DriveAllowsScsiPassthrough(hDrive))
+        return FALSE;
+    /* DIRECT first: uaspstor serves it. Buffered SPT is the USBSTOR fallback. */
+    if (SATReturnStatusOnce(hDrive, TRUE,  TRUE,  pbFail)) return TRUE;
+    if (SATReturnStatusOnce(hDrive, TRUE,  FALSE, pbFail)) return TRUE;
+    if (SATReturnStatusOnce(hDrive, FALSE, TRUE,  pbFail)) return TRUE;
+    if (SATReturnStatusOnce(hDrive, FALSE, FALSE, pbFail)) return TRUE;
+    return FALSE;
+}
+
 BOOL EnableSMARTSAT(HANDLE hDrive)
 {
     SMART_ACCESS_METHOD m = SMART_ACCESS_NONE;
@@ -620,6 +745,7 @@ BOOL GetIdentifyDataSAT(HANDLE hDrive, DRIVE_INFO* pInfo)
     pInfo->bIsUSB           = TRUE;
     pInfo->eAccessMethod    = method;
     pInfo->wRotationRate    = pIdent[217];
+    pInfo->bCapAtaIdentify  = TRUE;
     FillAtaProtocolFromIdent(pInfo, pIdent);
     return TRUE;
 }

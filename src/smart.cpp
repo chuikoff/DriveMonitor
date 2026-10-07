@@ -1,10 +1,9 @@
-/* DriveMonitor - SMART orchestration (open, scan, names). MIT: see LICENSE. */
+/* DriveMonitor - SMART orchestration (open, scan, names). GPL-2.0-or-later. See LICENSE. */
 #include "smart_internal.h"
 
 /* Final protocol string after type / SMART / NVMe ident are known. */
 void FillDriveProtocol(DRIVE_INFO* pInfo)
 {
-    char hay[384];
     if (!pInfo) return;
 
     if (pInfo->bIsNVMe) {
@@ -17,13 +16,9 @@ void FillDriveProtocol(DRIVE_INFO* pInfo)
         return;
     }
 
-    if (pInfo->bIsUSB && !pInfo->bSMART_Supported) {
-        safe_snprintf(hay, "%s %s %s",
-                  pInfo->szModel, pInfo->szBridgeVendor, pInfo->szBridgeProduct);
-        if (IsRealtekNvmeUsbBridge(pInfo) ||
-            pInfo->eUsbBridgeType == USB_BRIDGE_NVME_REALTEK ||
-            strstr(hay, "RTL9210") || strstr(hay, "RTL921"))
-            safe_snprintf(pInfo->szProtocol, "USB (RTL9210)");
+    if (pInfo->bIsUSB && !pInfo->bSMART_Supported && !pInfo->bCapAtaIdentify) {
+        if (pInfo->bGotNVMeIdent || pInfo->bIsNVMe)
+            safe_snprintf(pInfo->szProtocol, "USB NVMe");
         else
             safe_snprintf(pInfo->szProtocol, "USB");
         return;
@@ -463,34 +458,79 @@ static const char* VendorSpecificAttrName(BYTE bID)
     return g_szVendorAttrName[bID];
 }
 
+/* Controller only. A firmware prefix (HPS, U11, U10, …) is not a profile. */
 BOOL IsPhisonFamily(const DRIVE_INFO* p)
 {
     if (!p) return FALSE;
-    if (p->eController == CONTROLLER_PHISON)
-        return TRUE;
-    if (p->szFirmware[0] && strncmp(p->szFirmware, "HPS", 3) == 0)
-        return TRUE;
-    return FALSE;
+    return p->eController == CONTROLLER_PHISON;
+}
+
+/* SM2258/SM2259 production firmware: letter, four digits, letter, digit.
+ * U0524A0, U0817A0, V1205A0, T0910A0.
+ * U11, U10, T07, and S11 plus a digit (U1127B0, S1127B0) have that shape.
+ * The prefix does not select the Phison decoder. It only stays out of this
+ * SM2258/SM2259 match, so the drive stays unidentified until a model row hits. */
+BOOL FirmwareIsSmi225x(const char* fw)
+{
+    int i;
+    if (!fw) return FALSE;
+    for (i = 0; i < 7; i++) {
+        if (!fw[i]) return FALSE;
+    }
+    if (fw[7] != '\0') return FALSE;
+    if (!isalpha((unsigned char)fw[0]) || !isalpha((unsigned char)fw[5]))
+        return FALSE;
+    if (!isdigit((unsigned char)fw[1]) || !isdigit((unsigned char)fw[2]) ||
+        !isdigit((unsigned char)fw[3]) || !isdigit((unsigned char)fw[4]) ||
+        !isdigit((unsigned char)fw[6]))
+        return FALSE;
+    if (strncmp(fw, "U11", 3) == 0 || strncmp(fw, "U10", 3) == 0 ||
+        strncmp(fw, "T07", 3) == 0)
+        return FALSE;
+    if (fw[0] == 'S' && fw[1] == '1' && fw[2] == '1' &&
+        fw[3] >= '0' && fw[3] <= '9')
+        return FALSE;
+    return TRUE;
+}
+
+BOOL IsSmi225xFamily(const DRIVE_INFO* p)
+{
+    char fw[16];
+    if (!p || p->eController != CONTROLLER_SMI) return FALSE;
+    if (p->eType != DRIVE_TYPE_SSD_SATA && p->eType != DRIVE_TYPE_M2_SATA)
+        return FALSE;
+    ToUpperCopy(fw, sizeof(fw), p->szFirmware);
+    return FirmwareIsSmi225x(fw);
+}
+
+unsigned __int64 Smi225xHostGiB(unsigned __int64 raw)
+{
+    if (raw == 0) return 0;
+    return (raw * 32ULL) / 1024ULL;
 }
 
 static int HostGiBPlausible(unsigned __int64 host, unsigned __int64 nandGb,
-                            DWORD poh, unsigned __int64 capGb)
+                            DWORD poh, unsigned __int64 capGb, int reads)
 {
+    unsigned __int64 perHour, capMul;
     if (host == 0) return 0;
-    if (nandGb > 0) {
-        /* Host writes cannot exceed NAND written (WAF >= 1). */
+    /* Host writes cannot exceed NAND written (WAF >= 1). Host reads can. */
+    if (!reads && nandGb > 0) {
         if (host > nandGb) return 0;
         if (nandGb > host * 50ULL) return 0;
         return 1;
     }
-    if (poh >= 24 && host > (unsigned __int64)poh * 20ULL)
+    perHour = reads ? 80ULL : 20ULL;
+    capMul = reads ? 8000ULL : 500ULL;
+    if (poh >= 24 && host > (unsigned __int64)poh * perHour)
         return 0;
-    if (capGb > 0 && host > capGb * 500ULL)
+    if (capGb > 0 && host > capGb * capMul)
         return 0;
     return 1;
 }
 
-unsigned __int64 ScaleAtaHostGiB(const DRIVE_INFO* pInfo, unsigned __int64 raw)
+unsigned __int64 ScaleAtaHostGiB(const DRIVE_INFO* pInfo, unsigned __int64 raw,
+                                 BOOL reads)
 {
     unsigned __int64 asGb, as32mb, asLba, capGb, nandGb;
     int erase;
@@ -504,12 +544,16 @@ unsigned __int64 ScaleAtaHostGiB(const DRIVE_INFO* pInfo, unsigned __int64 raw)
     if (erase < 0) erase = pInfo->nSSDMaxEraseCount;
     nandGb = (capGb > 0 && erase > 0) ? (unsigned __int64)erase * capGb : 0;
     poh = pInfo->dwPowerOnHours;
-    if (HostGiBPlausible(asGb, nandGb, poh, capGb))
+    if (HostGiBPlausible(asGb, nandGb, poh, capGb, reads ? 1 : 0))
         return asGb;
     /* 32 MiB units need a NAND figure. Without it a modest LBA count
      * (Samsung PM871 F1) passes the POH check as tens of thousands of GB. */
-    if (nandGb > 0 && HostGiBPlausible(as32mb, nandGb, poh, capGb))
+    if (nandGb > 0 && HostGiBPlausible(as32mb, nandGb, poh, capGb, reads ? 1 : 0))
         return as32mb;
+    /* Below one GiB of 512-byte sectors the LBA quotient is 0. A rejected
+     * GB reading must not be printed as zero. */
+    if (asLba == 0 && asGb > 0 && asGb <= 4000000ULL)
+        return asGb;
     return asLba;
 }
 
@@ -933,6 +977,23 @@ void GetAttrDecode(BYTE bID, const DRIVE_INFO* pInfo, ATTR_DECODE* out)
     if (IsPhisonFamily(pInfo))
         ApplyPhisonSsdDecode(bID, out);
 
+    /* SM2258/SM2259: 241/242/245 counts are 32 MiB blocks, not LBAs.
+     * Showing the raw count as LBA makes a few hundred GiB look like
+     * a handful of sectors next to the power-on hours. */
+    if (IsSmi225xFamily(pInfo) &&
+        (bID == 0xF1 || bID == 0xF2 || bID == 0xF5)) {
+        if (bID == 0xF1)
+            out->szName = TN("Записано хостом", "Host written");
+        else if (bID == 0xF2)
+            out->szName = TN("Прочитано хостом", "Host read");
+        else
+            out->szName = TN("Записи NAND", "NAND writes");
+        out->eEnc = RAW_ENC_COUNTER48;
+        out->eState = ATTR_DECODE_KNOWN;
+        out->nSemanticConfidence = 80;
+        out->eCrit = ATTR_CRIT_NONE;
+    }
+
     /* A9/E7 are life remaining only for a known profile. The ID alone is not. */
     if (pInfo && bID == 0xA9 && !IsPhisonFamily(pInfo)) {
         out->szName = VendorSpecificAttrName(bID);
@@ -984,6 +1045,33 @@ void GetAttrDecode(BYTE bID, const DRIVE_INFO* pInfo, ATTR_DECODE* out)
             out->eCrit = ATTR_CRIT_NONE;
             if (out->nSemanticConfidence > 30)
                 out->nSemanticConfidence = 30;
+        }
+    }
+
+    /* A local profile keeps its own name. drivedb names the IDs that
+     * profile does not list. Anything else stays an unnamed RAW. */
+    if (pInfo && !ProfileListsAttr(pInfo, bID)) {
+        const char* dbName = DriveDbAttrName(pInfo, bID);
+        if (dbName && dbName[0]) {
+            int sem = PROF_SEM_NONE, enc = PROF_ENC_NONE;
+            out->szName = dbName;
+            out->eCrit = ATTR_CRIT_NONE;
+            out->nSemanticConfidence = 75;
+            if (DriveDbLookup(pInfo, bID, &sem, &enc)) {
+                if (enc == PROF_ENC_PERCENT)
+                    out->eEnc = RAW_ENC_PERCENT;
+                else if (enc == PROF_ENC_LBA)
+                    out->eEnc = RAW_ENC_LBA;
+                else
+                    out->eEnc = RAW_ENC_COUNTER48;
+            } else {
+                out->eEnc = RAW_ENC_UNKNOWN;
+            }
+        } else if (IsVendorSpecificId(bID)) {
+            out->szName = VendorSpecificAttrName(bID);
+            out->eEnc = RAW_ENC_UNKNOWN;
+            out->eCrit = ATTR_CRIT_NONE;
+            out->nSemanticConfidence = 30;
         }
     }
 
@@ -1374,25 +1462,10 @@ static DRIVE_CONTROLLER DetectDriveController(const DRIVE_INFO* p)
     if (p->bIsUSB && !p->bSMART_Supported && !p->bIsNVMe)
         return CONTROLLER_UNKNOWN;
 
-    /* 2. Firmware / model strings (work even before SMART). */
-    if (strncmp(szFwU, "HPS", 3) == 0 ||
-        strncmp(szFwU, "SBFK", 4) == 0 ||
-        strncmp(szFwU, "SBFM", 4) == 0 ||
-        strncmp(szFwU, "SAFM", 4) == 0 ||
-        strncmp(szFwU, "SBFB", 4) == 0 ||
-        strncmp(szFwU, "ECFM", 4) == 0 ||
-        strncmp(szFwU, "E8FM", 4) == 0 ||
-        strncmp(szFwU, "E7FM", 4) == 0 ||
-        strncmp(szFwU, "S9FM", 4) == 0 ||
-        strncmp(szFwU, "S8FM", 4) == 0 ||
-        strncmp(szFwU, "U11", 3) == 0 ||
-        strncmp(szFwU, "U10", 3) == 0 ||
-        strncmp(szFwU, "T07", 3) == 0 ||
-        strncmp(szFwU, "EJFM", 4) == 0 ||
-        /* PS3111-S11, e.g. Radeon R5SL firmware S1127B0. */
-        (szFwU[0] == 'S' && szFwU[1] == '1' && szFwU[2] == '1' &&
-         szFwU[3] >= '0' && szFwU[3] <= '9'))
-        return CONTROLLER_PHISON;
+    /* 2. Model and firmware tokens that name the ASIC.
+     * A Phison-shaped prefix (U11, U10, HPS, SBFK, EJFM, S11…) is not
+     * one of them: the same letters show up on other SSD families.
+     * Phison is a PCI VID above, or a model row in ApplySsdPartIds. */
 
     /* Token match: "ASM225" must not count as SM225. */
     if (ModelHasChipToken(szModelU, "SM226") || ModelHasChipToken(szModelU, "SM225") ||
@@ -1402,6 +1475,11 @@ static DRIVE_CONTROLLER DetectDriveController(const DRIVE_INFO* p)
         /* SM2258 SATA: VE + digit, e.g. Apacer AS340 VE1R9008. */
         (szFwU[0] == 'V' && szFwU[1] == 'E' &&
          szFwU[2] >= '0' && szFwU[2] <= '9'))
+        return CONTROLLER_SMI;
+
+    /* Kingston A400 and other SM2259XT strings (U0524A0).
+     * FirmwareIsSmi225x rejects U1127B0 and S1127B0. */
+    if (!hdd && FirmwareIsSmi225x(szFwU))
         return CONTROLLER_SMI;
 
     /* ADATA/XPG on Silicon Motion (HDS: SX8200PNP → SM2262EN).
@@ -1426,7 +1504,8 @@ static DRIVE_CONTROLLER DetectDriveController(const DRIVE_INFO* p)
 
     /* 3. HDD MCU follows the brand. Those makers build the drive.
      * SSD brand is a label: Kingston is not Phison, SanDisk is not one ASIC.
-     * Controller comes from VID, firmware, or ApplySsdPartIds. */
+     * Controller comes from an NVMe PCI VID or a model row in ApplySsdPartIds.
+     * Attribute 0xA9 and a firmware prefix do not select a decoder. */
     if (hdd) {
         switch (p->eVendor) {
         case VENDOR_SEAGATE: return CONTROLLER_SEAGATE;
@@ -1441,105 +1520,7 @@ static DRIVE_CONTROLLER DetectDriveController(const DRIVE_INFO* p)
     return CONTROLLER_UNKNOWN;
 }
 
-/* Model/firmware → controller silicon. OEM PCI VID is the brand, not the ASIC. */
-static void ApplySsdPartIds(DRIVE_INFO* p)
-{
-    static const struct {
-        const char* model;   /* substring of uppercase model */
-        const char* fw;      /* substring of uppercase firmware, NULL = any */
-        DRIVE_CONTROLLER ctl;
-        const char* chip;
-        const char* nvmeVer; /* "1.4.0" or NULL; used only if Identify VER is 0 */
-    } kTab[] = {
-        { "MICRON_2400", NULL, CONTROLLER_SMI,
-          "Silicon Motion SM2269XT", "1.4.0" },
-        { "2400_MTFD", NULL, CONTROLLER_SMI,
-          "Silicon Motion SM2269XT", "1.4.0" },
-        { "SX8200PNP", NULL, CONTROLLER_SMI,
-          "Silicon Motion SM2262EN/SM2262ENG/SM2262G", "1.3.0" },
-        { "SX8200 PRO", NULL, CONTROLLER_SMI,
-          "Silicon Motion SM2262EN/SM2262ENG/SM2262G", "1.3.0" },
-        { "SX8200PRO", NULL, CONTROLLER_SMI,
-          "Silicon Motion SM2262EN/SM2262ENG/SM2262G", "1.3.0" },
-        { "GAMMIX S11", NULL, CONTROLLER_SMI,
-          "Silicon Motion SM2262EN/SM2262ENG/SM2262G", "1.3.0" },
-        { "XPG S11", NULL, CONTROLLER_SMI,
-          "Silicon Motion SM2262EN/SM2262ENG/SM2262G", "1.3.0" },
-        { "SU800", NULL, CONTROLLER_SMI,
-          "Silicon Motion SM2258/SM2259", NULL },
-        { "AS340", NULL, CONTROLLER_SMI,
-          "Silicon Motion SM2258", NULL },
-        { "AS350", NULL, CONTROLLER_SMI,
-          "Silicon Motion SM2258", NULL },
-        { "", "VE1", CONTROLLER_SMI,
-          "Silicon Motion SM2258", NULL },
-        /* 870 EVO is Samsung's own MKX. Firmware SVT… is that family.
-         * Brand alone does not set the controller. */
-        { "870 EVO", NULL, CONTROLLER_SAMSUNG,
-          "Samsung MKX", NULL },
-        { "870EVO", NULL, CONTROLLER_SAMSUNG,
-          "Samsung MKX", NULL },
-        { "", "SVT", CONTROLLER_SAMSUNG,
-          "Samsung MKX", NULL },
-        { "R5SL", NULL, CONTROLLER_PHISON,
-          "Phison PS3111-S11", NULL },
-        { "", "S11", CONTROLLER_PHISON,
-          "Phison PS3111-S11", NULL },
-        { "GAMMIX S70", NULL, CONTROLLER_INNOGRIT,
-          "Innogrit IG5236", "1.4.0" },
-        { "P210", "U11", CONTROLLER_PHISON,
-          "Phison PS3111-S11", NULL },
-        { "BURST", "U11", CONTROLLER_PHISON,
-          "Phison PS3111-S11", NULL },
-        { "BURST", "U10", CONTROLLER_PHISON,
-          "Phison PS3110-S10", NULL },
-        { "", "U11", CONTROLLER_PHISON,
-          "Phison PS3111-S11", NULL },
-        { "", "U10", CONTROLLER_PHISON,
-          "Phison PS3110-S10", NULL },
-        { "SA400", "SBFK61", CONTROLLER_PHISON,
-          "Phison PS3110-S10", NULL },
-        { "", "SBFK61", CONTROLLER_PHISON,
-          "Phison PS3110-S10", NULL },
-        { "", "SBFK62", CONTROLLER_PHISON,
-          "Phison PS3111-S11", NULL },
-        { "", "SBFK", CONTROLLER_PHISON,
-          "Phison PS3110-S10 / PS3111-S11", NULL },
-        { "", "SBFM", CONTROLLER_PHISON,
-          "Phison PS3111-S11", NULL },
-        { "", "S9FM", CONTROLLER_PHISON,
-          "Phison PS3109-S9", NULL },
-        { "", "T07", CONTROLLER_PHISON,
-          "Phison PS3111-S11", NULL },
-        /* EJ firmware is PS5019-E19. E16 firmware is EGFM, not EJFM.
-         * E19T is the DRAM-less Spatium M450; other EJFM drives stay E19.
-         * Do not invent an NVMe version: Identify already reports 1.4. */
-        { "M450", NULL, CONTROLLER_PHISON,
-          "Phison PS5019-E19T", NULL },
-        { "", "EJFM", CONTROLLER_PHISON,
-          "Phison PS5019-E19", NULL },
-    };
-    char modelU[48], fwU[16];
-    unsigned i;
-    if (!p || p->eType == DRIVE_TYPE_HDD)
-        return;
-    ToUpperCopy(modelU, sizeof(modelU), p->szModel);
-    ToUpperCopy(fwU, sizeof(fwU), p->szFirmware);
-    for (i = 0; i < sizeof(kTab) / sizeof(kTab[0]); i++) {
-        if (kTab[i].model[0] && !strstr(modelU, kTab[i].model))
-            continue;
-        if (kTab[i].fw && !strstr(fwU, kTab[i].fw))
-            continue;
-        if (kTab[i].ctl != CONTROLLER_UNKNOWN)
-            p->eController = kTab[i].ctl;
-        if (kTab[i].chip)
-            safe_snprintf(p->szControllerChip, "%s", kTab[i].chip);
-        if (kTab[i].nvmeVer && p->bIsNVMe &&
-            (p->szProtocol[0] == '\0' || strcmp(p->szProtocol, "NVMe") == 0))
-            safe_snprintf(p->szProtocol, "NVMe %s", kTab[i].nvmeVer);
-        return;
-    }
-}
+
 
 void IdentifyDriveParts(DRIVE_INFO* pInfo)
 {
@@ -1559,7 +1540,8 @@ void IdentifyDriveParts(DRIVE_INFO* pInfo)
          (HasSmartAttr(pInfo, 0xC1) && HasSmartAttr(pInfo, 0x07))))
         pInfo->eType = DRIVE_TYPE_HDD;
     pInfo->eController = DetectDriveController(pInfo);
-    ApplySsdPartIds(pInfo);
+    /* Best profile across every vendor. A miss stays on the generic profile. */
+    ResolveDriveProfile(pInfo);
 }
 
 /* ============================================================

@@ -1,4 +1,4 @@
-/* DriveMonitor - UI language (RU/EN). MIT: see LICENSE. */
+/* DriveMonitor - UI language (RU/EN). GPL-2.0-or-later. See LICENSE. */
 #pragma once
 #ifndef LANG_H
 #define LANG_H

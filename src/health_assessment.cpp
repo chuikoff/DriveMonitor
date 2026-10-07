@@ -1,4 +1,4 @@
-/* DriveMonitor - health assessment and SSD indicators. MIT: see LICENSE. */
+/* DriveMonitor - health assessment and SSD indicators. GPL-2.0-or-later. See LICENSE. */
 #include "smart_internal.h"
 
 /* ============================================================
@@ -187,22 +187,6 @@ static int Clamp100(int v)
     if (v < 0) return 0;
     if (v > 100) return 100;
     return v;
-}
-
-static BOOL FirmwareFamilyRecognized(const DRIVE_INFO* p)
-{
-    char szFwU[16];
-    if (!p || !p->szFirmware[0]) return FALSE;
-    ToUpperCopy(szFwU, sizeof(szFwU), p->szFirmware);
-    if (strncmp(szFwU, "HPS", 3) == 0) return TRUE;
-    if (strncmp(szFwU, "SBF", 3) == 0) return TRUE;
-    if (strncmp(szFwU, "SAFM", 4) == 0) return TRUE;
-    if (strncmp(szFwU, "ECFM", 4) == 0) return TRUE;
-    if (strncmp(szFwU, "E8FM", 4) == 0) return TRUE;
-    if (strncmp(szFwU, "E7FM", 4) == 0) return TRUE;
-    if (strstr(szFwU, "SM22") || strstr(szFwU, "SM23") || strstr(szFwU, "SM25"))
-        return TRUE;
-    return FALSE;
 }
 
 static int CountUnknownAttrs(const DRIVE_INFO* pInfo)
@@ -1231,12 +1215,20 @@ void AssessDriveHealth(DRIVE_INFO* pInfo)
         nConfT = 100;
     }
 
-    if (pInfo->eController != CONTROLLER_UNKNOWN)
+    /* Profile score, not a firmware prefix. Exact and family read as
+     * identified. Generic ATA/NVMe stays partly identified. */
+    if (pInfo->nProfileScore >= PROF_SCORE_EXACT_MODEL)
         nConfM = 99;
-    else if (FirmwareFamilyRecognized(pInfo) || IsPhisonFamily(pInfo))
+    else if (pInfo->nProfileScore >= PROF_SCORE_FAMILY)
+        nConfM = 95;
+    else if (pInfo->nProfileScore >= PROF_SCORE_CONTROLLER)
         nConfM = 90;
+    else if (pInfo->nProfileScore >= PROF_SCORE_VENDOR)
+        nConfM = 80;
     else
         nConfM = 70;
+    if (pInfo->szModelFamily[0] && nConfM < 90)
+        nConfM = 90;
 
     if (pInfo->bIsNVMe) {
         nConfD = 100;
@@ -1342,9 +1334,9 @@ static void LectureAddSplitConfidence(char* buf, int nBuf, const DRIVE_INFO* p)
 static void LectureMatrixRow(char* buf, int nBuf,
                              const char* evid, const char* val, const char* infl)
 {
-    char c1[72], c2[48], c3[40];
+    char c1[72], c2[80], c3[40];
     PadUtf8(c1, (int)sizeof(c1), evid, 28);
-    PadUtf8(c2, (int)sizeof(c2), val, 32);
+    PadUtf8(c2, (int)sizeof(c2), val, 52);
     PadUtf8(c3, (int)sizeof(c3), infl, 16);
     LectureAddF(buf, nBuf, "  %s%s%s\r\n", c1, c2, c3);
 }
@@ -1437,6 +1429,21 @@ static void LectureAddDualStatus(char* szBuf, int nBufLen, const DRIVE_INFO* pIn
         LectureAdd(szBuf, nBufLen,
             "USB-мост не отдаёт SMART RETURN STATUS — это не отказ диска. "
             "Оценка ниже по таблице SMART.\r\n\r\n");
+    if (pInfo->bIsUSB) {
+        char cap[160];
+        FormatUsbCapability(pInfo, cap, (int)sizeof(cap));
+        if (cap[0])
+            LectureAddF(szBuf, nBufLen, TN("Переходник: %s\r\n\r\n",
+                                           "Adapter: %s\r\n\r\n"), cap);
+    }
+    if (pInfo->szModelFamily[0])
+        LectureAddF(szBuf, nBufLen, TN("Семейство: %s\r\n\r\n",
+                                       "Family: %s\r\n\r\n"),
+                    pInfo->szModelFamily);
+    if (pInfo->szDriveDbWarn[0])
+        LectureAddF(szBuf, nBufLen, TN("База дисков: %s\r\n\r\n",
+                                       "Drive database: %s\r\n\r\n"),
+                    pInfo->szDriveDbWarn);
 }
 
 static void FormatHddLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen)
@@ -1498,18 +1505,53 @@ static void FormatHddLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
         break;
     case HEALTH_STATUS_CAUTION:
         LectureAdd(szBuf, nBufLen, TN("Причина:\r\n", "Reason:\r\n"));
-        LectureAdd(szBuf, nBufLen, TN(
-            "Есть реальные признаки деградации носителя.\r\n\r\n",
-            "There are real signs of media degradation.\r\n\r\n"));
-        if (pend > 0)
-            LectureAddF(szBuf, nBufLen, "Ожидающие сектора: %d\r\n", pend);
-        if (r > 0)
-            LectureAddF(szBuf, nBufLen, "Переназначенные сектора: %d\r\n", r);
-        if (pInfo->nRemapEvents > 0)
-            LectureAddF(szBuf, nBufLen, "События переназначения: %d\r\n", pInfo->nRemapEvents);
-        LectureAdd(szBuf, nBufLen,
-            TN("\r\nРекомендация: Держать резервную копию и следить за SMART.\r\n",
-               "\r\nRecommendation: Keep a backup and watch SMART.\r\n"));
+        if (HealthRank(pInfo->eReliability) >= HealthRank(HEALTH_STATUS_CAUTION)) {
+            LectureAdd(szBuf, nBufLen, TN(
+                "Есть реальные признаки деградации носителя.\r\n\r\n",
+                "There are real signs of media degradation.\r\n\r\n"));
+            if (pend > 0)
+                LectureAddF(szBuf, nBufLen, "Ожидающие сектора: %d\r\n", pend);
+            if (r > 0)
+                LectureAddF(szBuf, nBufLen, "Переназначенные сектора: %d\r\n", r);
+            if (pInfo->nRemapEvents > 0)
+                LectureAddF(szBuf, nBufLen, "События переназначения: %d\r\n",
+                            pInfo->nRemapEvents);
+            LectureAdd(szBuf, nBufLen,
+                TN("\r\nРекомендация: Держать резервную копию и следить за SMART.\r\n",
+                   "\r\nRecommendation: Keep a backup and watch SMART.\r\n"));
+        } else if (HealthRank(pInfo->eInterface) >= HealthRank(HEALTH_STATUS_CAUTION)) {
+            LectureAdd(szBuf, nBufLen, TN(
+                "Интерфейс: CRC или таймауты команд. Носитель в норме — кабель, контакт или питание, не поверхность.\r\n",
+                "Interface: CRC or command timeouts. The media is fine — cable, contact, or power, not the platters.\r\n"));
+            if (pInfo->nCrcErrors > 0)
+                LectureAddF(szBuf, nBufLen, TN("  Ошибки CRC: %d\r\n",
+                                               "  CRC errors: %d\r\n"),
+                            pInfo->nCrcErrors);
+            LectureAdd(szBuf, nBufLen, TN(
+                "\r\nРекомендация: Проверить кабель, контакт и питание. Рост CRC важнее абсолютного числа.\r\n",
+                "\r\nRecommendation: Check the cable, contact, and power. A rising CRC count matters more than the total.\r\n"));
+        } else if (HealthRank(pInfo->eTempStatus) >= HealthRank(HEALTH_STATUS_CAUTION)) {
+            LectureAdd(szBuf, nBufLen, TN(
+                "Диск перегрет. Поверхность в норме. Это не повреждение пластин.\r\n",
+                "The drive is too hot. The surface is fine. This is not platter damage.\r\n"));
+            LectureAdd(szBuf, nBufLen, TN(
+                "\r\nРекомендация: Охладить диск и следить за температурой.\r\n",
+                "\r\nRecommendation: Cool the drive and watch the temperature.\r\n"));
+        } else if (HealthRank(pInfo->eMechanics) >= HealthRank(HEALTH_STATUS_CAUTION)) {
+            LectureAdd(szBuf, nBufLen, TN(
+                "Механика требует внимания. Плохих секторов нет — это не повреждение поверхности.\r\n",
+                "Mechanics need attention. There are no bad sectors — the platters are not failing.\r\n"));
+            LectureAdd(szBuf, nBufLen, TN(
+                "\r\nРекомендация: Держать резервную копию и следить за SMART.\r\n",
+                "\r\nRecommendation: Keep a backup and watch SMART.\r\n"));
+        } else {
+            LectureAdd(szBuf, nBufLen, TN(
+                "Есть признаки, требующие наблюдения. Повреждение поверхности не подтверждено.\r\n",
+                "There are signs that need watching. No confirmed media damage.\r\n"));
+            LectureAdd(szBuf, nBufLen, TN(
+                "\r\nРекомендация: Следить за динамикой SMART.\r\n",
+                "\r\nRecommendation: Watch SMART over time.\r\n"));
+        }
         break;
     case HEALTH_STATUS_BAD:
     case HEALTH_STATUS_WARNING:
@@ -2596,27 +2638,55 @@ void ExtractSSDIndicators(DRIVE_INFO* pInfo)
 
         /* Total writes / NAND writes */
         case 0xE9:
-            if (pInfo->nSSDTotalWritesGB < 0)
-                pInfo->nSSDTotalWritesGB = (int)GetRawValue(pA->bRawValue);
-            break;
         case 0xF9:
-            if (pInfo->nSSDTotalWritesGB < 0)
-                pInfo->nSSDTotalWritesGB = (int)GetRawValue(pA->bRawValue);
+            if (pInfo->nSSDTotalWritesGB < 0) {
+                int sem = PROF_SEM_NONE, enc = PROF_ENC_NONE;
+                unsigned __int64 nRaw, nGiB;
+                if (!ProfileLookup(pInfo, pA->bAttrID, &sem, &enc))
+                    break;
+                nRaw = GetRawValue48(pA->bRawValue);
+                nGiB = 0;
+                if (enc == PROF_ENC_BLOCK32)
+                    nGiB = Smi225xHostGiB(nRaw);
+                else if (enc == PROF_ENC_SCALE &&
+                         (pInfo->eType == DRIVE_TYPE_SSD_SATA ||
+                          pInfo->eType == DRIVE_TYPE_M2_SATA))
+                    nGiB = ScaleAtaHostGiB(pInfo, nRaw, FALSE);
+                else if (enc == PROF_ENC_LBA) {
+                    if (nRaw < 2048ULL) break;
+                    nGiB = nRaw / (1024ULL * 1024ULL * 2ULL);
+                } else
+                    nGiB = nRaw;
+                if (nGiB == 0 || nGiB > 4000000ULL) break;
+                pInfo->nSSDTotalWritesGB = (int)nGiB;
+            }
             break;
-        /* Host writes. Only Phison 241/242 is GB or 32 MiB units.
+        /* Host writes. Phison 241/242 is GB or 32 MiB (scaler).
+         * SM2258/SM2259 production firmware is fixed 32 MiB blocks.
          * Other SATA SSDs store LBAs; a sub-GiB count is not a GB total. */
         case 0xF1:
         case 0xF3: {
             unsigned __int64 nRaw, nGiB = 0;
             if (pInfo->nSSDTotalWritesGB >= 0) break;
             nRaw = GetRawValue48(pA->bRawValue);
-            if (IsPhisonFamily(pInfo) &&
-                (pInfo->eType == DRIVE_TYPE_SSD_SATA ||
-                 pInfo->eType == DRIVE_TYPE_M2_SATA)) {
-                nGiB = ScaleAtaHostGiB(pInfo, nRaw);
-            } else {
-                if (nRaw < 2048ULL) break;
-                nGiB = nRaw / (1024ULL * 1024ULL * 2ULL);
+            {
+                int sem = PROF_SEM_NONE, enc = PROF_ENC_NONE;
+                if (!ProfileLookup(pInfo, pA->bAttrID, &sem, &enc))
+                    break;
+                if (enc == PROF_ENC_SCALE &&
+                    (pInfo->eType == DRIVE_TYPE_SSD_SATA ||
+                     pInfo->eType == DRIVE_TYPE_M2_SATA))
+                    nGiB = ScaleAtaHostGiB(pInfo, nRaw, FALSE);
+                else if (enc == PROF_ENC_BLOCK32)
+                    nGiB = Smi225xHostGiB(nRaw);
+                else if (enc == PROF_ENC_LBA) {
+                    if (nRaw < 2048ULL) break;
+                    nGiB = nRaw / (1024ULL * 1024ULL * 2ULL);
+                } else if (enc == PROF_ENC_GIB) {
+                    if (nRaw == 0 || nRaw > 4000000ULL) break;
+                    nGiB = nRaw;
+                } else
+                    break;
             }
             if (nGiB == 0) break;
             if (nGiB > 4000000ULL) nGiB = 4000000ULL;
@@ -2626,19 +2696,40 @@ void ExtractSSDIndicators(DRIVE_INFO* pInfo)
 
         /* Average erase count */
         case 0xA7:
-            if (pInfo->nSSDAvgEraseCount < 0)
+            if (pInfo->nSSDAvgEraseCount < 0 &&
+                ProfileLookup(pInfo, 0xA7, NULL, NULL))
                 pInfo->nSSDAvgEraseCount = (int)GetRawValue(pA->bRawValue);
             break;
         case 0xAD: {
             /* 0xAD: Samsung = wear leveling only; Intel = avg erase only.
-             * Other vendors may fill both when neither is set yet. */
-            int nAd = (int)GetRawValue(pA->bRawValue);
+             * An erase semantic fills the erase counter. A wear semantic
+             * fills wear leveling. Both only when the row names neither. */
+            int nAd, semAd = PROF_SEM_NONE;
+            if (!ProfileLookup(pInfo, 0xAD, &semAd, NULL))
+                break;
+            nAd = (int)GetRawValue(pA->bRawValue);
             if (pInfo->eController == CONTROLLER_SAMSUNG) {
                 if (pInfo->nSSDWearLevelingCount < 0)
                     pInfo->nSSDWearLevelingCount = nAd;
             } else if (pInfo->eController == CONTROLLER_INTEL) {
                 if (pInfo->nSSDAvgEraseCount < 0)
                     pInfo->nSSDAvgEraseCount = nAd;
+            } else if (pInfo->eController == CONTROLLER_PHISON &&
+                       semAd == PROF_SEM_ERASE && nAd > 0xFFFF) {
+                /* Phison 173 packs max in the low 16 bits and average in
+                 * the next 16. The joined integer is not an erase count. */
+                unsigned avg = ((unsigned)nAd >> 16) & 0xFFFFu;
+                unsigned mx = (unsigned)nAd & 0xFFFFu;
+                if (pInfo->nSSDAvgEraseCount < 0 && avg > 0 && avg < 100000u)
+                    pInfo->nSSDAvgEraseCount = (int)avg;
+                if (pInfo->nSSDMaxEraseCount < 0 && mx > 0 && mx < 100000u)
+                    pInfo->nSSDMaxEraseCount = (int)mx;
+            } else if (semAd == PROF_SEM_ERASE) {
+                if (pInfo->nSSDAvgEraseCount < 0)
+                    pInfo->nSSDAvgEraseCount = nAd;
+            } else if (semAd == PROF_SEM_WEAR) {
+                if (pInfo->nSSDWearLevelingCount < 0)
+                    pInfo->nSSDWearLevelingCount = nAd;
             } else {
                 if (pInfo->nSSDWearLevelingCount < 0)
                     pInfo->nSSDWearLevelingCount = nAd;
@@ -2654,34 +2745,41 @@ void ExtractSSDIndicators(DRIVE_INFO* pInfo)
 
         /* Max erase count */
         case 0xA5:
-            if (pInfo->nSSDMaxEraseCount < 0)
+            if (pInfo->nSSDMaxEraseCount < 0 &&
+                ProfileLookup(pInfo, 0xA5, NULL, NULL))
                 pInfo->nSSDMaxEraseCount = (int)GetRawValue(pA->bRawValue);
             break;
 
         /* Min erase count */
         case 0xA6:
-            if (pInfo->nSSDMinEraseCount < 0)
+            if (pInfo->nSSDMinEraseCount < 0 &&
+                ProfileLookup(pInfo, 0xA6, NULL, NULL))
                 pInfo->nSSDMinEraseCount = (int)GetRawValue(pA->bRawValue);
             break;
         }
     }
 
-    /* Phison: A9, else E7. If A9's Value is still the dummy 100 and E7's
-     * Value and RAW are the same percent, E7 is the maintained life counter
-     * (Kingston A400: A9 RAW 40, E7 78/78). Samsung: E7, else attribute 177.
-     * SMI and unknown: no percent. */
-    if (IsPhisonFamily(pInfo)) {
-        if (nE7Agrees && nE7 >= 0 && nA9 >= 0 && nA9 != nE7 && nA9Val >= 90)
-            pInfo->nSSDLifeLeft = nE7;
-        else if (nA9 >= 0)
-            pInfo->nSSDLifeLeft = nA9;
-        else if (nE7 >= 0)
-            pInfo->nSSDLifeLeft = nE7;
-    } else if (pInfo->eController == CONTROLLER_SAMSUNG) {
-        if (nE7 >= 0)
-            pInfo->nSSDLifeLeft = nE7;
-        else if (nB1 >= 0)
-            pInfo->nSSDLifeLeft = nB1;
+    /* Endurance comes from the profile semantics. No profile entry means
+     * the ID is not a life percent, for every vendor. */
+    {
+        int semA9 = PROF_SEM_NONE, semE7 = PROF_SEM_NONE, semB1 = PROF_SEM_NONE;
+        ProfileLookup(pInfo, 0xA9, &semA9, NULL);
+        ProfileLookup(pInfo, 0xE7, &semE7, NULL);
+        ProfileLookup(pInfo, 0xB1, &semB1, NULL);
+        if (semA9 == PROF_SEM_ENDURANCE) {
+            if (IsPhisonFamily(pInfo) && nE7Agrees && nE7 >= 0 &&
+                nA9 >= 0 && nA9 != nE7 && nA9Val >= 90)
+                pInfo->nSSDLifeLeft = nE7;
+            else if (nA9 >= 0)
+                pInfo->nSSDLifeLeft = nA9;
+            else if (nE7 >= 0 && semE7 == PROF_SEM_ENDURANCE)
+                pInfo->nSSDLifeLeft = nE7;
+        } else if (semE7 == PROF_SEM_ENDURANCE) {
+            if (nE7 >= 0)
+                pInfo->nSSDLifeLeft = nE7;
+            else if (nB1 >= 0 && semB1 == PROF_SEM_WEAR)
+                pInfo->nSSDLifeLeft = nB1;
+        }
     }
 }
 

@@ -1,4 +1,4 @@
-/* DriveMonitor - ATA/SATA SMART (IOCTL_ATA_PASS_THROUGH). MIT: see LICENSE. */
+/* DriveMonitor - ATA/SATA SMART (IOCTL_ATA_PASS_THROUGH). GPL-2.0-or-later. See LICENSE. */
 #include "smart_internal.h"
 
 void FillAtaProtocolFromIdent(DRIVE_INFO* pInfo, const WORD* pIdent)
@@ -123,6 +123,7 @@ BOOL GetIdentifyData(HANDLE hDrive, int nDrive, DRIVE_INFO* pInfo)
     pInfo->wRotationRate = pIdent[217];
 
     /* Word 76/77: SATA gen / negotiated speed → szProtocol */
+    pInfo->bCapAtaIdentify = TRUE;
     FillAtaProtocolFromIdent(pInfo, pIdent);
 
     return TRUE;
@@ -421,6 +422,7 @@ BOOL GetIdentifyDataATAPassthrough(HANDLE hDrive, DRIVE_INFO* pInfo)
     pInfo->bSMART_Supported = (pIdent[82] & 0x0001) ? TRUE : FALSE;
     pInfo->bSMART_Enabled   = (pIdent[85] & 0x0001) ? TRUE : FALSE;
     pInfo->wRotationRate    = pIdent[217];
+    pInfo->bCapAtaIdentify = TRUE;
     FillAtaProtocolFromIdent(pInfo, pIdent);
     return TRUE;
 }
@@ -644,6 +646,8 @@ int FillSmartData(DRIVE_INFO* pInfo, const BYTE* pRawBuf)
         pA->bReserved    = pEntry[11];
         nCount++;
     }
+    if (nCount > 0)
+        pInfo->bCapSmartData = TRUE;
     return nCount;
 }
 
@@ -676,6 +680,8 @@ int FillSmartThreshold(DRIVE_INFO* pInfo, const BYTE* pRawBuf)
             }
         }
     }
+    if (nCount > 0)
+        pInfo->bCapSmartThresh = TRUE;
     return nCount;
 }
 
@@ -753,6 +759,8 @@ BOOL AcquireATASMART(HANDLE hDrive, int nDrive, DRIVE_INFO* pInfo, BOOL bReadLog
         }
 
         if (GetSMARTPredictFailure(hDrive, nDrive, &pInfo->bPredictFailure))
+            pInfo->bGotReturnStatus = TRUE;
+        else if (GetSMARTReturnStatusSAT(hDrive, &pInfo->bPredictFailure))
             pInfo->bGotReturnStatus = TRUE;
         ExtractTemperatureFromATA(pInfo);
         ExtractCommonATACounters(pInfo);

@@ -1,4 +1,4 @@
-/* DriveMonitor - main window. MIT: see LICENSE. */
+/* DriveMonitor - main window. GPL-2.0-or-later. See LICENSE. */
 
 #define WIN32_LEAN_AND_MEAN
 #ifndef UNICODE
@@ -165,10 +165,17 @@ static void FormatUsbAdapterName(const DRIVE_INFO* p, char* szBuf, int nBufLen)
     default: break;
     }
 
-    if (chip && p->wUsbVid && p->wUsbPid)
-        safe_snprintf_n(szBuf, nBufLen, "%s (%04X:%04X)", chip,
-                  (unsigned)p->wUsbVid, (unsigned)p->wUsbPid);
-    else if (chip)
+    if (chip && p->wUsbVid && p->wUsbPid) {
+        /* USB_BRIDGE_SAT is also the unknown-VID default. Do not call a
+         * stick SAT when IDENTIFY and SMART both failed. */
+        if (p->eUsbBridgeType == USB_BRIDGE_SAT &&
+            !p->bCapAtaIdentify && !p->bCapSmartData)
+            safe_snprintf_n(szBuf, nBufLen, "VID:%04X PID:%04X",
+                      (unsigned)p->wUsbVid, (unsigned)p->wUsbPid);
+        else
+            safe_snprintf_n(szBuf, nBufLen, "%s (%04X:%04X)", chip,
+                      (unsigned)p->wUsbVid, (unsigned)p->wUsbPid);
+    } else if (chip)
         safe_snprintf_n(szBuf, nBufLen, "%s", chip);
     else if (p->szBridgeVendor[0])
         safe_snprintf_n(szBuf, nBufLen, "%s", p->szBridgeVendor);
@@ -855,6 +862,8 @@ static void DoSaveDriveReport(HWND hWnd)
                   Tr(STR_REPORT_FIELD), Tr(STR_REPORT_VALUE));
     ReportCat(buf, kCap, &len, szLine);
     ReportMdKv(buf, kCap, &len, Tr(STR_MODEL), ReportDash(pInfo->szModel));
+    if (pInfo->szModelFamily[0])
+        ReportMdKv(buf, kCap, &len, TN("Семейство", "Family"), pInfo->szModelFamily);
     {
         const char* brand = GetVendorName(pInfo->eVendor);
         if (pInfo->eVendor == VENDOR_UNKNOWN || pInfo->eVendor == VENDOR_OTHER)
@@ -2534,12 +2543,18 @@ static LPARAM AttrStatusParam(const char* s)
     return (LPARAM)ATTRST_NONE;
 }
 
-static BOOL VendorUsesE7AsLife(DRIVE_CONTROLLER c, DRIVE_TYPE t)
+/* Phison and Samsung 231 are life remaining. Any other SSD uses 231 as a
+ * percent only when the resolved profile says so (Apacer AS350 Lifetime_Left
+ * via drivedb). SMI firmware without that semantic stays temperature. */
+static BOOL E7IsLifePercent(const DRIVE_INFO* p)
 {
-    (void)t;
-    /* Phison E7 is SSD life, not temperature. Samsung 231 is SSD Life Left
-     * once the controller is identified. SMI E7 varies by firmware. */
-    return c == CONTROLLER_PHISON || c == CONTROLLER_SAMSUNG;
+    int sem = PROF_SEM_NONE;
+    if (!p) return FALSE;
+    if (p->eController == CONTROLLER_PHISON ||
+        p->eController == CONTROLLER_SAMSUNG ||
+        IsPhisonFamily(p))
+        return TRUE;
+    return ProfileLookup(p, 0xE7, &sem, NULL) && sem == PROF_SEM_ENDURANCE;
 }
 
 static void FormatSmartValue(BYTE bID, BYTE* pRaw,
@@ -2621,7 +2636,20 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
         else if (w16 <= 100)
             nLife = (int)w16;
 
-        if (VendorUsesE7AsLife(eCtl, eType)) {
+        if (E7IsLifePercent(pDrv)) {
+            /* Non-Samsung life is the low 16 bits of RAW, the same figure
+             * the lecture stores. Value can stay at 100 after RAW steps
+             * (Apacer AS350: Value 100, RAW 99). Samsung RAW is an erase
+             * count, so Value stays. When Value and RAW disagree and the
+             * headline did not take this RAW, keep Value: Phison then
+             * reports life from A9. */
+            if (pDrv && pDrv->eController != CONTROLLER_SAMSUNG && w16 <= 100) {
+                int raw16 = (int)w16;
+                int endurance = pDrv->nEndurancePercent;
+                BOOL disagree = (bVal <= 100 && (int)bVal != raw16);
+                if (!disagree || endurance < 0 || endurance == raw16)
+                    nLife = raw16;
+            }
             if (nLife >= 0)
                 safe_snprintf(szMain, TN("%d%% остаток ресурса", "%d%% life remaining"), nLife);
             else
@@ -2852,12 +2880,41 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
     case 0xF3:
     case 0xF4:
     {
-        /* Phison 241/242: GB or 32 MiB units. Other SATA SSDs are LBAs. */
+        /* An erase/wear row that shares an F1–F4 id is not an LBA counter.
+         * Phison 244 is the average erase count. */
+        {
+            int semF = PROF_SEM_NONE;
+            if (pDrv && ProfileLookup(pDrv, bID, &semF, NULL) &&
+                (semF == PROF_SEM_ERASE || semF == PROF_SEM_WEAR)) {
+                if (qw48 > 0xFFFFFFFFULL)
+                    safe_snprintf(szMain, "%llu", (unsigned long long)qw48);
+                else
+                    safe_snprintf(szMain, "%lu", (unsigned long)dw32);
+                break;
+            }
+        }
+        /* Phison 241/242: GB or 32 MiB units. SM2258/SM2259 is 32 MiB.
+         * Other SATA SSDs are LBAs. Host reads may exceed NAND writes. */
         if (pDrv && IsPhisonFamily(pDrv) &&
             (pDrv->eType == DRIVE_TYPE_SSD_SATA ||
              pDrv->eType == DRIVE_TYPE_M2_SATA) &&
             (bID == 0xF1 || bID == 0xF2)) {
-            unsigned __int64 nGB = ScaleAtaHostGiB(pDrv, qw48);
+            unsigned __int64 nGB = ScaleAtaHostGiB(pDrv, qw48, bID == 0xF2);
+            if (nGB > 4000000ULL)
+                nGB = 4000000ULL;
+            if (bID == 0xF1)
+                safe_snprintf(szMain, TN("%llu ГБ записано хостом",
+                                         "%llu GB written by host"),
+                              (unsigned long long)nGB);
+            else
+                safe_snprintf(szMain, TN("%llu ГБ прочитано хостом",
+                                         "%llu GB read by host"),
+                              (unsigned long long)nGB);
+            break;
+        }
+        if (pDrv && IsSmi225xFamily(pDrv) &&
+            (bID == 0xF1 || bID == 0xF2)) {
+            unsigned __int64 nGB = Smi225xHostGiB(qw48);
             if (nGB > 4000000ULL)
                 nGB = 4000000ULL;
             if (bID == 0xF1)
@@ -2963,7 +3020,12 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
     case 0xAD:
         if (eCtl == CONTROLLER_MICRON)
             safe_snprintf(szMain, "%lu среднее стираний", (unsigned long)dw32);
-        else
+        else if (eCtl == CONTROLLER_PHISON && dw32 > 0xFFFFUL) {
+            unsigned mx = (unsigned)(dw32 & 0xFFFFUL);
+            unsigned avg = (unsigned)((dw32 >> 16) & 0xFFFFUL);
+            safe_snprintf(szMain, TN("макс. %u / средн. %u", "max %u / avg %u"),
+                          mx, avg);
+        } else
             safe_snprintf(szMain, "%lu циклов выравнивания", (unsigned long)dw32);
         break;
 
@@ -3031,6 +3093,22 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
             safe_snprintf(szMain, "%lu", (unsigned long)dw32);
         break;
 
+    case 0xF5:
+        if (pDrv && IsSmi225xFamily(pDrv)) {
+            unsigned __int64 nGB = Smi225xHostGiB(qw48);
+            if (nGB > 4000000ULL)
+                nGB = 4000000ULL;
+            safe_snprintf(szMain, TN("%llu ГБ записано в NAND",
+                                     "%llu GB written to NAND"),
+                          (unsigned long long)nGB);
+            break;
+        }
+        if (qw48 > 0xFFFFFFFFULL)
+            safe_snprintf(szMain, "%llu", (unsigned long long)qw48);
+        else
+            safe_snprintf(szMain, "%lu", (unsigned long)dw32);
+        break;
+
     case 0xF6:
         if (eCtl == CONTROLLER_MICRON) {
             unsigned __int64 nLBA = qw48;
@@ -3084,8 +3162,7 @@ static const char* AtaRowStatus(const DRIVE_INFO* p, const SMART_ATTRIBUTE* a,
     if (ssd && (id == 0xE7 || id == 0xA9)) {
         int nLeft = p->nEndurancePercent;
         BOOL lifeId = (id == 0xA9 && IsPhisonFamily(p)) ||
-                      (id == 0xE7 && (IsPhisonFamily(p) ||
-                                      p->eController == CONTROLLER_SAMSUNG));
+                      (id == 0xE7 && E7IsLifePercent(p));
         if (!lifeId || nLeft < 0) return "Не оценивается";
         if (nLeft >= 0 && nLeft <= 5) return "ПЛОХО";
         if (nLeft >= 0 && nLeft <= 10) return "Внимание";

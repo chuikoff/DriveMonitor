@@ -1,4 +1,4 @@
-/* DriveMonitor - SMART internal types and cross-module API. MIT: see LICENSE. */
+/* DriveMonitor - SMART internal types and cross-module API. GPL-2.0-or-later. See LICENSE. */
 #pragma once
 #ifndef SMART_INTERNAL_H
 #define SMART_INTERNAL_H
@@ -240,6 +240,7 @@ static inline const SMART_ATTRIBUTE* FindAttr(const DRIVE_INFO* pInfo, BYTE id)
 }
 
 void ToUpperCopy(char* dst, int nDst, const char* src);
+BOOL FirmwareIsSmi225x(const char* fw);
 BOOL HasSmartAttr(const DRIVE_INFO* p, BYTE id);
 BOOL DriveIsHdd(const DRIVE_INFO* p);
 

@@ -1,4 +1,4 @@
-/* DriveMonitor - WinMain. MIT: see LICENSE. */
+/* DriveMonitor - WinMain. GPL-2.0-or-later. See LICENSE. */
 
 #ifdef _MSC_VER
 #pragma comment(lib, "comctl32.lib")

@@ -1,4 +1,4 @@
-/* DriveMonitor - icon, manifest, VERSIONINFO. MIT: see LICENSE. */
+/* DriveMonitor - icon, manifest, VERSIONINFO. GPL-2.0-or-later. See LICENSE. */
 
 #include <windows.h>
 #include "resource.h"
@@ -32,11 +32,11 @@ BEGIN
             VALUE "FileDescription",  "DriveMonitor " DRIVEMONITOR_VERSION " (сборка " DRIVEMONITOR_BUILD_STR ")"
             VALUE "FileVersion",      DRIVEMONITOR_FILEVERSION_STR
             VALUE "InternalName",     "DriveMonitor"
-            VALUE "LegalCopyright",   "Copyright (c) 2026 chuikoff. MIT License."
+            VALUE "LegalCopyright",   "Copyright (C) 2026 chuikoff. GPL-2.0-or-later."
             VALUE "OriginalFilename", "DriveMonitor.exe"
             VALUE "ProductName",      "DriveMonitor"
             VALUE "ProductVersion",   DRIVEMONITOR_VERSION
-            VALUE "Comments",         "100% Free Open Source Software. Author: chuikoff. Support: https://boosty.to/chuikoff"
+            VALUE "Comments",         "100% Free Open Source Software. GPL-2.0-or-later. Author: chuikoff. Support: https://boosty.to/chuikoff"
         END
     END
     BLOCK "VarFileInfo"

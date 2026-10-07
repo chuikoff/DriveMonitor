@@ -1,4 +1,4 @@
-/* DriveMonitor - main window. MIT: see LICENSE. */
+/* DriveMonitor - main window. GPL-2.0-or-later. See LICENSE. */
 #pragma once
 #ifndef MAINWND_H
 #define MAINWND_H

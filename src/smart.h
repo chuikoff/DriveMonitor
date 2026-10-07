@@ -1,4 +1,4 @@
-/* DriveMonitor - SMART public API. MIT: see LICENSE. */
+/* DriveMonitor - SMART public API. GPL-2.0-or-later. See LICENSE. */
 
 #pragma once
 #ifndef SMART_H
@@ -392,6 +392,15 @@ typedef struct _SMART_SELF_TEST_LOG {
 /* ============================================================
  * Main drive info structure
  * ============================================================ */
+/* One -v row from the matched drivedb entry. name is for display. */
+#define DRIVEDB_ATTR_MAX 64
+typedef struct _DRIVEDB_ATTR {
+    BYTE id;
+    BYTE sem;
+    BYTE enc;
+    char name[44];
+} DRIVEDB_ATTR;
+
 typedef struct _DRIVE_INFO {
     char        szModel[41];
     char        szSerial[21];
@@ -512,6 +521,20 @@ typedef struct _DRIVE_INFO {
 
     /* Temperature sensors */
     int         nTempSensor[8];          /* NVMe temp sensors 1-8, -1 if N/A */
+
+    /* Profile resolver. 0 = not resolved. Generic ATA/NVMe is 50. */
+    int         nProfileScore;
+    char        szProfileId[48];
+    /* Set when that probe succeeded. USB labels follow these, not a bridge list. */
+    BOOL        bCapAtaIdentify;
+    BOOL        bCapSmartData;
+    BOOL        bCapSmartThresh;
+    /* smartmontools drivedb.h (GPL-2.0-or-later). Family is a label.
+     * It does not set the controller and it does not set a health score. */
+    char        szModelFamily[96];
+    char        szDriveDbWarn[160];
+    int         nDriveDbAttrs;
+    DRIVEDB_ATTR driveDbAttr[DRIVEDB_ATTR_MAX];
 } DRIVE_INFO;
 
 /* ============================================================
@@ -624,6 +647,9 @@ BOOL  GetSMARTAttributesSAT(HANDLE hDrive, DRIVE_INFO* pInfo);
 BOOL  GetSMARTThresholdsSAT(HANDLE hDrive, DRIVE_INFO* pInfo);
 BOOL  GetSMARTViaStorageProtocol(HANDLE hDrive, DRIVE_INFO* pInfo);
 BOOL  GetSMARTPredictFailure(HANDLE hDrive, int nDrive, BOOL* pbFail);
+/* USB SAT: ATA SMART RETURN STATUS (0xDA), registers from the SAT sense
+ * descriptor. TRUE only when LBA mid/high are 4F/C2 or F4/2C. */
+BOOL  GetSMARTReturnStatusSAT(HANDLE hDrive, BOOL* pbFail);
 
 /* SMART Log reading */
 BOOL  GetSMARTErrorLog(HANDLE hDrive, int nDrive, DRIVE_INFO* pInfo);
@@ -681,11 +707,61 @@ BOOL RemapRawIsFlyingHours(const DRIVE_INFO* pInfo, const BYTE* pRaw);
 /* Seagate ID 1/7/195: low 32 = operations, high 16 = errors (SMART attrib spec). */
 DWORD    SeagateRateOps(const BYTE* pRaw);
 unsigned SeagateRateErrs(const BYTE* pRaw);
-/* ATA 241/242 host writes: RAW may be GB, 32 MB units, or 512-byte LBA.
+/* ATA 241/242: RAW may be GB, 32 MiB units, or 512-byte LBA.
  * Pick the encoding that fits erase×capacity and lifetime GB/h.
- * Callers use this for Phison; other SATA SSDs keep the LBA line. */
-unsigned __int64 ScaleAtaHostGiB(const DRIVE_INFO* pInfo, unsigned __int64 raw);
+ * reads is nonzero for a host-read counter: reads may exceed NAND writes.
+ * Callers use this for Phison. SM2258/SM2259 production firmware is a
+ * fixed 32 MiB unit (Smi225xHostGiB), not this heuristic. */
+unsigned __int64 ScaleAtaHostGiB(const DRIVE_INFO* pInfo, unsigned __int64 raw,
+                                 BOOL reads);
+unsigned __int64 Smi225xHostGiB(unsigned __int64 raw);
 BOOL IsPhisonFamily(const DRIVE_INFO* p);
+BOOL IsSmi225xFamily(const DRIVE_INFO* p);
+
+/* Profile resolver. Best candidate wins. Scores:
+ * 100 model+firmware, 98 exact model, 90 family, 80 controller,
+ * 70 vendor, 50 generic ATA/NVMe, 0 none.
+ * A profile describes attribute semantics. It does not store a health score. */
+#define PROF_SCORE_EXACT_FW    100
+#define PROF_SCORE_EXACT_MODEL  98
+#define PROF_SCORE_FAMILY       90
+#define PROF_SCORE_CONTROLLER   80
+#define PROF_SCORE_VENDOR       70
+#define PROF_SCORE_GENERIC      50
+
+#define PROF_SEM_NONE       0
+#define PROF_SEM_ENDURANCE  1
+#define PROF_SEM_HOST_WRITE 2
+#define PROF_SEM_HOST_READ  3
+#define PROF_SEM_ERASE      4
+#define PROF_SEM_WEAR       5
+#define PROF_SEM_MEDIA      6
+#define PROF_SEM_INTERFACE  7
+#define PROF_SEM_MECHANICS  8
+#define PROF_SEM_THERMAL    9
+#define PROF_SEM_NAND_WRITE 10
+
+#define PROF_ENC_NONE    0
+#define PROF_ENC_SCALE   1   /* Phison GB / 32 MiB heuristic */
+#define PROF_ENC_BLOCK32 2   /* fixed 32 MiB blocks */
+#define PROF_ENC_LBA     3
+#define PROF_ENC_PERCENT 4
+#define PROF_ENC_COUNTER 5
+#define PROF_ENC_GIB     6   /* raw value is already GiB */
+
+void ResolveDriveProfile(DRIVE_INFO* p);
+int  DriveProfileScore(const DRIVE_INFO* p);
+/* TRUE when a matching local profile, or the generic profile, lists id.
+ * drivedb rows are not local profiles. */
+BOOL ProfileListsAttr(const DRIVE_INFO* p, BYTE id);
+/* Local profile, then a drivedb -v row, then the generic profile. */
+BOOL ProfileLookup(const DRIVE_INFO* p, BYTE id, int* sem, int* enc);
+/* Fills szModelFamily from drivedb.h. Does not send USB commands. */
+void DriveDbApply(DRIVE_INFO* p);
+const char* DriveDbAttrName(const DRIVE_INFO* p, BYTE id);
+/* TRUE only when the -v name states a health semantic. A bare name is not. */
+BOOL DriveDbLookup(const DRIVE_INFO* p, BYTE id, int* sem, int* enc);
+void FormatUsbCapability(const DRIVE_INFO* p, char* buf, int nBuf);
 
 #ifdef __cplusplus
 }

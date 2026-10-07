@@ -1,5 +1,5 @@
 /* DriveMonitor - NVMe via IOCTL_STORAGE_QUERY_PROPERTY.
- * MIT: see LICENSE.
+ * GPL-2.0-or-later. See LICENSE.
  * Never IOCTL_STORAGE_PROTOCOL_COMMAND — nvme.sys bugchecks on it.
  * Intel RST VMD (iaStorVD): IntelNvm SRB only. ATA/SCSI passthrough
  * and a 4096-byte log-page query bugcheck 0x139. */

@@ -1,4 +1,4 @@
-/* DriveMonitor - UI language. MIT: see LICENSE. */
+/* DriveMonitor - UI language. GPL-2.0-or-later. See LICENSE. */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <string.h>
@@ -34,7 +34,7 @@ static const char* const kRu[STR__COUNT] = {
     "Не удалось извлечь диск (код %lu).",
     "Диск отключён. Шнур можно вынуть.",
     "Мониторинг состояния дисков и S.M.A.R.T. на низком уровне.",
-    "Автор: chuikoff — MIT License",
+    "Автор: chuikoff — GPL-2.0-or-later",
     "Свободное ПО с открытым исходным кодом",
     "Поддержать",
     "DriveMonitor - Screenshot Saved",
@@ -77,7 +77,7 @@ static const char* const kEn[STR__COUNT] = {
     "Could not eject the drive (code %lu).",
     "Drive disconnected. You can unplug the cable.",
     "Low-level disk health and S.M.A.R.T. viewer.",
-    "Author: chuikoff — MIT License",
+    "Author: chuikoff — GPL-2.0-or-later",
     "Free and open-source software",
     "Support",
     "DriveMonitor - Screenshot Saved",

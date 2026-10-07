@@ -1,4 +1,4 @@
-/* DriveMonitor - resource IDs. MIT: see LICENSE. */
+/* DriveMonitor - resource IDs. GPL-2.0-or-later. See LICENSE. */
 #pragma once
 #ifndef RESOURCE_H
 #define RESOURCE_H
@@ -6,11 +6,11 @@
 #define IDI_APPICON     101
 #define IDR_VERSION     1
 
-#define DRIVEMONITOR_VERSION         "1.7"
-#define DRIVEMONITOR_BUILD           23
-#define DRIVEMONITOR_BUILD_STR       "23"
-#define DRIVEMONITOR_FILEVERSION     1,7,0,23
-#define DRIVEMONITOR_FILEVERSION_STR "1.7.23"
+#define DRIVEMONITOR_VERSION         "2.0"
+#define DRIVEMONITOR_BUILD           3
+#define DRIVEMONITOR_BUILD_STR       "3"
+#define DRIVEMONITOR_FILEVERSION     2,0,0,3
+#define DRIVEMONITOR_FILEVERSION_STR "2.0.3"
 
 #define IDC_ADAPTER_LABEL   1027
 #define IDC_ADAPTER_STATIC  1028
