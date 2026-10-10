@@ -170,6 +170,86 @@ unsigned SeagateRateErrs(const BYTE* pRaw)
     return (unsigned)pRaw[4] | ((unsigned)pRaw[5] << 8);
 }
 
+static BOOL HasCI(const char* s, const char* tok)
+{
+    int i, j;
+    if (!s || !tok || !tok[0]) return FALSE;
+    for (i = 0; s[i]; i++) {
+        for (j = 0; tok[j]; j++) {
+            char a = s[i + j];
+            char b = tok[j];
+            if (!a) return FALSE;
+            if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+            if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+            if (a != b) break;
+        }
+        if (!tok[j]) return TRUE;
+    }
+    return FALSE;
+}
+
+/* OOS500G128M / firmware OOS* is a Seagate OEM sold as Utania.
+ * The brand stays Utania. Attributes 1/7/195 still use the Seagate split. */
+static BOOL StartsWithOos(const char* s)
+{
+    if (!s || !s[0] || !s[1] || !s[2]) return FALSE;
+    return (s[0] == 'O' || s[0] == 'o') &&
+           (s[1] == 'O' || s[1] == 'o') &&
+           (s[2] == 'S' || s[2] == 's');
+}
+
+/* ST1000LM024 / ST750LM022 are Samsung SpinPoint M8 with an ST model.
+ * Their attribute 1/7 RAW is not Seagate's error/operation pair. */
+BOOL UseSeagateRateRaw(const DRIVE_INFO* p)
+{
+    BOOL seagateOem;
+    if (!p || p->eType != DRIVE_TYPE_HDD || p->bIsNVMe) return FALSE;
+    seagateOem = (p->eVendor == VENDOR_SEAGATE) ||
+                 (p->eVendor == VENDOR_UTANIA &&
+                  (StartsWithOos(p->szModel) || StartsWithOos(p->szFirmware)));
+    if (!seagateOem) return FALSE;
+    if (HasCI(p->szModelFamily, "SpinPoint") || HasCI(p->szModel, "SpinPoint"))
+        return FALSE;
+    if (HasCI(p->szModelFamily, "HN-M") || HasCI(p->szModel, "HN-M"))
+        return FALSE;
+    return TRUE;
+}
+
+void PhisonMaxAvgHalves(unsigned raw32, unsigned* mx, unsigned* avg)
+{
+    unsigned lo, hi;
+    if (!mx || !avg) return;
+    lo = raw32 & 0xFFFFu;
+    hi = (raw32 >> 16) & 0xFFFFu;
+    /* MKP-521: low half is max, next half is average.
+     * S9FM02.8 stores average first; that pair has average > max. */
+    if (hi > lo) {
+        *mx = hi;
+        *avg = lo;
+    } else {
+        *mx = lo;
+        *avg = hi;
+    }
+}
+
+BOOL DriveDbAttrIsCrc(const DRIVE_INFO* p, BYTE id)
+{
+    int i;
+    if (!p || id == 0) return FALSE;
+    for (i = 0; i < p->nDriveDbAttrs && i < DRIVEDB_ATTR_MAX; i++) {
+        if (p->driveDbAttr[i].id == id && HasCI(p->driveDbAttr[i].name, "crc"))
+            return TRUE;
+    }
+    return FALSE;
+}
+
+BOOL NormalizedWriteErrorScored(BYTE val, BYTE thresh)
+{
+    if (thresh == 0 || val == 0 || val == 255)
+        return FALSE;
+    return val <= 10;
+}
+
 /* ============================================================
  * SMART attribute name table
  * Comprehensive coverage of standard + vendor-specific attributes
@@ -329,115 +409,6 @@ static const ATTR_NAME g_AttrNames[] = {
     { 0x00, NULL,                                ATTR_CRIT_NONE,      INTERP_NORMAL       }
 };
 
-/* Vendor overlay: only IDs whose name differs from generic g_AttrNames.
- * Terminated by id 0. HGST/Hitachi share WD names (generic already matches).
- * Kioxia uses the Toshiba/Phison SATA-SSD overlay. Solidigm is VENDOR_INTEL. */
-typedef struct _ATTR_OVERLAY {
-    BYTE        id;
-    const char* name;
-    const char* nameEn;
-} ATTR_OVERLAY;
-
-static const ATTR_OVERLAY g_OvSeagateHdd[] = {
-    { 0x01, "Частота ошибок чтения (RAW вендора)", "Read Error Rate (vendor RAW)" },
-    { 0xBB, "Неисправимые ошибки", "Uncorrectable errors" },
-    { 0xC3, "Восстановлено ECC (чтение)", "Hardware ECC recovered" },
-    { 0xF0, "Часы полёта головок", "Head flying hours" },
-    { 0x00, NULL, NULL }
-};
-
-static const ATTR_OVERLAY g_OvSamsungSsd[] = {
-    { 0xB1, "Выравнивание износа", "Wear leveling" },
-    { 0xB3, "Использовано резервных блоков", "Used reserved blocks" },
-    { 0xB5, "Ошибки программирования", "Program fail count" },
-    { 0xB6, "Ошибки стирания", "Erase fail count" },
-    { 0xB7, "Плохие блоки (runtime)", "Runtime bad blocks" },
-    { 0xBB, "Неисправимые ошибки", "Uncorrectable errors" },
-    { 0xEB, "Защита от потери питания", "Power-loss protection" },
-    { 0xF5, "Мин. стираний (Samsung)", "Min erase count (Samsung)" },
-    { 0xF6, "Макс. стираний (Samsung)", "Max erase count (Samsung)" },
-    { 0xF7, "Среднее стираний (Samsung)", "Average erase count (Samsung)" },
-    { 0xF8, "Выравнивание износа (Samsung)", "Wear leveling (Samsung)" },
-    { 0x00, NULL, NULL }
-};
-
-static const ATTR_OVERLAY g_OvPhisonSsd[] = {
-    { 0xE7, "Остаток ресурса SSD", "SSD life remaining" },
-    { 0xE9, "Записи NAND (ГиБ)", "NAND writes (GiB)" },
-    { 0x00, NULL, NULL }
-};
-
-static const ATTR_OVERLAY g_OvToshibaHdd[] = {
-    { 0xC7, "Ошибки CRC", "CRC errors" },
-    { 0x00, NULL, NULL }
-};
-
-static const ATTR_OVERLAY g_OvMicronSsd[] = {
-    { 0xCA, "Остаток ресурса %", "Percent lifetime remaining" },
-    { 0xF6, "Записано секторов хоста", "Host sectors written" },
-    { 0xAD, "Среднее стираний", "Average erase count" },
-    { 0x00, NULL, NULL }
-};
-
-static const ATTR_OVERLAY g_OvIntelSsd[] = {
-    { 0xAA, "Доступное резервное пространство", "Available reserved space" },
-    { 0xE1, "Записи хоста", "Host writes" },
-    { 0xE2, "Таймер нагрузки", "Timed workload" },
-    { 0xE8, "Доступное резервное пространство", "Available reserved space" },
-    { 0xE9, "Индикатор износа", "Media wear-out indicator" },
-    { 0x00, NULL, NULL }
-};
-
-static const char* LookupOverlay(const ATTR_OVERLAY* tab, BYTE bID)
-{
-    int i;
-    if (!tab) return NULL;
-    for (i = 0; tab[i].id != 0; i++) {
-        if (tab[i].id == bID)
-            return (UiLangIsEn() && tab[i].nameEn) ? tab[i].nameEn : tab[i].name;
-    }
-    return NULL;
-}
-
-static const ATTR_OVERLAY* OverlayFor(const DRIVE_INFO* p)
-{
-    DRIVE_TYPE t;
-    DRIVE_CONTROLLER c;
-    BOOL ssd, hdd;
-    if (!p) return NULL;
-    t = p->eType;
-    c = p->eController;
-    ssd = (t == DRIVE_TYPE_SSD_SATA || t == DRIVE_TYPE_M2_SATA);
-    hdd = (t == DRIVE_TYPE_HDD);
-    if (t == DRIVE_TYPE_NVME)
-        return NULL;
-
-    /* Overlays key off controller, not brand (Kingston A400 is Phison). */
-    switch (c) {
-    case CONTROLLER_PHISON:
-        return g_OvPhisonSsd;
-    case CONTROLLER_SAMSUNG:
-        return hdd ? NULL : g_OvSamsungSsd;
-    case CONTROLLER_INTEL:
-        return g_OvIntelSsd;
-    case CONTROLLER_MICRON:
-        return g_OvMicronSsd;
-    case CONTROLLER_SEAGATE:
-        return ssd ? NULL : g_OvSeagateHdd;
-    case CONTROLLER_TOSHIBA:
-        return ssd ? NULL : g_OvToshibaHdd;
-    default:
-        break;
-    }
-    /* Seagate HDD brand + HDD type keeps the Seagate overlay even if the
-     * MCU was left UNKNOWN. Toshiba HDD CRC overlay similarly. */
-    if (hdd && p->eVendor == VENDOR_SEAGATE)
-        return g_OvSeagateHdd;
-    if (hdd && p->eVendor == VENDOR_TOSHIBA)
-        return g_OvToshibaHdd;
-    return NULL;
-}
-
 static char g_szVendorAttrName[256][48];
 static UI_LANG g_vendorAttrLang = (UI_LANG)(-1);
 
@@ -465,34 +436,9 @@ BOOL IsPhisonFamily(const DRIVE_INFO* p)
     return p->eController == CONTROLLER_PHISON;
 }
 
-/* SM2258/SM2259 production firmware: letter, four digits, letter, digit.
- * U0524A0, U0817A0, V1205A0, T0910A0.
- * U11, U10, T07, and S11 plus a digit (U1127B0, S1127B0) have that shape.
- * The prefix does not select the Phison decoder. It only stays out of this
- * SM2258/SM2259 match, so the drive stays unidentified until a model row hits. */
-BOOL FirmwareIsSmi225x(const char* fw)
-{
-    int i;
-    if (!fw) return FALSE;
-    for (i = 0; i < 7; i++) {
-        if (!fw[i]) return FALSE;
-    }
-    if (fw[7] != '\0') return FALSE;
-    if (!isalpha((unsigned char)fw[0]) || !isalpha((unsigned char)fw[5]))
-        return FALSE;
-    if (!isdigit((unsigned char)fw[1]) || !isdigit((unsigned char)fw[2]) ||
-        !isdigit((unsigned char)fw[3]) || !isdigit((unsigned char)fw[4]) ||
-        !isdigit((unsigned char)fw[6]))
-        return FALSE;
-    if (strncmp(fw, "U11", 3) == 0 || strncmp(fw, "U10", 3) == 0 ||
-        strncmp(fw, "T07", 3) == 0)
-        return FALSE;
-    if (fw[0] == 'S' && fw[1] == '1' && fw[2] == '1' &&
-        fw[3] >= '0' && fw[3] <= '9')
-        return FALSE;
-    return TRUE;
-}
-
+/* SM2258/SM2259 shape lives in profile.cpp (FirmwareIsSmi225x).
+ * The shape does not select a controller. A model row or an already
+ * identified Silicon Motion controller has to name it. */
 BOOL IsSmi225xFamily(const DRIVE_INFO* p)
 {
     char fw[16];
@@ -563,11 +509,6 @@ static BOOL IsAtaSsdTypeInfo(const DRIVE_INFO* p)
     return p->eType == DRIVE_TYPE_SSD_SATA || p->eType == DRIVE_TYPE_M2_SATA;
 }
 
-BOOL DriveIsHdd(const DRIVE_INFO* p)
-{
-    return p && p->eType == DRIVE_TYPE_HDD && !p->bIsNVMe;
-}
-
 BOOL DriveTreatsC0AsPowerLoss(const DRIVE_INFO* pInfo)
 {
     if (!pInfo) return FALSE;
@@ -610,176 +551,6 @@ static RAW_ENC EncFromInterp(ATTR_INTERP e)
     }
 }
 
-static void ApplyPhisonSsdDecode(BYTE bID, ATTR_DECODE* out)
-{
-    switch (bID) {
-    case 0xA0:
-        out->szName = TN("Внезапные выключения", "Unsafe shutdowns");
-        out->eEnc = RAW_ENC_COUNTER32;
-        out->eState = ATTR_DECODE_KNOWN;
-        out->nSemanticConfidence = 70;
-        out->eCrit = ATTR_CRIT_NONE;
-        break;
-    case 0xA1:
-        out->szName = TN("Резервные блоки (осталось)", "Spare blocks remaining");
-        out->eEnc = RAW_ENC_COUNTER32;
-        out->eState = ATTR_DECODE_KNOWN;
-        out->nSemanticConfidence = 80;
-        out->eCrit = ATTR_CRIT_ADVISORY;
-        break;
-    case 0xA3:
-        out->szName = TN("Начальные плохие блоки", "Initial bad blocks");
-        out->eEnc = RAW_ENC_COUNTER32;
-        out->eState = ATTR_DECODE_KNOWN;
-        out->nSemanticConfidence = 80;
-        out->eCrit = ATTR_CRIT_NONE;
-        break;
-    case 0xA4:
-        out->szName = TN("Всего стираний", "Total erase count");
-        out->eEnc = RAW_ENC_COUNTER32;
-        out->eState = ATTR_DECODE_KNOWN;
-        out->nSemanticConfidence = 80;
-        out->eCrit = ATTR_CRIT_NONE;
-        break;
-    case 0xA5:
-        out->szName = TN("Макс. стираний", "Max erase count");
-        out->eEnc = RAW_ENC_COUNTER32;
-        out->eState = ATTR_DECODE_KNOWN;
-        out->nSemanticConfidence = 80;
-        out->eCrit = ATTR_CRIT_NONE;
-        break;
-    case 0xA6:
-        out->szName = TN("Мин. стираний", "Min erase count");
-        out->eEnc = RAW_ENC_COUNTER32;
-        out->eState = ATTR_DECODE_KNOWN;
-        out->nSemanticConfidence = 80;
-        out->eCrit = ATTR_CRIT_NONE;
-        break;
-    case 0xA7:
-        out->szName = TN("Среднее стираний", "Average erase count");
-        out->eEnc = RAW_ENC_COUNTER32;
-        out->eState = ATTR_DECODE_KNOWN;
-        out->nSemanticConfidence = 80;
-        out->eCrit = ATTR_CRIT_NONE;
-        break;
-    case 0xA8:
-        out->szName = TN("Макс. стираний по спецификации", "Specified max erase count");
-        out->eEnc = RAW_ENC_COUNTER32;
-        out->eState = ATTR_DECODE_KNOWN;
-        out->nSemanticConfidence = 75;
-        out->eCrit = ATTR_CRIT_NONE;
-        break;
-    case 0xA9:
-        out->szName = TN("Заявленный остаток ресурса", "Reported life remaining");
-        out->eEnc = RAW_ENC_PERCENT;
-        out->eState = ATTR_DECODE_KNOWN;
-        out->nSemanticConfidence = 85;
-        out->eCrit = ATTR_CRIT_ADVISORY;
-        break;
-    case 0xAF:
-        out->szName = TN("Сбой защиты питания", "Power-loss protection fail");
-        out->eEnc = RAW_ENC_COUNTER32;
-        out->eState = ATTR_DECODE_KNOWN;
-        out->nSemanticConfidence = 70;
-        out->eCrit = ATTR_CRIT_CRITICAL;
-        break;
-    case 0xC0:
-        out->szName = TN("Аварийные отключения питания", "Unsafe power-off events");
-        out->eEnc = RAW_ENC_COUNTER32;
-        out->eState = ATTR_DECODE_KNOWN;
-        out->nSemanticConfidence = 80;
-        out->eCrit = ATTR_CRIT_NONE;
-        break;
-    case 0xB0:
-        out->szName = TN("Ошибки стирания (худший кристалл)", "Erase fails (worst die)");
-        out->eEnc = RAW_ENC_UNKNOWN;
-        out->eState = ATTR_DECODE_UNKNOWN;
-        out->nSemanticConfidence = 70;
-        out->eCrit = ATTR_CRIT_NONE;
-        break;
-    case 0xB1:
-        out->szName = TN("Всего циклов выравнивания износа", "Wear-leveling count");
-        out->eEnc = RAW_ENC_UNKNOWN;
-        out->eState = ATTR_DECODE_UNKNOWN;
-        out->nSemanticConfidence = 70;
-        out->eCrit = ATTR_CRIT_NONE;
-        break;
-    case 0xB2:
-        out->szName = TN("Резервные блоки (использовано)", "Used spare blocks");
-        out->eEnc = RAW_ENC_COUNTER32;
-        out->eState = ATTR_DECODE_KNOWN;
-        out->nSemanticConfidence = 70;
-        out->eCrit = ATTR_CRIT_ADVISORY;
-        break;
-    case 0xB5:
-        out->szName = TN("Ошибки программирования (всего)", "Program fail count");
-        out->eEnc = RAW_ENC_COUNTER32;
-        out->eState = ATTR_DECODE_KNOWN;
-        out->nSemanticConfidence = 85;
-        out->eCrit = ATTR_CRIT_CRITICAL;
-        break;
-    case 0xB6:
-        out->szName = TN("Ошибки стирания (всего)", "Erase fail count");
-        out->eEnc = RAW_ENC_COUNTER32;
-        out->eState = ATTR_DECODE_KNOWN;
-        out->nSemanticConfidence = 85;
-        out->eCrit = ATTR_CRIT_CRITICAL;
-        break;
-    case 0xC3:
-        out->szName = TN("ECC (вендор)", "ECC (vendor)");
-        out->eEnc = RAW_ENC_UNKNOWN;
-        out->eState = ATTR_DECODE_UNKNOWN;
-        out->nSemanticConfidence = 50;
-        out->eCrit = ATTR_CRIT_NONE;
-        break;
-    case 0xE7:
-        out->szName = TN("Остаток ресурса SSD", "SSD life remaining");
-        out->eEnc = RAW_ENC_PERCENT;
-        out->eState = ATTR_DECODE_KNOWN;
-        out->nSemanticConfidence = 80;
-        out->eCrit = ATTR_CRIT_ADVISORY;
-        break;
-    case 0xE8:
-        out->szName = TN("Резервное пространство", "Available reserved space");
-        out->eEnc = RAW_ENC_PERCENT;
-        out->eState = ATTR_DECODE_KNOWN;
-        out->nSemanticConfidence = 80;
-        out->eCrit = ATTR_CRIT_ADVISORY;
-        break;
-    case 0xE9:
-        out->szName = TN("Записи NAND (ГиБ)", "NAND writes (GiB)");
-        out->eEnc = RAW_ENC_COUNTER32;
-        out->eState = ATTR_DECODE_KNOWN;
-        out->nSemanticConfidence = 75;
-        out->eCrit = ATTR_CRIT_NONE;
-        break;
-    case 0xF1:
-        out->szName = TN("Записано хостом (ГБ)", "Host written (GB)");
-        out->eEnc = RAW_ENC_COUNTER32;
-        out->eState = ATTR_DECODE_KNOWN;
-        out->nSemanticConfidence = 85;
-        out->eCrit = ATTR_CRIT_NONE;
-        break;
-    case 0xF2:
-        out->szName = TN("Прочитано хостом (ГБ)", "Host read (GB)");
-        out->eEnc = RAW_ENC_COUNTER32;
-        out->eState = ATTR_DECODE_KNOWN;
-        out->nSemanticConfidence = 85;
-        out->eCrit = ATTR_CRIT_NONE;
-        break;
-    case 0xF5:
-    case 0xF6:
-    case 0xF7:
-        out->szName = VendorSpecificAttrName(bID);
-        out->eEnc = RAW_ENC_UNKNOWN;
-        out->eState = ATTR_DECODE_UNKNOWN;
-        out->nSemanticConfidence = 0;
-        out->eCrit = ATTR_CRIT_NONE;
-        break;
-    default:
-        break;
-    }
-}
 
 static const char* AttrNameEn(BYTE id)
 {
@@ -846,11 +617,96 @@ static const char* AttrNameEn(BYTE id)
     }
 }
 
+static int CiContains(const char* s, const char* tok)
+{
+    char low[64], tlow[32];
+    int i, n, m;
+    if (!s || !tok || !tok[0]) return 0;
+    n = 0;
+    for (i = 0; s[i] && n < (int)sizeof(low) - 1; i++)
+        low[n++] = (char)tolower((unsigned char)s[i]);
+    low[n] = '\0';
+    m = 0;
+    for (i = 0; tok[i] && m < (int)sizeof(tlow) - 1; i++)
+        tlow[m++] = (char)tolower((unsigned char)tok[i]);
+    tlow[m] = '\0';
+    return strstr(low, tlow) != NULL;
+}
+
+/* drivedb stores the English -v name with spaces. Unknown_* stays unnamed.
+ * A name we do not translate is still a decode: the English label is shown. */
+static const char* DbDisplayName(const char* name)
+{
+    if (!name || !name[0]) return NULL;
+    if (CiContains(name, "unknown") || CiContains(name, "unkn"))
+        return NULL;
+    if (CiContains(name, "not in use"))
+        return TN("Не используется", "Not in use");
+    if (CiContains(name, "uncorrect"))
+        return TN("Неисправимые ошибки", "Uncorrectable errors");
+    if (CiContains(name, "maxavgerase") || CiContains(name, "max avg"))
+        return TN("Макс./средн. стираний", "Max/avg erase");
+    if (CiContains(name, "avgerase") || CiContains(name, "average erase") ||
+        CiContains(name, "avg erase"))
+        return TN("Среднее стираний", "Average erase count");
+    if (CiContains(name, "min erase"))
+        return TN("Мин. стираний", "Min erase count");
+    if (CiContains(name, "max erase"))
+        return TN("Макс. стираний", "Max erase count");
+    if (CiContains(name, "total erase"))
+        return TN("Всего стираний", "Total erase count");
+    if (CiContains(name, "program fail"))
+        return TN("Ошибки программирования", "Program fail count");
+    if (CiContains(name, "erase fail"))
+        return TN("Ошибки стирания", "Erase fail count");
+    if (CiContains(name, "unexpect") || CiContains(name, "unsafe shutdown") ||
+        CiContains(name, "unexpected power"))
+        return TN("Внезапная потеря питания", "Unexpected power loss");
+    if (CiContains(name, "supercap"))
+        return TN("Состояние суперконденсатора", "Supercap status");
+    if (CiContains(name, "downshift"))
+        return TN("Понижения SATA", "SATA downshift");
+    if (CiContains(name, "sata phy") || CiContains(name, "phy error"))
+        return TN("Ошибки SATA PHY", "SATA PHY errors");
+    if (CiContains(name, "bad blk") || CiContains(name, "bad block"))
+        return TN("Плохие блоки", "Bad blocks");
+    if (CiContains(name, "wear level"))
+        return TN("Выравнивание износа", "Wear leveling");
+    if (CiContains(name, "life left") || CiContains(name, "ssd life") ||
+        CiContains(name, "remaining life") || CiContains(name, "lifetime left"))
+        return TN("Остаток ресурса SSD", "SSD life remaining");
+    if (CiContains(name, "lifetime write"))
+        return TN("Запись хоста", "Host writes");
+    if (CiContains(name, "lifetime read"))
+        return TN("Чтение хоста", "Host reads");
+    if (CiContains(name, "spare"))
+        return TN("Резервные блоки", "Spare blocks");
+    if (CiContains(name, "crc"))
+        return TN("Ошибки CRC", "CRC errors");
+    return name;
+}
+
+static RAW_ENC RawEncFromProf(int enc)
+{
+    switch (enc) {
+    case PROF_ENC_PERCENT: return RAW_ENC_PERCENT;
+    case PROF_ENC_LBA:     return RAW_ENC_LBA;
+    case PROF_ENC_COUNTER:
+    case PROF_ENC_MAXAVG:
+    case PROF_ENC_PAIR:
+    case PROF_ENC_GIB:
+    case PROF_ENC_BLOCK32:
+    case PROF_ENC_SCALE:
+        return RAW_ENC_COUNTER48;
+    default:
+        return RAW_ENC_UNKNOWN;
+    }
+}
+
+
 void GetAttrDecode(BYTE bID, const DRIVE_INFO* pInfo, ATTR_DECODE* out)
 {
     int i;
-    const char* ovl;
-    BOOL bOverlayTrustsEnc;
 
     if (!out) return;
     InitVendorAttrNames();
@@ -893,10 +749,6 @@ void GetAttrDecode(BYTE bID, const DRIVE_INFO* pInfo, ATTR_DECODE* out)
     default: break;
     }
 
-    ovl = LookupOverlay(OverlayFor(pInfo), bID);
-    if (ovl)
-        out->szName = ovl;
-
     /* HDD must not inherit SSD NAND/endurance names if the same ID exists. */
     if (DriveIsHdd(pInfo)) {
         switch (bID) {
@@ -937,22 +789,8 @@ void GetAttrDecode(BYTE bID, const DRIVE_INFO* pInfo, ATTR_DECODE* out)
         }
     }
 
-    /* Overlay on Samsung/Intel/Micron is a trusted profile for that ID.
-     * Phison overlay is names-only for E7/E9; encoding comes from ApplyPhison. */
-    bOverlayTrustsEnc = FALSE;
-    if (ovl && pInfo) {
-        switch (pInfo->eController) {
-        case CONTROLLER_SAMSUNG:
-        case CONTROLLER_INTEL:
-        case CONTROLLER_MICRON:
-            bOverlayTrustsEnc = TRUE;
-            break;
-        default:
-            break;
-        }
-    }
-
-    if (IsVendorSpecificId(bID) && !bOverlayTrustsEnc) {
+    /* A vendor id has no trusted packing until a profile names it. */
+    if (IsVendorSpecificId(bID)) {
         BOOL bSsdLike = TRUE; /* no pInfo: do not claim a universal encoding */
         if (pInfo) {
             bSsdLike = (pInfo->eType == DRIVE_TYPE_SSD_SATA ||
@@ -963,8 +801,7 @@ void GetAttrDecode(BYTE bID, const DRIVE_INFO* pInfo, ATTR_DECODE* out)
         if (bSsdLike) {
             out->eEnc = RAW_ENC_UNKNOWN;
             out->eCrit = ATTR_CRIT_NONE;
-            /* Keep the name. Profile (Phison) may restore KNOWN below. */
-            if (!ovl && out->nSemanticConfidence > 30)
+            if (out->nSemanticConfidence > 30)
                 out->nSemanticConfidence = 30;
         } else if (bID == 0xB5 || bID == 0xB6 || bID == 0xAB || bID == 0xAC) {
             /* SSD names on an HDD — packing is not a program-fail count. */
@@ -972,26 +809,6 @@ void GetAttrDecode(BYTE bID, const DRIVE_INFO* pInfo, ATTR_DECODE* out)
             out->eCrit = ATTR_CRIT_NONE;
             out->nSemanticConfidence = 40;
         }
-    }
-
-    if (IsPhisonFamily(pInfo))
-        ApplyPhisonSsdDecode(bID, out);
-
-    /* SM2258/SM2259: 241/242/245 counts are 32 MiB blocks, not LBAs.
-     * Showing the raw count as LBA makes a few hundred GiB look like
-     * a handful of sectors next to the power-on hours. */
-    if (IsSmi225xFamily(pInfo) &&
-        (bID == 0xF1 || bID == 0xF2 || bID == 0xF5)) {
-        if (bID == 0xF1)
-            out->szName = TN("Записано хостом", "Host written");
-        else if (bID == 0xF2)
-            out->szName = TN("Прочитано хостом", "Host read");
-        else
-            out->szName = TN("Записи NAND", "NAND writes");
-        out->eEnc = RAW_ENC_COUNTER48;
-        out->eState = ATTR_DECODE_KNOWN;
-        out->nSemanticConfidence = 80;
-        out->eCrit = ATTR_CRIT_NONE;
     }
 
     /* A9/E7 are life remaining only for a known profile. The ID alone is not. */
@@ -1019,14 +836,6 @@ void GetAttrDecode(BYTE bID, const DRIVE_INFO* pInfo, ATTR_DECODE* out)
         out->eCrit = ATTR_CRIT_NONE;
         out->nSemanticConfidence = 30;
     }
-    if (pInfo && bID == 0xE7 && pInfo->eController == CONTROLLER_SAMSUNG &&
-        !IsPhisonFamily(pInfo)) {
-        out->szName = TN("Остаток ресурса SSD", "SSD life remaining");
-        out->eEnc = RAW_ENC_PERCENT;
-        out->eState = ATTR_DECODE_KNOWN;
-        out->eCrit = ATTR_CRIT_ADVISORY;
-        out->nSemanticConfidence = 80;
-    }
 
     /* SSD C0 is emergency/unsafe power-off count, not HDD head-park. */
     if (bID == 0xC0 && DriveTreatsC0AsPowerLoss(pInfo)) {
@@ -1049,30 +858,84 @@ void GetAttrDecode(BYTE bID, const DRIVE_INFO* pInfo, ATTR_DECODE* out)
     }
 
     /* A local profile keeps its own name. drivedb names the IDs that
-     * profile does not list. Anything else stays an unnamed RAW. */
+     * profile does not list. A raw format is a decode even when the name
+     * is not a health semantic. Unknown_* stays unnamed. */
     if (pInfo && !ProfileListsAttr(pInfo, bID)) {
-        const char* dbName = DriveDbAttrName(pInfo, bID);
+        const char* dbRaw = DriveDbAttrName(pInfo, bID);
+        const char* dbName = DbDisplayName(dbRaw);
         if (dbName && dbName[0]) {
             int sem = PROF_SEM_NONE, enc = PROF_ENC_NONE;
             out->szName = dbName;
             out->eCrit = ATTR_CRIT_NONE;
             out->nSemanticConfidence = 75;
-            if (DriveDbLookup(pInfo, bID, &sem, &enc)) {
-                if (enc == PROF_ENC_PERCENT)
-                    out->eEnc = RAW_ENC_PERCENT;
-                else if (enc == PROF_ENC_LBA)
-                    out->eEnc = RAW_ENC_LBA;
-                else
-                    out->eEnc = RAW_ENC_COUNTER48;
-            } else {
+            if (DriveDbAttrEnc(pInfo, bID, &sem, &enc) && enc != PROF_ENC_NONE)
+                out->eEnc = RawEncFromProf(enc);
+            else
                 out->eEnc = RAW_ENC_UNKNOWN;
-            }
         } else if (IsVendorSpecificId(bID)) {
-            out->szName = VendorSpecificAttrName(bID);
-            out->eEnc = RAW_ENC_UNKNOWN;
-            out->eCrit = ATTR_CRIT_NONE;
-            out->nSemanticConfidence = 30;
+            /* HDD 183/184/240 keep the generic ATA names. Samsung SSD
+             * 183 is not a SATA downshift and is forced unnamed below. */
+            BOOL keepHdd = DriveIsHdd(pInfo) &&
+                (bID == 0xB7 || bID == 0xB8 || bID == 0xF0);
+            /* 187 stays the standard counter when RAW decodes as a count.
+             * Hitachi packing (decode < 0) stays unnamed and is not scored. */
+            BOOL keep187 = FALSE;
+            if (!keepHdd && bID == 0xBB) {
+                const SMART_ATTRIBUTE* a187 = FindAttr(pInfo, 0xBB);
+                if (a187 &&
+                    DecodeReportedUncorrect(a187->bRawValue, pInfo->eVendor) >= 0)
+                    keep187 = TRUE;
+            }
+            if (keepHdd) {
+                /* name and encoding already set from the generic table */
+            } else if (keep187) {
+                out->szName = TN("Неисправимые ошибки", "Uncorrectable errors");
+                out->eEnc = RAW_ENC_COUNTER32;
+                out->eCrit = ATTR_CRIT_CRITICAL;
+                out->nSemanticConfidence = 70;
+            } else {
+                out->szName = VendorSpecificAttrName(bID);
+                out->eEnc = RAW_ENC_UNKNOWN;
+                out->eCrit = ATTR_CRIT_NONE;
+                out->nSemanticConfidence = 30;
+            }
         }
+    }
+
+    /* A confirmed profile name replaces the generic label. A contested
+     * profile does not. 245 uses the alt name when attribute 165 is absent. */
+    if (pInfo) {
+        int semL = PROF_SEM_NONE, encL = PROF_ENC_NONE;
+        const char* ru = NULL;
+        const char* en = NULL;
+        const char* altRu = NULL;
+        const char* altEn = NULL;
+        unsigned char unless = 0;
+        const char* name;
+        if (ProfileAttrLabel(pInfo, bID, &semL, &encL, &ru, &en,
+                             &unless, &altRu, &altEn)) {
+            name = (UiLangIsEn() && en) ? en : ru;
+            if (unless && !HasSmartAttr(pInfo, unless)) {
+                const char* alt = (UiLangIsEn() && altEn) ? altEn : altRu;
+                if (alt && alt[0]) name = alt;
+            }
+            if (name && name[0])
+                out->szName = name;
+            out->eEnc = (encL == PROF_ENC_NONE) ? RAW_ENC_UNKNOWN
+                                                : RawEncFromProf(encL);
+            if (out->nSemanticConfidence < 80)
+                out->nSemanticConfidence = 80;
+        }
+    }
+
+    /* Samsung 176/181/183/184 stay unnamed. 181 on PM871 is not a fail
+     * count, and 183 is not a SATA downshift. */
+    if (pInfo && pInfo->eController == CONTROLLER_SAMSUNG && !DriveIsHdd(pInfo) &&
+        (bID == 0xB0 || bID == 0xB5 || bID == 0xB7 || bID == 0xB8)) {
+        out->szName = VendorSpecificAttrName(bID);
+        out->eEnc = RAW_ENC_UNKNOWN;
+        out->eCrit = ATTR_CRIT_NONE;
+        out->nSemanticConfidence = 30;
     }
 
     out->eState = (out->eEnc == RAW_ENC_UNKNOWN)
@@ -1130,6 +993,8 @@ const char* GetDiskStatusName(const DRIVE_INFO* p)
         return Tr(STR_HS_UNK);
     if (p->eDiskStatus != HEALTH_STATUS_UNKNOWN)
         return GetHealthStatusName(p->eDiskStatus);
+    if (SmartSnapshotRejected(p))
+        return Tr(STR_SMART_DATA_ERR);
     if (p->bIsUSB && p->bSMART_Supported)
         return Tr(STR_NO_BRIDGE_STATUS);
     if (p->bIsUSB)
@@ -1362,17 +1227,6 @@ DRIVE_VENDOR DetectDriveVendor(const char* szModel)
     return VENDOR_UNKNOWN;
 }
 
-void ToUpperCopy(char* dst, int nDst, const char* src)
-{
-    int i;
-    if (!dst || nDst <= 0) return;
-    dst[0] = '\0';
-    if (!src) return;
-    for (i = 0; i < nDst - 1 && src[i]; i++)
-        dst[i] = (char)toupper((unsigned char)src[i]);
-    dst[i] = '\0';
-}
-
 BOOL HasSmartAttr(const DRIVE_INFO* p, BYTE id)
 {
     int i;
@@ -1462,40 +1316,30 @@ static DRIVE_CONTROLLER DetectDriveController(const DRIVE_INFO* p)
     if (p->bIsUSB && !p->bSMART_Supported && !p->bIsNVMe)
         return CONTROLLER_UNKNOWN;
 
-    /* 2. Model and firmware tokens that name the ASIC.
-     * A Phison-shaped prefix (U11, U10, HPS, SBFK, EJFM, S11…) is not
-     * one of them: the same letters show up on other SSD families.
-     * Phison is a PCI VID above, or a model row in ApplySsdPartIds. */
+    /* 2. A model, or a token that names the ASIC (SM225, RTS576).
+     * PCI VID was handled above. A firmware shape is not an identifier:
+     * U0524A0, VE+digit, SANA, SVT, U11, SBFK. The profile table uses
+     * those only together with a model, or after the controller is known. */
 
     /* Token match: "ASM225" must not count as SM225. */
     if (ModelHasChipToken(szModelU, "SM226") || ModelHasChipToken(szModelU, "SM225") ||
         ModelHasChipToken(szModelU, "SM232") || ModelHasChipToken(szModelU, "SM250") ||
         strstr(szFwU, "SM226") || strstr(szFwU, "SM225") ||
-        strstr(szFwU, "SM232") ||
-        /* SM2258 SATA: VE + digit, e.g. Apacer AS340 VE1R9008. */
-        (szFwU[0] == 'V' && szFwU[1] == 'E' &&
-         szFwU[2] >= '0' && szFwU[2] <= '9'))
+        strstr(szFwU, "SM232"))
         return CONTROLLER_SMI;
 
-    /* Kingston A400 and other SM2259XT strings (U0524A0).
-     * FirmwareIsSmi225x rejects U1127B0 and S1127B0. */
-    if (!hdd && FirmwareIsSmi225x(szFwU))
-        return CONTROLLER_SMI;
-
-    /* ADATA/XPG on Silicon Motion (HDS: SX8200PNP → SM2262EN).
-     * PCI VID is ADATA 1CC1, so model/firmware is the fingerprint. */
+    /* ADATA/XPG model names. PCI VID is ADATA 1CC1, so the model is the
+     * fingerprint. Firmware SANA alone is not. */
     if (strstr(szModelU, "SX8200") || strstr(szModelU, "SX8100") ||
-        strstr(szModelU, "SX7000") || strstr(szModelU, "GAMMIX S11") ||
-        strstr(szFwU, "SANA"))
+        strstr(szModelU, "SX7000") || strstr(szModelU, "GAMMIX S11"))
         return CONTROLLER_SMI;
 
     if (strstr(szModelU, "MAP120") || strstr(szModelU, "MAP160") ||
-        strstr(szModelU, "MAP100") || strstr(szFwU, "MAP16") ||
-        strstr(szFwU, "MAP12"))
+        strstr(szModelU, "MAP100"))
         return CONTROLLER_MAXIO;
 
     if (strstr(szModelU, "RTS576") || strstr(szModelU, "RTS577") ||
-        strstr(szFwU, "RTS576") || strstr(szFwU, "RTL57"))
+        strstr(szFwU, "RTS576"))
         return CONTROLLER_REALTEK;
 
     if (strstr(szModelU, "IG521") || strstr(szModelU, "IG523") ||
@@ -2671,7 +2515,11 @@ int ScanDrives(DRIVE_INFO* pDrives, int nMaxDrives)
                         ExtractNVMeExtendedInfo(pInfo);
                         if (pInfo->szModel[0] == '\0' || pInfo->szSerial[0] == '\0')
                             GetNVMeIdentifyController(hDrive, pInfo);
-                    } else if (GetSMARTViaLogSense(hDrive, pInfo)) {
+                    } else if (!pInfo->bSmartDataInvalid &&
+                               GetSMARTViaLogSense(hDrive, pInfo)) {
+                        /* Temperature / informational exceptions only.
+                         * Not an attribute snapshot, and not a repair
+                         * for a sector ValidateSmartData already rejected. */
                         pInfo->bSMART_Supported = TRUE;
                     }
                 }

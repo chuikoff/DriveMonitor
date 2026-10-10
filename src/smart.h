@@ -407,6 +407,9 @@ typedef struct _DRIVE_INFO {
     char        szFirmware[9];
     DWORD       dwCapacityMB;
     BOOL        bSMART_Supported;
+    /* Raw ATA SMART sector was received and rejected. Cleared when a
+     * later valid ATA sector or NVMe health log is accepted. */
+    BOOL        bSmartDataInvalid;
     BOOL        bSMART_Enabled;
     int         nHealthPercent;  /* remaining life 0-100, or -1; not a fake Health% */
     BOOL        bPredictFailure;
@@ -522,9 +525,16 @@ typedef struct _DRIVE_INFO {
     /* Temperature sensors */
     int         nTempSensor[8];          /* NVMe temp sensors 1-8, -1 if N/A */
 
-    /* Profile resolver. 0 = not resolved. Generic ATA/NVMe is 50. */
+    /* Profile resolver. 0 = not resolved. Generic ATA/NVMe is 50.
+     * A tie at the same score and the same specificity is ambiguous:
+     * the lexically first id is recorded, and a contested attribute
+     * is not given a semantic. */
     int         nProfileScore;
     char        szProfileId[48];
+    BOOL        bProfileAmbiguous;
+    char        szProfileConflict[48];
+    char        szProfileOrigin[24];
+    int         nProfileFlags;
     /* Set when that probe succeeded. USB labels follow these, not a bridge list. */
     BOOL        bCapAtaIdentify;
     BOOL        bCapSmartData;
@@ -536,6 +546,12 @@ typedef struct _DRIVE_INFO {
     int         nDriveDbAttrs;
     DRIVEDB_ATTR driveDbAttr[DRIVEDB_ATTR_MAX];
 } DRIVE_INFO;
+
+/* ATA attributes were rejected and nothing valid replaced them. */
+static inline BOOL SmartSnapshotRejected(const DRIVE_INFO* p)
+{
+    return p && p->bSmartDataInvalid && !p->bSMART_Supported;
+}
 
 /* ============================================================
  * Attribute classification
@@ -704,9 +720,23 @@ int DecodeReportedUncorrect(const BYTE* pRaw, DRIVE_VENDOR vendor);
 int DecodeRemapEvents(const DRIVE_INFO* pInfo, const BYTE* pRaw);
 /* 196 RAW is the same 48-bit field as 240, including the millisecond half. */
 BOOL RemapRawIsFlyingHours(const DRIVE_INFO* pInfo, const BYTE* pRaw);
-/* Seagate ID 1/7/195: low 32 = operations, high 16 = errors (SMART attrib spec). */
+/* Seagate ID 1/7/195: low 32 = operations, high 16 = errors (SMART attrib spec).
+ * SpinPoint M8 sold as ST/HN-M does not use that packing. */
 DWORD    SeagateRateOps(const BYTE* pRaw);
 unsigned SeagateRateErrs(const BYTE* pRaw);
+BOOL     UseSeagateRateRaw(const DRIVE_INFO* pInfo);
+/* MKP-521: bytes [1:0] max, [3:2] average. If the average half is larger,
+ * this firmware stored them the other way (S9FM). */
+void     PhisonMaxAvgHalves(unsigned raw32, unsigned* mx, unsigned* avg);
+/* drivedb -v name for this id contains "crc" (199 or Phison 218). */
+BOOL     DriveDbAttrIsCrc(const DRIVE_INFO* p, BYTE id);
+/* Attribute 200 is scored only when a threshold exists and Value is actually low.
+ * A lifetime-stuck 1 with threshold 0 is not a failure. */
+BOOL     NormalizedWriteErrorScored(BYTE val, BYTE thresh);
+/* Lifetime max °C from attribute 190 or 194, or -1. Does not change the current reading. */
+int      AtaTempLifetimeMaxC(const SMART_ATTRIBUTE* a);
+/* Inverted 190/194: lifetime peak reached scale−threshold. Direct °C Worst does not trip. */
+BOOL     AtaTempPeakTripped(const SMART_ATTRIBUTE* a, BYTE thresh);
 /* ATA 241/242: RAW may be GB, 32 MiB units, or 512-byte LBA.
  * Pick the encoding that fits erase×capacity and lifetime GB/h.
  * reads is nonzero for a host-read counter: reads may exceed NAND writes.
@@ -748,9 +778,92 @@ BOOL IsSmi225xFamily(const DRIVE_INFO* p);
 #define PROF_ENC_PERCENT 4
 #define PROF_ENC_COUNTER 5
 #define PROF_ENC_GIB     6   /* raw value is already GiB */
+#define PROF_ENC_MAXAVG  7   /* raw16(avg16): max in the low half, average in the next */
+#define PROF_ENC_PAIR    8   /* two raw halves: later/early, or a raw16(raw16) pair */
+
+/* How a matched profile reads life counters. Inherited along extends. */
+#define PROF_F_E7_VALUE      1  /* 231 life is normalized Value, not RAW */
+#define PROF_F_A9_PREFER_E7  2  /* dummy A9 Value: use E7 when it agrees */
+#define PROF_F_B1_LIFE       4  /* 177 Value is remaining life */
+
+#define PROF_KIND_EXACT       1
+#define PROF_KIND_FAMILY      2
+#define PROF_KIND_CONTROLLER  3
+#define PROF_KIND_VENDOR      4
+#define PROF_KIND_GENERIC     5
+
+#define PROF_FW_NONE    0
+#define PROF_FW_SUBSTR  1
+#define PROF_FW_SMI225  2  /* letter, four digits, letter, digit; not U11/U10/S11 */
+#define PROF_FW_VE      3  /* VE plus a digit */
+
+/* One declarative attribute row. id 0 ends the table.
+ * A name is optional. altUnless: when that id is absent, the alt name is used. */
+typedef struct _PROF_ATTR {
+    unsigned char id;
+    unsigned char sem;
+    unsigned char enc;
+    unsigned char altUnless;
+    const char* nameRu;
+    const char* nameEn;
+    const char* altRu;
+    const char* altEn;
+} PROF_ATTR;
+
+/* Extra profile. The caller keeps every pointer alive.
+ * Adding one does not require a new branch in the interpreter. */
+typedef struct _PROFILE_DEF {
+    const char* id;
+    const char* extends;
+    int kind;
+    const char* model;
+    const char* fw;
+    int fwMode;
+    DRIVE_VENDOR vendor;
+    DRIVE_CONTROLLER ctl;
+    int nvme;                 /* -1 any, 0 not NVMe, 1 NVMe only */
+    int hdd;                  /* -1 any, 0 not HDD, 1 HDD only */
+    const char* chip;
+    const char* nvmeVer;
+    int flags;
+    const char* source;
+    const PROF_ATTR* attrs;
+} PROFILE_DEF;
+
+/* SAT / SMART / threshold / NVMe probe bits. Same rule as the USB label. */
+static inline void UsbProbeFlags(const DRIVE_INFO* p,
+                                 int* sat, int* smart, int* thresh, int* nvme)
+{
+    int s = 0, m = 0, t = 0, n = 0;
+    if (p && p->bIsUSB) {
+        s = (p->bCapAtaIdentify || (p->bCapSmartData && !p->bIsNVMe)) ? 1 : 0;
+        m = (p->bCapSmartData ||
+             (p->bSMART_Supported && !p->bIsNVMe && p->bCapAtaIdentify)) ? 1 : 0;
+        t = p->bCapSmartThresh ? 1 : 0;
+        n = (p->bGotNVMeIdent || (p->bIsNVMe && p->bSMART_Supported)) ? 1 : 0;
+    }
+    if (sat) *sat = s;
+    if (smart) *smart = m;
+    if (thresh) *thresh = t;
+    if (nvme) *nvme = n;
+}
 
 void ResolveDriveProfile(DRIVE_INFO* p);
 int  DriveProfileScore(const DRIVE_INFO* p);
+/* Registers one extra profile. FALSE if the id is empty, already known, or the table is full. */
+BOOL ProfileRegister(const PROFILE_DEF* def);
+void ProfileClearRegistered(void);
+/* 1 when RAW can be decoded with this encoding. SCALE and NONE are not safe. */
+int  ProfileDecodeRaw(int enc, unsigned __int64 raw, unsigned __int64* out);
+/* 1 when now >= prev. A backwards counter is not a delta. */
+int  ProfileRawDelta(unsigned __int64 prev, unsigned __int64 now, long long* delta);
+void FormatProfileDiagnostic(const DRIVE_INFO* p, char* buf, int nBuf);
+/* Confirmed local name. FALSE when the profile has no name, or the match is contested. */
+BOOL ProfileAttrLabel(const DRIVE_INFO* p, BYTE id,
+                      int* sem, int* enc,
+                      const char** nameRu, const char** nameEn,
+                      unsigned char* altUnless,
+                      const char** altRu, const char** altEn);
 /* TRUE when a matching local profile, or the generic profile, lists id.
  * drivedb rows are not local profiles. */
 BOOL ProfileListsAttr(const DRIVE_INFO* p, BYTE id);
@@ -761,6 +874,8 @@ void DriveDbApply(DRIVE_INFO* p);
 const char* DriveDbAttrName(const DRIVE_INFO* p, BYTE id);
 /* TRUE only when the -v name states a health semantic. A bare name is not. */
 BOOL DriveDbLookup(const DRIVE_INFO* p, BYTE id, int* sem, int* enc);
+/* Stored -v row, including names that are not a health semantic. */
+BOOL DriveDbAttrEnc(const DRIVE_INFO* p, BYTE id, int* sem, int* enc);
 void FormatUsbCapability(const DRIVE_INFO* p, char* buf, int nBuf);
 
 #ifdef __cplusplus

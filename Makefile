@@ -52,7 +52,10 @@ LDFLAGS = -mwindows \
           -lgdiplus -lshlwapi -lsetupapi -lcfgmgr32
 
 
-.PHONY: all clean
+.PHONY: all clean test
+
+TESTDIR = tests
+TEST_TARGET = $(OUTDIR)/profile_test.exe
 
 all: $(OUTDIR) $(OBJDIR) $(TARGET)
 	@echo ""
@@ -80,6 +83,21 @@ $(RES_O): $(SRCDIR)/app.rc $(SRCDIR)/app.manifest $(SRCDIR)/app.ico $(SRCDIR)/re
 $(TARGET): $(OBJS) $(RES_O) | $(OUTDIR)
 	@echo "  LD  $@"
 	$(Q)$(CC) $(OBJS) $(RES_O) $(LDFLAGS) -o $@
+
+# Console resolver tests. profile.cpp only: drivedb and the GUI stay out.
+# DriveDbApply and DriveDbLookup are stubs in profile_test.cpp.
+test: $(OUTDIR) $(OBJDIR) $(TEST_TARGET)
+	$(TEST_TARGET)
+
+$(OBJDIR)/profile_test.o: $(TESTDIR)/profile_test.cpp $(SRCDIR)/smart.h | $(OBJDIR)
+	@echo "  CC  $<"
+	$(Q)$(CC) -O2 -DWIN32 -D_WIN32 -D_WINDOWS -DNDEBUG \
+	    -I$(SRCDIR) -finput-charset=UTF-8 $(CXXFLAGS) -c $< -o $@
+
+$(TEST_TARGET): $(OBJDIR)/profile_test.o $(OBJDIR)/profile.o
+	@echo "  LD  $@"
+	$(Q)$(CC) $(OBJDIR)/profile_test.o $(OBJDIR)/profile.o \
+	    -static -static-libgcc -static-libstdc++ -lkernel32 -o $@
 
 $(OBJDIR):
 ifeq ($(OS),Windows_NT)

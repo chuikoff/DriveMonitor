@@ -3,15 +3,11 @@
 
 void FormatUsbCapability(const DRIVE_INFO* p, char* buf, int nBuf)
 {
-    int sat, smart, thresh, nvme;
+    int sat = 0, smart = 0, thresh = 0, nvme = 0;
     if (!buf || nBuf <= 0) return;
     buf[0] = '\0';
     if (!p || !p->bIsUSB) return;
-    sat = p->bCapAtaIdentify || (p->bCapSmartData && !p->bIsNVMe);
-    smart = p->bCapSmartData || (p->bSMART_Supported && !p->bIsNVMe &&
-                                 p->bCapAtaIdentify);
-    thresh = p->bCapSmartThresh;
-    nvme = p->bGotNVMeIdent || (p->bIsNVMe && p->bSMART_Supported);
+    UsbProbeFlags(p, &sat, &smart, &thresh, &nvme);
     safe_snprintf_n(buf, nBuf,
         TN("SAT %s · SMART %s · пороги %s · NVMe %s",
            "SAT %s · SMART %s · thresholds %s · NVMe %s"),
@@ -766,9 +762,6 @@ BOOL GetSMARTAttributesSAT(HANDLE hDrive, DRIVE_INFO* pInfo)
         return FALSE;
     }
 
-    if (IsBufferAllZero(data + 2, 30) || IsBufferAllFF(data + 2, 30))
-        return FALSE;
-
     if (FillSmartData(pInfo, data) <= 0)
         return FALSE;
     if (pInfo->eAccessMethod == SMART_ACCESS_NONE) pInfo->eAccessMethod = method;
@@ -1213,6 +1206,7 @@ BOOL NVMeHealthLogJMicron(HANDLE hDrive, DRIVE_INFO* pInfo)
 
     memcpy(&pInfo->nvmeHealth, sptwb.DataBuf, sizeof(NVME_HEALTH_INFO_LOG));
     pInfo->bSMART_Supported = TRUE;
+    pInfo->bSmartDataInvalid = FALSE;
     pInfo->bIsNVMe = TRUE;
     pInfo->eAccessMethod = SMART_ACCESS_NVME_PASSTHROUGH;
     return TRUE;
@@ -1311,6 +1305,7 @@ BOOL NVMeHealthLogASMedia(HANDLE hDrive, DRIVE_INFO* pInfo)
 
     memcpy(&pInfo->nvmeHealth, sptwb.DataBuf, sizeof(NVME_HEALTH_INFO_LOG));
     pInfo->bSMART_Supported = TRUE;
+    pInfo->bSmartDataInvalid = FALSE;
     pInfo->bIsNVMe = TRUE;
     pInfo->eAccessMethod = SMART_ACCESS_NVME_PASSTHROUGH;
     return TRUE;
@@ -1433,6 +1428,7 @@ BOOL NVMeHealthLogRealtek(HANDLE hDrive, DRIVE_INFO* pInfo)
         nCopy = 512;
     memcpy(&pInfo->nvmeHealth, psptwb->DataBuf, nCopy);
     pInfo->bSMART_Supported = TRUE;
+    pInfo->bSmartDataInvalid = FALSE;
     pInfo->bIsNVMe = TRUE;
     pInfo->eAccessMethod = SMART_ACCESS_NVME_PASSTHROUGH;
     FreeSptBuf4K(psptwb);
@@ -1594,6 +1590,7 @@ BOOL NVMeHealthLogVLI(HANDLE hDrive, DRIVE_INFO* pInfo)
 
     memcpy(&pInfo->nvmeHealth, sptwb.DataBuf, sizeof(NVME_HEALTH_INFO_LOG));
     pInfo->bSMART_Supported = TRUE;
+    pInfo->bSmartDataInvalid = FALSE;
     pInfo->bIsNVMe = TRUE;
     pInfo->eAccessMethod = SMART_ACCESS_NVME_PASSTHROUGH;
     return TRUE;

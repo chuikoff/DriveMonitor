@@ -155,8 +155,6 @@ BOOL GetSMARTAttributes(HANDLE hDrive, int nDrive, DRIVE_INFO* pInfo)
         return FALSE;
 
     SENDCMDOUTPARAMS* pCop = (SENDCMDOUTPARAMS*)outBuf;
-    if (IsBufferAllZero(pCop->bBuffer + 2, 30)) return FALSE;
-
     return FillSmartData(pInfo, pCop->bBuffer) > 0;
 }
 
@@ -440,9 +438,6 @@ BOOL GetSMARTAttributesATAPassthrough(HANDLE hDrive, DRIVE_INFO* pInfo)
                         data, READ_ATTRIBUTE_BUFFER_SIZE, TRUE))
         return FALSE;
 
-    if (IsBufferAllZero(data + 2, 30) || IsBufferAllFF(data + 2, 30))
-        return FALSE;
-
     return FillSmartData(pInfo, data) > 0;
 }
 
@@ -485,10 +480,6 @@ BOOL GetSMARTViaStorageProtocol(HANDLE hDrive, DRIVE_INFO* pInfo)
     }
 
     BYTE* pData = buf + sizeof(ULONG)*2 + sizeof(MY_STORAGE_PROTOCOL_SPECIFIC_DATA);
-    if (IsBufferAllZero(pData + 2, 28)) {
-        pInfo->dwErrStorageProtocol = ERROR_INVALID_DATA;
-        return FALSE;
-    }
     if (FillSmartData(pInfo, pData) <= 0) {
         pInfo->dwErrStorageProtocol = ERROR_INVALID_DATA;
         return FALSE;
@@ -544,6 +535,64 @@ static int TempCFromAtaAttr(const SMART_ATTRIBUTE* pA, DRIVE_VENDOR vendor)
     return -1;
 }
 
+static int TempAbsDiff(int a, int b)
+{
+    int d = a - b;
+    return d < 0 ? -d : d;
+}
+
+/* Airflow 190 (and a 194 that uses the same scale): Value ≈ scale − °C. */
+static int AtaTempInvertedScale(const SMART_ATTRIBUTE* a)
+{
+    int cur, val;
+    if (!a) return 0;
+    cur = (int)a->bRawValue[0];
+    if (cur < 1 || cur > 125) return 0;
+    val = (int)a->bAttrValue;
+    if (TempAbsDiff(val, 100 - cur) <= 1) return 100;
+    if (TempAbsDiff(val, 125 - cur) <= 1) return 125;
+    return 0;
+}
+
+int AtaTempLifetimeMaxC(const SMART_ATTRIBUTE* a)
+{
+    int cur, best, worst, scale, peak, rawMax;
+    if (!a) return -1;
+    if (a->bAttrID != 0xBE && a->bAttrID != 0xC2) return -1;
+    cur = (int)a->bRawValue[0];
+    if (cur < 1 || cur > 125) return -1;
+    best = -1;
+    rawMax = (int)a->bRawValue[4];
+    if (rawMax >= 1 && rawMax <= 125 && rawMax >= cur)
+        best = rawMax;
+    worst = (int)a->bWorstValue;
+    scale = AtaTempInvertedScale(a);
+    if (scale > 0 && worst >= 1 && worst <= 125 && worst < (int)a->bAttrValue) {
+        peak = scale - worst;
+        if (peak >= 1 && peak <= 125 && peak >= cur && peak > best)
+            best = peak;
+    } else if (scale == 0 && a->bAttrID == 0xC2 &&
+               TempAbsDiff((int)a->bAttrValue, cur) <= 1 &&
+               worst >= 1 && worst <= 125 && worst >= cur && worst > best) {
+        /* Seagate 194 stores the current °C in Value and the lifetime max in Worst.
+         * WD 194 values such as 129 are not Celsius and stay out. */
+        best = worst;
+    }
+    return best;
+}
+
+BOOL AtaTempPeakTripped(const SMART_ATTRIBUTE* a, BYTE thresh)
+{
+    int scale, peak, trip;
+    if (!a || thresh == 0) return FALSE;
+    scale = AtaTempInvertedScale(a);
+    if (scale == 0 || (int)thresh >= scale) return FALSE;
+    peak = AtaTempLifetimeMaxC(a);
+    if (peak < 1) return FALSE;
+    trip = scale - (int)thresh;
+    return trip >= 1 && peak >= trip;
+}
+
 void ExtractTemperatureFromATA(DRIVE_INFO* pInfo)
 {
     int i;
@@ -593,25 +642,43 @@ void ExtractCommonATACounters(DRIVE_INFO* pInfo)
 /* ============================================================
  * SMART data validation
  *
- * Validates the SMART read data buffer by:
- * 1. Checking that it's not all zeros
- * 2. Counting valid (non-zero ID) attributes
- * 3. Optional checksum verification (last byte of 512)
+ * pRawBuf is the raw 512-byte SMART READ DATA sector, before
+ * FillSmartData compacts it. The compacted attribute struct is
+ * the wrong buffer: its last byte is zeroed padding.
+ *
+ * Reject a short, empty, 0xFF, or torn sector, and a checksum
+ * byte that is present but does not match. Byte 511 == 0 means
+ * the drive or bridge left the checksum unimplemented (typical
+ * of USB SAT). That sector stays valid when the table is intact.
  * ============================================================ */
 BOOL ValidateSmartData(const BYTE* pRawBuf, int nBufLen)
 {
-    /* Check not all zero */
-    if (IsBufferAllZero(pRawBuf, nBufLen)) return FALSE;
-
-    /* Check at least one valid attribute ID exists */
     int nValidAttrs = 0;
-    int i;
+    int i, j;
+    unsigned sum;
+
+    if (!pRawBuf || nBufLen < 512) return FALSE;
+    if (IsBufferAllZero(pRawBuf, 512)) return FALSE;
+    if (IsBufferAllFF(pRawBuf + 2, 30 * 12)) return FALSE;
+
     for (i = 0; i < 30; i++) {
-        BYTE bID = pRawBuf[2 + i * 12];
-        if (bID != 0) nValidAttrs++;
+        const BYTE* pEntry = pRawBuf + 2 + i * 12;
+        if (pEntry[0] == 0) {
+            /* Unused slots are all zeros. A payload behind ID 0 is torn. */
+            for (j = 1; j < 12; j++) {
+                if (pEntry[j] != 0) return FALSE;
+            }
+            continue;
+        }
+        nValidAttrs++;
     }
     if (nValidAttrs == 0) return FALSE;
 
+    if (pRawBuf[511] != 0) {
+        sum = 0;
+        for (i = 0; i < 512; i++) sum += pRawBuf[i];
+        if ((sum & 0xFF) != 0) return FALSE;
+    }
     return TRUE;
 }
 
@@ -628,6 +695,14 @@ int FillSmartData(DRIVE_INFO* pInfo, const BYTE* pRawBuf)
 {
     int nCount = 0;
     int i;
+    if (!pInfo) return 0;
+    if (!ValidateSmartData(pRawBuf, READ_ATTRIBUTE_BUFFER_SIZE)) {
+        ZeroMemory(&pInfo->attrData, sizeof(pInfo->attrData));
+        pInfo->bCapSmartData = FALSE;
+        pInfo->bSmartDataInvalid = TRUE;
+        return 0;
+    }
+    pInfo->bSmartDataInvalid = FALSE;
     ZeroMemory(&pInfo->attrData, sizeof(SMART_ATTRIBUTE_DATA));
     pInfo->attrData.wRevisionNumber = (WORD)pRawBuf[0] | ((WORD)pRawBuf[1] << 8);
 
@@ -752,12 +827,7 @@ BOOL AcquireATASMART(HANDLE hDrive, int nDrive, DRIVE_INFO* pInfo, BOOL bReadLog
     }
 
     if (bAttr) {
-        /* Validate SMART data */
-        if (!ValidateSmartData((const BYTE*)&pInfo->attrData,
-                               sizeof(SMART_ATTRIBUTE_DATA))) {
-            /* Data may be invalid — but still try to use what we have */
-        }
-
+        /* FillSmartData already accepted the raw sector. */
         if (GetSMARTPredictFailure(hDrive, nDrive, &pInfo->bPredictFailure))
             pInfo->bGotReturnStatus = TRUE;
         else if (GetSMARTReturnStatusSAT(hDrive, &pInfo->bPredictFailure))
@@ -779,8 +849,15 @@ BOOL AcquireATASMART(HANDLE hDrive, int nDrive, DRIVE_INFO* pInfo, BOOL bReadLog
             }
         }
     } else {
+        /* No accepted attribute sector. A rejected packet keeps
+         * bSmartDataInvalid so health is not scored from it. An IOCTL
+         * failure leaves the flag clear: SMART was not returned. */
         pInfo->bSMART_Supported = FALSE;
         pInfo->nHealthPercent   = -1;
+        if (pInfo->bSmartDataInvalid) {
+            ZeroMemory(&pInfo->threshData, sizeof(pInfo->threshData));
+            pInfo->bCapSmartThresh = FALSE;
+        }
     }
     (void)bThresh;
     return bAttr;

@@ -2240,7 +2240,9 @@ void UpdateDriveInfo(HWND hWnd, int nDriveIdx)
         SetDlgItemTextU8(hWnd, IDC_POH_STATIC, szPoh);
     }
 
-    if (!pInfo->bSMART_Supported) {
+    if (SmartSnapshotRejected(pInfo)) {
+        safe_snprintf(szBuf, "%s", TN("Ошибка данных SMART", "SMART data error"));
+    } else if (!pInfo->bSMART_Supported) {
         if (pInfo->bIsNVMe)
             safe_snprintf(szBuf, TN("NVMe Health Log ошибка (err %lu)",
                                     "NVMe Health Log error (err %lu)"),
@@ -2271,7 +2273,11 @@ void UpdateDriveInfo(HWND hWnd, int nDriveIdx)
         SetDlgItemTextU8(hWnd, IDC_ADAPTER_STATIC, "—");
     }
 
-    if (pInfo->bIsUSB && !pInfo->bSMART_Supported) {
+    if (SmartSnapshotRejected(pInfo)) {
+        SetDlgItemTextU8(hWnd, IDC_PREDICT_STATIC, TN(
+            "Пакет SMART повреждён или обрезан. Здоровье не оценивается.",
+            "The SMART packet is damaged or truncated. Health is not assessed."));
+    } else if (pInfo->bIsUSB && !pInfo->bSMART_Supported) {
         char szBridge[80], szName[64];
         FormatUsbAdapterName(pInfo, szName, sizeof(szName));
         if (szName[0] && strcmp(szName, "—") != 0)
@@ -2550,11 +2556,56 @@ static BOOL E7IsLifePercent(const DRIVE_INFO* p)
 {
     int sem = PROF_SEM_NONE;
     if (!p) return FALSE;
-    if (p->eController == CONTROLLER_PHISON ||
-        p->eController == CONTROLLER_SAMSUNG ||
-        IsPhisonFamily(p))
-        return TRUE;
     return ProfileLookup(p, 0xE7, &sem, NULL) && sem == PROF_SEM_ENDURANCE;
+}
+
+/* Local profile first. drivedb display encoding covers names that are
+ * not a health semantic (DriveDbLookup would skip those). */
+static BOOL AttrEncOf(const DRIVE_INFO* p, BYTE id, int* sem, int* enc)
+{
+    if (sem) *sem = PROF_SEM_NONE;
+    if (enc) *enc = PROF_ENC_NONE;
+    if (!p) return FALSE;
+    if (ProfileLookup(p, id, sem, enc)) return TRUE;
+    return DriveDbAttrEnc(p, id, sem, enc);
+}
+
+static BOOL DbNotInUse(const DRIVE_INFO* p, BYTE id)
+{
+    const char* n = p ? DriveDbAttrName(p, id) : NULL;
+    if (!n) return FALSE;
+    return strstr(n, "Not In Use") != NULL || strstr(n, "not in use") != NULL;
+}
+
+/* Current °C from RAW, plus a lifetime max when the attribute actually stores one. */
+static void FormatAtaTempValue(BYTE id, const BYTE* pRaw, BYTE bVal, BYTE bWorst,
+                               char* szMain, int nMain)
+{
+    SMART_ATTRIBUTE a;
+    int nC, nF, nMin, life, i;
+    ZeroMemory(&a, sizeof(a));
+    a.bAttrID = id;
+    a.bAttrValue = bVal;
+    a.bWorstValue = bWorst;
+    for (i = 0; i < 6 && pRaw; i++)
+        a.bRawValue[i] = pRaw[i];
+    nC = (int)a.bRawValue[0];
+    if (id == 0xC2) {
+        int w16 = (int)a.bRawValue[0] | ((int)a.bRawValue[1] << 8);
+        if (nC <= 0 || nC > 125) nC = w16;
+        if (nC <= 0 || nC > 125) nC = (int)bVal;
+    }
+    nF = nC * 9 / 5 + 32;
+    nMin = (int)a.bRawValue[2];
+    life = AtaTempLifetimeMaxC(&a);
+    if (nMin >= 1 && nMin <= 125 && life > nMin && life <= 125)
+        safe_snprintf_n(szMain, nMain,
+            "%d \xC2\xB0""C (%d \xC2\xB0""F)  мин:%d макс:%d", nC, nF, nMin, life);
+    else if (life > nC && life >= 1 && life <= 125)
+        safe_snprintf_n(szMain, nMain,
+            "%d \xC2\xB0""C (%d \xC2\xB0""F)  макс:%d", nC, nF, life);
+    else
+        safe_snprintf_n(szMain, nMain, "%d \xC2\xB0""C (%d \xC2\xB0""F)", nC, nF);
 }
 
 static void FormatSmartValue(BYTE bID, BYTE* pRaw,
@@ -2562,7 +2613,6 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
                               const DRIVE_INFO* pDrv,
                               char* szBuf, int nBufLen)
 {
-    DRIVE_VENDOR eVendor = pDrv ? pDrv->eVendor : VENDOR_UNKNOWN;
     DRIVE_TYPE eType = pDrv ? pDrv->eType : DRIVE_TYPE_UNKNOWN;
     DRIVE_CONTROLLER eCtl = pDrv ? pDrv->eController : CONTROLLER_UNKNOWN;
 
@@ -2570,8 +2620,6 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
     WORD  w16  = (WORD)(dw32 & 0xFFFFu);
     unsigned __int64 qw48 = GetRawValue48(pRaw);
 
-    (void)bWorst;
-    (void)bThresh;
     char szMain[80] = "";
 
     {
@@ -2583,12 +2631,7 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
                 safe_snprintf_n(szBuf, nBufLen, "%s", szMain);
                 return;
             }
-            if (pDrv && pDrv->eType == DRIVE_TYPE_HDD &&
-                (bID == 0xB5 || bID == 0xB6 || bID == 0xAB || bID == 0xAC)) {
-                unsigned hi = (unsigned)((dw32 >> 16) & 0xFFFFu);
-                unsigned lo = (unsigned)(dw32 & 0xFFFFu);
-                safe_snprintf(szMain, "%u / %u", hi, lo);
-            } else if (qw48 > 0xFFFFFFFFULL)
+            if (qw48 > 0xFFFFFFFFULL)
                 safe_snprintf(szMain, "%llu  (vendor-specific)",
                               (unsigned long long)qw48);
             else
@@ -2603,29 +2646,9 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
     {
 
     case 0xBE:
-    {
-        int nC = (int)pRaw[0];
-        int nF = nC * 9 / 5 + 32;
-        int nMin = (int)pRaw[2], nMax = (int)pRaw[4];
-        if (nMin > 0 && nMax > nMin && nMax < 100)
-            safe_snprintf(szMain, "%d \xC2\xB0""C (%d \xC2\xB0""F)  мин:%d макс:%d", nC, nF, nMin, nMax);
-        else
-            safe_snprintf(szMain, "%d \xC2\xB0""C (%d \xC2\xB0""F)", nC, nF);
-        break;
-    }
     case 0xC2:
-    {
-        int nC = (int)pRaw[0];
-        if (nC <= 0 || nC > 125) nC = (int)w16;
-        if (nC <= 0 || nC > 125) nC = (int)bVal;
-        int nF = nC * 9 / 5 + 32;
-        int nMin = (int)pRaw[2], nMax = (int)pRaw[4];
-        if (nMin > 0 && nMax > nMin && nMax <= 125)
-            safe_snprintf(szMain, "%d \xC2\xB0""C (%d \xC2\xB0""F)  мин:%d макс:%d", nC, nF, nMin, nMax);
-        else
-            safe_snprintf(szMain, "%d \xC2\xB0""C (%d \xC2\xB0""F)", nC, nF);
+        FormatAtaTempValue(bID, pRaw, bVal, bWorst, szMain, (int)sizeof(szMain));
         break;
-    }
     case 0xE7:
     {
         int nLife = -1;
@@ -2643,7 +2666,9 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
              * count, so Value stays. When Value and RAW disagree and the
              * headline did not take this RAW, keep Value: Phison then
              * reports life from A9. */
-            if (pDrv && pDrv->eController != CONTROLLER_SAMSUNG && w16 <= 100) {
+            /* Maxio 231: Value is life remaining, RAW is percent used.
+             * Samsung RAW is an erase count. Both stay on Value. */
+            if (pDrv && !(pDrv->nProfileFlags & PROF_F_E7_VALUE) && w16 <= 100) {
                 int raw16 = (int)w16;
                 int endurance = pDrv->nEndurancePercent;
                 BOOL disagree = (bVal <= 100 && (int)bVal != raw16);
@@ -2710,6 +2735,10 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
     }
 
     case 0xC4:
+        if (DbNotInUse(pDrv, bID)) {
+            safe_snprintf(szMain, "%lu", (unsigned long)dw32);
+            break;
+        }
         if (DecodeRemapEvents(pDrv, pRaw) < 0) {
             if (RemapRawIsFlyingHours(pDrv, pRaw))
                 safe_snprintf(szMain, TN(
@@ -2753,7 +2782,7 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
         break;
 
     case 0xC3:
-        if (eType == DRIVE_TYPE_HDD && eVendor == VENDOR_SEAGATE) {
+        if (UseSeagateRateRaw(pDrv)) {
             unsigned nErr = SeagateRateErrs(pRaw);
             DWORD nOps = SeagateRateOps(pRaw);
             safe_snprintf(szMain, "%u ош. чтения / %lu секторов", nErr, (unsigned long)nOps);
@@ -2766,12 +2795,14 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
                 safe_snprintf(szMain, TN("%lu восстановлений ECC", "%lu ECC recovered"), (unsigned long)dw32);
             break;
         }
-        if (qw48 > 0xFFFFFFFFULL)
-            safe_snprintf(szMain, "%llu  (vendor-specific)",
-                          (unsigned long long)qw48);
+        /* Reached only when the SSD profile named this counter.
+         * An unknown 195 still returns above as vendor-specific. */
+        if (dw32 == 0)
+            safe_snprintf(szMain, "%s", TN("0  (ОК)", "0 (OK)"));
+        else if (qw48 > 0xFFFFFFFFULL)
+            safe_snprintf(szMain, "%llu", (unsigned long long)qw48);
         else
-            safe_snprintf(szMain, "%lu  (vendor-specific)",
-                          (unsigned long)dw32);
+            safe_snprintf(szMain, "%lu", (unsigned long)dw32);
         break;
 
     case 0xBC:
@@ -2806,7 +2837,7 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
         if (DriveTreatsC0AsPowerLoss(pDrv))
             safe_snprintf(szMain, TN("%lu событий", "%lu events"), (unsigned long)dw32);
         else
-            safe_snprintf(szMain, TN("%lu аварийных парковок", "%lu emergency retracts"), (unsigned long)dw32);
+            safe_snprintf(szMain, TN("%lu парковок при выключении", "%lu power-off retracts"), (unsigned long)dw32);
         break;
 
     case 0xB7:
@@ -2837,13 +2868,15 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
     case 0xC8:
         if (dw32 == 0)
             safe_snprintf(szMain, "%s", TN("0  (ОК)", "0 (OK)"));
-        else
+        else if (NormalizedWriteErrorScored(bVal, bThresh))
             safe_snprintf(szMain, "%lu  (значение важнее RAW)", (unsigned long)dw32);
+        else
+            safe_snprintf(szMain, "%lu", (unsigned long)dw32);
         break;
 
     case 0x01:
     {
-        if (eVendor == VENDOR_SEAGATE) {
+        if (UseSeagateRateRaw(pDrv)) {
             unsigned nErr = SeagateRateErrs(pRaw);
             DWORD nOps = SeagateRateOps(pRaw);
             safe_snprintf(szMain, "%u ошибок чтения / %lu секторов", nErr, (unsigned long)nOps);
@@ -2860,7 +2893,7 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
 
     case 0x07:
     {
-        if (eVendor == VENDOR_SEAGATE) {
+        if (UseSeagateRateRaw(pDrv)) {
             unsigned nErr = SeagateRateErrs(pRaw);
             DWORD nOps = SeagateRateOps(pRaw);
             safe_snprintf(szMain, "%u ошибок позиц. / %lu seeks", nErr, (unsigned long)nOps);
@@ -2880,12 +2913,16 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
     case 0xF3:
     case 0xF4:
     {
-        /* An erase/wear row that shares an F1–F4 id is not an LBA counter.
-         * Phison 244 is the average erase count. */
+        /* An erase/wear row, or a drivedb counter that only shares the
+         * ID (Samsung 243 downshift), is not an LBA total. */
         {
-            int semF = PROF_SEM_NONE;
-            if (pDrv && ProfileLookup(pDrv, bID, &semF, NULL) &&
-                (semF == PROF_SEM_ERASE || semF == PROF_SEM_WEAR)) {
+            int semF = PROF_SEM_NONE, encF = PROF_ENC_NONE;
+            if (AttrEncOf(pDrv, bID, &semF, &encF) &&
+                (semF == PROF_SEM_ERASE || semF == PROF_SEM_WEAR ||
+                 encF == PROF_ENC_COUNTER || encF == PROF_ENC_PAIR ||
+                 encF == PROF_ENC_MAXAVG) &&
+                encF != PROF_ENC_LBA && encF != PROF_ENC_GIB &&
+                encF != PROF_ENC_BLOCK32 && encF != PROF_ENC_SCALE) {
                 if (qw48 > 0xFFFFFFFFULL)
                     safe_snprintf(szMain, "%llu", (unsigned long long)qw48);
                 else
@@ -2893,39 +2930,48 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
                 break;
             }
         }
-        /* Phison 241/242: GB or 32 MiB units. SM2258/SM2259 is 32 MiB.
-         * Other SATA SSDs are LBAs. Host reads may exceed NAND writes. */
-        if (pDrv && IsPhisonFamily(pDrv) &&
-            (pDrv->eType == DRIVE_TYPE_SSD_SATA ||
-             pDrv->eType == DRIVE_TYPE_M2_SATA) &&
-            (bID == 0xF1 || bID == 0xF2)) {
-            unsigned __int64 nGB = ScaleAtaHostGiB(pDrv, qw48, bID == 0xF2);
-            if (nGB > 4000000ULL)
-                nGB = 4000000ULL;
-            if (bID == 0xF1)
-                safe_snprintf(szMain, TN("%llu ГБ записано хостом",
-                                         "%llu GB written by host"),
-                              (unsigned long long)nGB);
-            else
-                safe_snprintf(szMain, TN("%llu ГБ прочитано хостом",
-                                         "%llu GB read by host"),
-                              (unsigned long long)nGB);
-            break;
+        /* Encoding comes from the profile: Phison SCALE, SM2258 BLOCK32.
+         * Host reads may exceed NAND writes. */
+        {
+            int semH = PROF_SEM_NONE, encH = PROF_ENC_NONE;
+            BOOL sata = pDrv && (pDrv->eType == DRIVE_TYPE_SSD_SATA ||
+                                 pDrv->eType == DRIVE_TYPE_M2_SATA);
+            if ((bID == 0xF1 || bID == 0xF2) && sata &&
+                AttrEncOf(pDrv, bID, &semH, &encH) &&
+                (encH == PROF_ENC_SCALE || encH == PROF_ENC_BLOCK32)) {
+                unsigned __int64 nGB = (encH == PROF_ENC_BLOCK32)
+                    ? Smi225xHostGiB(qw48)
+                    : ScaleAtaHostGiB(pDrv, qw48, bID == 0xF2);
+                if (nGB > 4000000ULL)
+                    nGB = 4000000ULL;
+                if (bID == 0xF1)
+                    safe_snprintf(szMain, TN("%llu ГБ записано хостом",
+                                             "%llu GB written by host"),
+                                  (unsigned long long)nGB);
+                else
+                    safe_snprintf(szMain, TN("%llu ГБ прочитано хостом",
+                                             "%llu GB read by host"),
+                                  (unsigned long long)nGB);
+                break;
+            }
         }
-        if (pDrv && IsSmi225xFamily(pDrv) &&
-            (bID == 0xF1 || bID == 0xF2)) {
-            unsigned __int64 nGB = Smi225xHostGiB(qw48);
-            if (nGB > 4000000ULL)
-                nGB = 4000000ULL;
-            if (bID == 0xF1)
-                safe_snprintf(szMain, TN("%llu ГБ записано хостом",
-                                         "%llu GB written by host"),
-                              (unsigned long long)nGB);
-            else
-                safe_snprintf(szMain, TN("%llu ГБ прочитано хостом",
-                                         "%llu GB read by host"),
-                              (unsigned long long)nGB);
-            break;
+        /* Profile says the raw value is already GiB. A reading above
+         * 4e6 GiB is not GiB (SPCC 241); leave it as LBAs. */
+        {
+            int semG = PROF_SEM_NONE, encG = PROF_ENC_NONE;
+            if ((bID == 0xF1 || bID == 0xF2) &&
+                AttrEncOf(pDrv, bID, &semG, &encG) &&
+                encG == PROF_ENC_GIB && qw48 <= 4000000ULL) {
+                if (bID == 0xF1)
+                    safe_snprintf(szMain, TN("%llu ГиБ записано хостом",
+                                             "%llu GiB written by host"),
+                                  (unsigned long long)qw48);
+                else
+                    safe_snprintf(szMain, TN("%llu ГиБ прочитано хостом",
+                                             "%llu GiB read by host"),
+                                  (unsigned long long)qw48);
+                break;
+            }
         }
         {
             unsigned __int64 nLBA = qw48;
@@ -2959,7 +3005,9 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
 
     case 0xE9:
     {
-        if (eCtl == CONTROLLER_INTEL && bVal <= 100) {
+        int semE9 = PROF_SEM_NONE, encE9 = PROF_ENC_NONE;
+        if (AttrEncOf(pDrv, bID, &semE9, &encE9) &&
+            encE9 == PROF_ENC_PERCENT && bVal <= 100) {
             safe_snprintf(szMain, "%u%%  индикатор износа", (unsigned)bVal);
             break;
         }
@@ -2971,9 +3019,34 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
         break;
     }
 
+    case 0xA8:
+        if (eCtl == CONTROLLER_MAXIO) {
+            unsigned hi = (unsigned)((qw48 >> 32) & 0xFFFFu);
+            if (hi)
+                safe_snprintf(szMain, TN("%lu (старший байт %u)",
+                                         "%lu (high byte %u)"),
+                              (unsigned long)dw32, hi);
+            else
+                safe_snprintf(szMain, "%lu", (unsigned long)dw32);
+            break;
+        }
+        if (qw48 > 0xFFFFFFFFULL)
+            safe_snprintf(szMain, "%llu", (unsigned long long)qw48);
+        else
+            safe_snprintf(szMain, "%lu", (unsigned long)dw32);
+        break;
+
     case 0xA9:
     {
-        /* A9 is life remaining only on Phison. Elsewhere it is just RAW. */
+        int enc9 = PROF_ENC_NONE;
+        BOOL have9 = AttrEncOf(pDrv, bID, NULL, &enc9);
+        if (have9 && enc9 == PROF_ENC_PAIR) {
+            unsigned lo = (unsigned)(dw32 & 0xFFFFu);
+            unsigned hi = (unsigned)((dw32 >> 16) & 0xFFFFu);
+            safe_snprintf(szMain, "%u / %u", lo, hi);
+            break;
+        }
+        /* A9 is life remaining only on Phison or a profile that says so. */
         if (pDrv && IsPhisonFamily(pDrv)) {
             /* Summary picked another counter (E7). Do not also call this RAW life. */
             if (dw32 >= 1 && dw32 <= 100 &&
@@ -2989,6 +3062,10 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
                                          "0%% reported life remaining"));
             else
                 safe_snprintf(szMain, "%lu", (unsigned long)dw32);
+        } else if (have9 && enc9 == PROF_ENC_PERCENT && dw32 <= 100) {
+            safe_snprintf(szMain, TN("%lu%%  остаток ресурса",
+                                     "%lu%% life remaining"),
+                          (unsigned long)dw32);
         } else {
             safe_snprintf(szMain, "%lu", (unsigned long)dw32);
         }
@@ -2996,7 +3073,7 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
     }
 
     case 0xB1:
-        if (eCtl == CONTROLLER_SAMSUNG && bVal <= 100) {
+        if (pDrv && (pDrv->nProfileFlags & PROF_F_B1_LIFE) && bVal <= 100) {
             safe_snprintf(szMain, "износ/остаток %u%%", (unsigned)bVal);
             break;
         }
@@ -3007,7 +3084,11 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
         break;
 
     case 0xCA:
-        if (eCtl == CONTROLLER_MICRON && bVal <= 100) {
+    {
+        int semCa = PROF_SEM_NONE, encCa = PROF_ENC_NONE;
+        if (AttrEncOf(pDrv, bID, &semCa, &encCa) &&
+            semCa == PROF_SEM_ENDURANCE && encCa == PROF_ENC_PERCENT &&
+            bVal <= 100) {
             safe_snprintf(szMain, "%u%% ресурса", (unsigned)bVal);
             break;
         }
@@ -3016,18 +3097,28 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
         else
             safe_snprintf(szMain, "%lu", (unsigned long)dw32);
         break;
+    }
 
     case 0xAD:
+    {
+        int encAd = PROF_ENC_NONE;
+        BOOL split = AttrEncOf(pDrv, bID, NULL, &encAd) &&
+                     encAd == PROF_ENC_MAXAVG;
+        if (!split && eCtl == CONTROLLER_PHISON && dw32 > 0xFFFFUL)
+            split = TRUE;
         if (eCtl == CONTROLLER_MICRON)
             safe_snprintf(szMain, "%lu среднее стираний", (unsigned long)dw32);
-        else if (eCtl == CONTROLLER_PHISON && dw32 > 0xFFFFUL) {
-            unsigned mx = (unsigned)(dw32 & 0xFFFFUL);
-            unsigned avg = (unsigned)((dw32 >> 16) & 0xFFFFUL);
+        else if (split) {
+            unsigned mx, avg;
+            PhisonMaxAvgHalves(dw32, &mx, &avg);
             safe_snprintf(szMain, TN("макс. %u / средн. %u", "max %u / avg %u"),
                           mx, avg);
+        } else if (eCtl == CONTROLLER_MAXIO) {
+            safe_snprintf(szMain, "%lu", (unsigned long)(dw32 & 0xFFFFUL));
         } else
             safe_snprintf(szMain, "%lu циклов выравнивания", (unsigned long)dw32);
         break;
+    }
 
     case 0xA1:
     case 0xB2:
@@ -3050,21 +3141,53 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
 
     case 0xAA:
     {
-        DWORD pct = dw32 ? dw32 : (DWORD)bVal;
-        if (eCtl == CONTROLLER_INTEL && bVal <= 100)
-            pct = (DWORD)bVal;
-        safe_snprintf(szMain, "%lu%%  резервное пространство", (unsigned long)pct);
+        int encA = PROF_ENC_NONE;
+        AttrEncOf(pDrv, bID, NULL, &encA);
+        if (encA == PROF_ENC_PERCENT && bVal <= 100) {
+            safe_snprintf(szMain, "%u%%  резервное пространство", (unsigned)bVal);
+        } else if (encA == PROF_ENC_PAIR) {
+            /* MKP-521 / z54z10: bytes [1:0] early, bytes [5:4] later.
+             * A low/high 24-bit split labels the factory count as later. */
+            unsigned early = (unsigned)pRaw[0] | ((unsigned)pRaw[1] << 8);
+            unsigned later = (unsigned)pRaw[4] | ((unsigned)pRaw[5] << 8);
+            safe_snprintf(szMain, TN("%u поздних / %u ранних",
+                                     "%u later / %u early"),
+                          later, early);
+        } else {
+            safe_snprintf(szMain, "%lu", (unsigned long)dw32);
+        }
         break;
     }
 
     case 0xE8:
     {
+        int spareBlk = -1;
+        int si;
         if (eCtl == CONTROLLER_INTEL && bVal <= 100) {
             safe_snprintf(szMain, "%u%%  резервное пространство", (unsigned)bVal);
             break;
         }
-        DWORD pct = dw32 ? dw32 : (DWORD)bVal;
-        safe_snprintf(szMain, "%lu%%  резервное пространство", (unsigned long)pct);
+        /* Phison S11: 232 RAW copies spare blocks (161). Value is the percent.
+         * R5SL480G RAW 47 and attribute 161 are the same 47 blocks, Value is 100. */
+        if (pDrv && IsPhisonFamily(pDrv)) {
+            for (si = 0; si < 30; si++) {
+                const SMART_ATTRIBUTE* sp = &pDrv->attrData.stAttributes[si];
+                if (sp->bAttrID == 0xA1) {
+                    spareBlk = (int)GetRawValue(sp->bRawValue);
+                    break;
+                }
+            }
+        }
+        if (spareBlk >= 0 && (int)dw32 == spareBlk &&
+            bVal <= 100 && (unsigned)bVal != dw32) {
+            safe_snprintf(szMain, TN("%lu блоков", "%lu blocks"),
+                          (unsigned long)dw32);
+            break;
+        }
+        {
+            DWORD pct = dw32 ? dw32 : (DWORD)bVal;
+            safe_snprintf(szMain, "%lu%%  резервное пространство", (unsigned long)pct);
+        }
         break;
     }
 
@@ -3073,7 +3196,9 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
         break;
 
     case 0xE1:
-        if (eCtl == CONTROLLER_INTEL) {
+    {
+        int encE1 = PROF_ENC_NONE;
+        if (AttrEncOf(pDrv, bID, NULL, &encE1) && encE1 == PROF_ENC_BLOCK32) {
             unsigned __int64 nGiB = ((unsigned __int64)dw32 * 32ULL) / 1024ULL;
             if (nGiB >= 1024ULL)
                 safe_snprintf(szMain, "%lu единиц (32 MiB)  (~%llu TB)",
@@ -3085,6 +3210,7 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
         }
         safe_snprintf(szMain, "%lu", (unsigned long)dw32);
         break;
+    }
 
     case 0xE2:
         if (eCtl == CONTROLLER_INTEL)
@@ -3094,7 +3220,9 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
         break;
 
     case 0xF5:
-        if (pDrv && IsSmi225xFamily(pDrv)) {
+    {
+        int encF5 = PROF_ENC_NONE;
+        if (AttrEncOf(pDrv, bID, NULL, &encF5) && encF5 == PROF_ENC_BLOCK32) {
             unsigned __int64 nGB = Smi225xHostGiB(qw48);
             if (nGB > 4000000ULL)
                 nGB = 4000000ULL;
@@ -3108,6 +3236,7 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
         else
             safe_snprintf(szMain, "%lu", (unsigned long)dw32);
         break;
+    }
 
     case 0xF6:
         if (eCtl == CONTROLLER_MICRON) {
@@ -3156,13 +3285,19 @@ static const char* AtaRowStatus(const DRIVE_INFO* p, const SMART_ATTRIBUTE* a,
             return "СБОЙ";
         return "Внимание";
     }
-    if (bThresh > 0 && worst != 0 && worst != 255 && worst <= bThresh)
+    /* 190/194: Worst is a temperature, not a fallen normalized value.
+     * «было» only when the decoded peak crossed the inverted trip. */
+    if (id != 0xBE && id != 0xC2 &&
+        bThresh > 0 && worst != 0 && worst != 255 && worst <= bThresh)
         return "было";
 
     if (ssd && (id == 0xE7 || id == 0xA9)) {
         int nLeft = p->nEndurancePercent;
-        BOOL lifeId = (id == 0xA9 && IsPhisonFamily(p)) ||
-                      (id == 0xE7 && E7IsLifePercent(p));
+        int semLife = PROF_SEM_NONE;
+        BOOL lifeId = (id == 0xE7 && E7IsLifePercent(p)) ||
+                      (id == 0xA9 &&
+                       ProfileLookup(p, 0xA9, &semLife, NULL) &&
+                       semLife == PROF_SEM_ENDURANCE);
         if (!lifeId || nLeft < 0) return "Не оценивается";
         if (nLeft >= 0 && nLeft <= 5) return "ПЛОХО";
         if (nLeft >= 0 && nLeft <= 10) return "Внимание";
@@ -3179,6 +3314,10 @@ static const char* AtaRowStatus(const DRIVE_INFO* p, const SMART_ATTRIBUTE* a,
     else if (id == 0xC5) n = p->nPendingSectors;
     else if (id == 0xC6) n = p->nUncorrectable;
     else if (id == 0xC7) n = p->nCrcErrors;
+    else if (id == 0xDA && DriveDbAttrIsCrc(p, 0xDA) &&
+             p->nCrcErrors > 0 &&
+             (int)GetRawValue(a->bRawValue) == p->nCrcErrors)
+        n = p->nCrcErrors;
     if (n > 0) {
         if (id == 0xC6 || n >= 10 || (id == 0xC5 && n >= 4))
             return "ПЛОХО";
@@ -3195,7 +3334,7 @@ static const char* AtaRowStatus(const DRIVE_INFO* p, const SMART_ATTRIBUTE* a,
     }
 
     if (id == 0xC3) {
-        if (!ssd && p->eVendor == VENDOR_SEAGATE) {
+        if (UseSeagateRateRaw(p)) {
             if (SeagateRateErrs(a->bRawValue) > 0) return "Внимание";
             return "ОК";
         }
@@ -3210,15 +3349,16 @@ static const char* AtaRowStatus(const DRIVE_INFO* p, const SMART_ATTRIBUTE* a,
     }
 
     if (id == 0xC8) {
-        if (val > 0 && val <= 1) return "ПЛОХО";
-        if (val > 0 && val <= 10) return "Внимание";
+        if (!NormalizedWriteErrorScored(val, bThresh)) return "ОК";
+        if (val <= 1) return "ПЛОХО";
+        if (val <= 10) return "Внимание";
         return "ОК";
     }
     if (id == 0x01 || id == 0x07) {
         DWORD dw01;
         WORD lo16;
         if (ssd) return "ОК";
-        if (p->eVendor == VENDOR_SEAGATE) {
+        if (UseSeagateRateRaw(p)) {
             if (SeagateRateErrs(a->bRawValue) > 0) return "Внимание";
             return "ОК";
         }
@@ -3230,10 +3370,18 @@ static const char* AtaRowStatus(const DRIVE_INFO* p, const SMART_ATTRIBUTE* a,
             if (dw01 > 10) return "Внимание";
             return "ОК";
         }
-        /* WD: RAW 01/07 is normally 0. Samsung F1-style huge counters are noise. */
+        /* Samsung F1-style huge counters are noise. */
         if (p->eVendor == VENDOR_SAMSUNG && dw01 > 10000u)
             return "ОК";
-        if ((p->eVendor == VENDOR_WDC || p->eVendor == VENDOR_SAMSUNG) && dw01 > 0)
+        /* WD Value 200 is the best mark. A stale non-zero RAW
+         * (WD5000LPCX-24 attr 1 stays 6435 at value 200, threshold 51)
+         * is not an error count. Badge only within 10 of the threshold. */
+        if (p->eVendor == VENDOR_WDC) {
+            if (bThresh > 0 && val > 0 && (int)val <= (int)bThresh + 10)
+                return "Внимание";
+            return "ОК";
+        }
+        if (p->eVendor == VENDOR_SAMSUNG && dw01 > 0)
             return "Внимание";
         return "ОК";
     }
@@ -3261,8 +3409,13 @@ static const char* AtaRowStatus(const DRIVE_INFO* p, const SMART_ATTRIBUTE* a,
         return "ОК";
     }
 
-    if ((id == 0xC2 || id == 0xBE) && p->nTemperatureC > 70)
-        return "Жарко";
+    if (id == 0xC2 || id == 0xBE) {
+        if (p->nTemperatureC > 70)
+            return "Жарко";
+        if (AtaTempPeakTripped(a, bThresh))
+            return "было";
+        return "ОК";
+    }
 
     if ((a->wStatusFlags & 0x0001) && bThresh > 0 && bThresh < 50 &&
         val > bThresh && val < bThresh + 10)
@@ -3300,7 +3453,14 @@ void UpdateAttrList(HWND hWnd, int nDriveIdx)
 
     DRIVE_INFO* pInfo = &g_Drives[nDriveIdx];
 
-    if (pInfo->bIsUSB && !pInfo->bSMART_Supported) {
+    if (SmartSnapshotRejected(pInfo)) {
+        AttrRowSet(&rows[0], "--",
+            TN("Ошибка данных SMART: пакет повреждён или обрезан. Здоровье не оценивается.",
+               "SMART data error: the packet is damaged or truncated. Health is not assessed."),
+            "", "—", "—", "", "");
+        nDesired = 1;
+    }
+    else if (pInfo->bIsUSB && !pInfo->bSMART_Supported) {
         const char* msg = IsLikelyUsbFlashDrive(pInfo)
             ? TN("У этой USB-флешки SMART не отдаётся — так у большинства флешек.",
                  "This USB flash drive does not export SMART — most sticks don't.")
@@ -3333,11 +3493,15 @@ void UpdateAttrList(HWND hWnd, int nDriveIdx)
         int  nWarnC = NvmeIdentifyTempC(pInfo->wNVMeWarnTempThreshold);
         int  nCritC = NvmeIdentifyTempC(pInfo->wNVMeCritTempThreshold);
 
-        #define NVME_ROW(id_, name_, val_, stat_) \
+        #define NVME_NA TN("н/п", "n/a")
+        #define NVME_ROW_EX(id_, name_, val_, worst_, thresh_, raw_, stat_) \
         { \
             if (nDesired < MAX_ATTR_ROWS) \
-                AttrRowSet(&rows[nDesired++], (id_), (name_), (val_), "—", "—", "", (stat_)); \
+                AttrRowSet(&rows[nDesired++], (id_), (name_), (val_), \
+                           (worst_), (thresh_), (raw_), (stat_)); \
         }
+        #define NVME_ROW(id_, name_, val_, stat_) \
+            NVME_ROW_EX(id_, name_, val_, NVME_NA, NVME_NA, val_, stat_)
 
         char szCrit[64], szVBuf[64], szSpare[32], szSpTh[32], szPctU[32];
         char szDUR[64], szDUW[64], szPOH[64], szPC[32];
@@ -3369,7 +3533,25 @@ void UpdateAttrList(HWND hWnd, int nDriveIdx)
             if (pInfo->eTempBand == TEMP_BAND_CRITICAL) szTstat = "Жарко";
             else if (pInfo->eTempBand == TEMP_BAND_HIGH) szTstat = "Внимание";
             else if (pInfo->eTempBand == TEMP_BAND_ELEVATED) szTstat = "Риск";
-            NVME_ROW("02h", TN("Температура", "Temperature"), szVBuf, szTstat);
+            {
+                char szRawT[24], szWorstT[24], szThrT[24];
+                const char* worstT = NVME_NA;
+                const char* thrT = NVME_NA;
+                safe_snprintf(szRawT, "%d C", nTempC);
+                if (pInfo->nTempMaxC > 0) {
+                    safe_snprintf(szWorstT, "%d C", pInfo->nTempMaxC);
+                    worstT = szWorstT;
+                }
+                if (nWarnC > 0) {
+                    safe_snprintf(szThrT, "%d C", nWarnC);
+                    thrT = szThrT;
+                } else if (nCritC > 0) {
+                    safe_snprintf(szThrT, "%d C", nCritC);
+                    thrT = szThrT;
+                }
+                NVME_ROW_EX("02h", TN("Температура", "Temperature"), szVBuf,
+                            worstT, thrT, szRawT, szTstat);
+            }
         }
         if (nWarnC > 0) {
             char szW[32];
@@ -3391,10 +3573,11 @@ void UpdateAttrList(HWND hWnd, int nDriveIdx)
         }
 
         safe_snprintf(szSpare,"%d %%",(int)pLog->AvailableSpare);
-        NVME_ROW("03h", TN("Запас блоков", "Available spare"), szSpare,
+        safe_snprintf(szSpTh,"%d %%",(int)pLog->AvailableSpareThreshold);
+        NVME_ROW_EX("03h", TN("Запас блоков", "Available spare"), szSpare,
+            NVME_NA, szSpTh, szSpare,
             (pLog->AvailableSpare<pLog->AvailableSpareThreshold?"ПЛОХО":"ОК"));
 
-        safe_snprintf(szSpTh,"%d %%",(int)pLog->AvailableSpareThreshold);
         NVME_ROW("04h", TN("Порог запаса блоков", "Spare threshold"), szSpTh, "ОК");
 
         safe_snprintf(szPctU,"%d %%",(int)pLog->PercentageUsed);
@@ -3496,6 +3679,8 @@ void UpdateAttrList(HWND hWnd, int nDriveIdx)
         }
 
         #undef NVME_ROW
+        #undef NVME_ROW_EX
+        #undef NVME_NA
     }
     else if (pInfo->bSMART_Supported) {
         int i, j;

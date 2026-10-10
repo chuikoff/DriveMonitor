@@ -387,6 +387,7 @@ BOOL GetNVMeHealthLog(HANDLE hDrive, DRIVE_INFO* pInfo)
            nCopied < sizeof(NVME_HEALTH_INFO_LOG) ? nCopied : sizeof(NVME_HEALTH_INFO_LOG));
     pInfo->bIsNVMe          = TRUE;
     pInfo->bSMART_Supported = TRUE;
+    pInfo->bSmartDataInvalid = FALSE;
     pInfo->bSMART_Enabled   = TRUE;
     pInfo->eAccessMethod    = SMART_ACCESS_NVME_PROTOCOL;
 
@@ -569,6 +570,7 @@ static BOOL FillNvmeHealthFromBuf(DRIVE_INFO* pInfo, BYTE* health, DWORD n)
            n < sizeof(NVME_HEALTH_INFO_LOG) ? n : sizeof(NVME_HEALTH_INFO_LOG));
     pInfo->bIsNVMe = TRUE;
     pInfo->bSMART_Supported = TRUE;
+    pInfo->bSmartDataInvalid = FALSE;
     pInfo->bSMART_Enabled = TRUE;
     pInfo->eAccessMethod = SMART_ACCESS_NVME_PROTOCOL;
     return TRUE;
