@@ -697,6 +697,9 @@ static RAW_ENC RawEncFromProf(int enc)
     case PROF_ENC_GIB:
     case PROF_ENC_BLOCK32:
     case PROF_ENC_SCALE:
+    case PROF_ENC_LO16:
+    case PROF_ENC_REPORTED:
+    case PROF_ENC_REMAP:
         return RAW_ENC_COUNTER48;
     default:
         return RAW_ENC_UNKNOWN;

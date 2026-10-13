@@ -250,6 +250,17 @@ static void MapAttr(const char* fmt, const char* name, int* sem, int* enc)
         *enc = HasCI(low, "percent") ? PROF_ENC_PERCENT : PROF_ENC_COUNTER;
         return;
     }
+    if (HasCI(low, "crc") && !HasCI(low, "fail")) {
+        *sem = PROF_SEM_INTERFACE;
+        *enc = PROF_ENC_COUNTER;
+        return;
+    }
+    if (HasCI(low, "realloc") || HasCI(low, "pending_sector") ||
+        HasCI(low, "current_pending") || HasCI(low, "uncorrect")) {
+        *sem = PROF_SEM_MEDIA;
+        *enc = PROF_ENC_COUNTER;
+        return;
+    }
     /* A raw format is still a decode. Health scoring ignores sem NONE.
      * Unknown_* stays unnamed in GetAttrDecode; the encoding is only
      * used when the name itself is a real label. */
@@ -268,7 +279,8 @@ static bool HealthSem(int sem)
 {
     return sem == PROF_SEM_ENDURANCE || sem == PROF_SEM_HOST_WRITE ||
            sem == PROF_SEM_HOST_READ || sem == PROF_SEM_NAND_WRITE ||
-           sem == PROF_SEM_ERASE || sem == PROF_SEM_WEAR;
+           sem == PROF_SEM_ERASE || sem == PROF_SEM_WEAR ||
+           sem == PROF_SEM_MEDIA || sem == PROF_SEM_INTERFACE;
 }
 
 static void StoreAttr(DRIVE_INFO* p, unsigned id, int sem, int enc, const char* name)

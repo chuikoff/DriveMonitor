@@ -10,7 +10,7 @@
 
 **Текущий выпуск:** [1.7.23](https://github.com/chuikoff/DriveMonitor/releases/tag/1.7.23) (сборка 23) — скачать `DriveMonitor.exe`, запустить от администратора.
 
-**Бета:** [2.0.12-beta](https://github.com/chuikoff/DriveMonitor/releases/tag/2.0.12-beta) (сборка 12, GPL-2.0-or-later). Стабильный выпуск остаётся 1.7.23.
+**Бета:** [2.0.17-beta](https://github.com/chuikoff/DriveMonitor/releases/tag/2.0.17-beta) (сборка 17, GPL-2.0-or-later). Стабильный выпуск остаётся 1.7.23.
 
 Windows 10 / 11. Снимок SMART на старте, при hotplug и по «Перечитать». «Вид → Мониторинг» (Ctrl+M) раз в минуту перечитывает диски; по умолчанию выключен. Пока мониторинг включён, в трее по иконке на диск с температурой, а кнопка «Свернуть» убирает окно в трей и чтение продолжается. Без мониторинга иконок в трее нет. Закрытие окна завершает программу. Без графика и теста поверхности. Интерфейс следует DPI монитора; масштаб 100–200% в меню «Вид» (Ctrl+±, Ctrl+0, Ctrl+колёсико).
 
@@ -68,7 +68,7 @@ A one-shot Windows S.M.A.R.T. viewer with Russian and English UI. Language: **La
 
 **Current release:** [1.7.23](https://github.com/chuikoff/DriveMonitor/releases/tag/1.7.23) (build 23) — download `DriveMonitor.exe` and run it as Administrator.
 
-**Beta:** [2.0.12-beta](https://github.com/chuikoff/DriveMonitor/releases/tag/2.0.12-beta) (build 12, GPL-2.0-or-later). The stable release remains 1.7.23.
+**Beta:** [2.0.17-beta](https://github.com/chuikoff/DriveMonitor/releases/tag/2.0.17-beta) (build 17, GPL-2.0-or-later). The stable release remains 1.7.23.
 
 Windows 10 / 11. One SMART snapshot at startup, on hotplug, and on Reread. **View → Monitor** (Ctrl+M) rereads once a minute; it is off by default. While monitoring is on, the tray shows one icon per disk with its temperature, and Minimize hides the window there while reading continues. With monitoring off there are no tray icons. Closing the window exits. No Health% formula. The UI follows monitor DPI; zoom 100–200% is under **View** (Ctrl+±, Ctrl+0, Ctrl+wheel).
 

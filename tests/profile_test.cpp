@@ -1,6 +1,7 @@
 /* DriveMonitor - profile resolver tests. GPL-2.0-or-later. See LICENSE.
  * Linked with src/profile.cpp only. DriveDbApply and DriveDbLookup are
- * stubs, so a new row is proven by ProfileRegister, not by an interpreter edit. */
+ * stubs, so a new row is proven by ProfileRegister, not by an interpreter edit.
+ * The real drivedb chain is tests/drivedb_test.cpp. */
 #include "smart.h"
 #include <stdio.h>
 #include <string.h>
@@ -8,6 +9,7 @@
 static int g_fail = 0;
 static int g_check = 0;
 static int g_dbE7 = 0;
+static int g_db11 = 0;
 static DRIVE_INFO g;
 
 extern "C" void DriveDbApply(DRIVE_INFO* p)
@@ -18,11 +20,23 @@ extern "C" void DriveDbApply(DRIVE_INFO* p)
 /* When g_dbE7 is set, drivedb claims 231 is wear/counter.
  * A local profile that already decided 231 must keep its own semantic.
  * A contested 231 must not accept this row. */
+extern "C" BOOL DriveDbAttrIsCrc(const DRIVE_INFO* p, BYTE id)
+{
+    (void)p;
+    (void)id;
+    return FALSE;
+}
+
 extern "C" BOOL DriveDbLookup(const DRIVE_INFO* p, BYTE id, int* sem, int* enc)
 {
     (void)p;
     if (sem) *sem = PROF_SEM_NONE;
     if (enc) *enc = PROF_ENC_NONE;
+    if (g_db11 && id == 0x11) {
+        if (sem) *sem = PROF_SEM_WEAR;
+        if (enc) *enc = PROF_ENC_COUNTER;
+        return TRUE;
+    }
     if (!g_dbE7 || id != 0xE7) return FALSE;
     if (sem) *sem = PROF_SEM_WEAR;
     if (enc) *enc = PROF_ENC_COUNTER;
@@ -70,21 +84,51 @@ static void ExpectId(const char* id, int score, const char* msg)
 }
 
 static const PROF_ATTR kLifeA[] = {
-    { 0xE7, PROF_SEM_ENDURANCE, PROF_ENC_PERCENT, 0, "A life", "A life", NULL, NULL },
-    { 0, 0, 0, 0, NULL, NULL, NULL, NULL }
+    { 0xE7, PROF_SEM_ENDURANCE, PROF_ENC_PERCENT, 0, "A life", "A life", NULL, NULL,
+      0, 0, 0, 0, 0, 0, 0 },
+    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0 }
 };
 static const PROF_ATTR kLifeB[] = {
-    { 0xE7, PROF_SEM_WEAR, PROF_ENC_COUNTER, 0, "B wear", "B wear", NULL, NULL },
-    { 0, 0, 0, 0, NULL, NULL, NULL, NULL }
+    { 0xE7, PROF_SEM_WEAR, PROF_ENC_COUNTER, 0, "B wear", "B wear", NULL, NULL,
+      0, 0, 0, 0, 0, 0, 0 },
+    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0 }
 };
 static const PROF_ATTR kLifeAgree[] = {
-    { 0xE7, PROF_SEM_ENDURANCE, PROF_ENC_PERCENT, 0, "Same", "Same", NULL, NULL },
-    { 0, 0, 0, 0, NULL, NULL, NULL, NULL }
+    { 0xE7, PROF_SEM_ENDURANCE, PROF_ENC_PERCENT, 0, "Same", "Same", NULL, NULL,
+      0, 0, 0, 0, 0, 0, 0 },
+    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0 }
 };
 static const PROF_ATTR kWidget[] = {
-    { 0xE7, PROF_SEM_ENDURANCE, PROF_ENC_PERCENT, 0, "Widget life", "Widget life", NULL, NULL },
-    { 0x11, PROF_SEM_MEDIA, PROF_ENC_COUNTER, 0, "Widget media", "Widget media", NULL, NULL },
-    { 0, 0, 0, 0, NULL, NULL, NULL, NULL }
+    { 0xE7, PROF_SEM_ENDURANCE, PROF_ENC_PERCENT, 0, "Widget life", "Widget life", NULL, NULL,
+      0, 0, 0, 0, 0, 0, 0 },
+    { 0x11, PROF_SEM_MEDIA, PROF_ENC_COUNTER, 0, "Widget media", "Widget media", NULL, NULL,
+      0, 0, 0, 0, 0, 0, 0 },
+    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0 }
+};
+static const PROF_ATTR kSpecLong[] = {
+    { 0x11, PROF_SEM_MEDIA, PROF_ENC_COUNTER, 0, "Long media", "Long media", NULL, NULL,
+      0, 0, 0, 0, 0, 0, 0 },
+    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0 }
+};
+static const PROF_ATTR kSpecShort[] = {
+    { 0x11, PROF_SEM_WEAR, PROF_ENC_COUNTER, 0, "Short wear", "Short wear", NULL, NULL,
+      0, 0, 0, 0, 0, 0, 0 },
+    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0 }
+};
+static const PROF_ATTR kCoverMedia[] = {
+    { 0x11, PROF_SEM_MEDIA, PROF_ENC_COUNTER, 0, "Cover media", "Cover media", NULL, NULL,
+      0, 0, 0, 0, 0, 0, 0 },
+    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0 }
+};
+static const PROF_ATTR kCoverWear[] = {
+    { 0x11, PROF_SEM_WEAR, PROF_ENC_COUNTER, 0, "Cover wear", "Cover wear", NULL, NULL,
+      0, 0, 0, 0, 0, 0, 0 },
+    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0 }
+};
+static const PROF_ATTR kCoverSame[] = {
+    { 0x11, PROF_SEM_MEDIA, PROF_ENC_COUNTER, 0, "Cover same", "Cover same", NULL, NULL,
+      0, 0, 0, 0, 2, 0, 0 },
+    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0 }
 };
 
 static void DefExact(PROFILE_DEF* d, const char* id, const char* model,
@@ -171,6 +215,8 @@ static void TestSameIdDifferentMeaning(void)
            enc == PROF_ENC_PERCENT, "Phison A9 endurance");
     Expect(Lookup(0xE7, &sem, &enc) && sem == PROF_SEM_ENDURANCE, "Phison E7 endurance");
     Expect(Lookup(0xF1, &sem, &enc) && enc == PROF_ENC_SCALE, "Phison F1 scale");
+    Expect(Lookup(0xE9, &sem, &enc) && sem == PROF_SEM_NAND_WRITE &&
+           enc == PROF_ENC_GIB && ProfileWriteVolume(sem, enc), "Phison E9 GiB");
     Expect(!Lookup(0xFC, &sem, &enc), "Phison 252 unknown");
 
     Blank(DRIVE_TYPE_SSD_SATA, FALSE);
@@ -275,6 +321,13 @@ static void TestRegister(void)
     Expect(Lookup(0xE7, &sem, &enc) && sem == PROF_SEM_ENDURANCE &&
            enc == PROF_ENC_PERCENT, "widget life");
     Expect(Lookup(0x11, &sem, &enc) && sem == PROF_SEM_MEDIA, "widget media id");
+    {
+        PROF_HEALTH hh;
+        Expect(ProfileHealthRule(&g, 0x11, &hh) &&
+               hh.rule == PROF_RULE_WORSE && hh.sem == PROF_SEM_MEDIA &&
+               hh.caution == 1 && hh.bad == 0 && hh.badHdd == 0,
+               "widget media enters the channel");
+    }
     Expect(ProfileAttrLabel(&g, 0xE7, &sem, &enc, &ru, NULL, NULL, NULL, NULL) &&
            ru && strcmp(ru, "Widget life") == 0, "widget label");
     ProfileClearRegistered();
@@ -370,6 +423,43 @@ static void TestRegister(void)
     g_dbE7 = 0;
 }
 
+static void TestWriteVolume(void)
+{
+    int sem = 0, enc = 0;
+
+    Expect(!ProfileWriteVolume(PROF_SEM_WEAR, PROF_ENC_PERCENT), "wear percent is not a volume");
+    Expect(!ProfileWriteVolume(PROF_SEM_NAND_WRITE, PROF_ENC_COUNTER), "bare counter is not GiB");
+    Expect(!ProfileWriteVolume(PROF_SEM_NONE, PROF_ENC_GIB), "GiB without a write semantic");
+    Expect(ProfileWriteVolume(PROF_SEM_HOST_WRITE, PROF_ENC_GIB), "host GiB");
+    Expect(ProfileWriteVolume(PROF_SEM_NAND_WRITE, PROF_ENC_BLOCK32), "NAND 32 MiB");
+    Expect(ProfileWriteVolume(PROF_SEM_HOST_WRITE, PROF_ENC_LBA), "host LBA");
+    Expect(ProfileWriteVolume(PROF_SEM_HOST_WRITE, PROF_ENC_SCALE), "host scale");
+    Expect(ProfileEraseCount(PROF_SEM_ERASE, PROF_ENC_COUNTER), "erase counter");
+    Expect(ProfileEraseCount(PROF_SEM_ERASE, PROF_ENC_MAXAVG), "erase max/avg");
+    Expect(!ProfileEraseCount(PROF_SEM_ERASE, PROF_ENC_PERCENT), "erase percent is not a count");
+    Expect(!ProfileEraseCount(PROF_SEM_WEAR, PROF_ENC_COUNTER), "wear counter is not erase");
+    Expect(!ProfileEraseCount(PROF_SEM_NONE, PROF_ENC_COUNTER), "unnamed counter is not erase");
+
+    Blank(DRIVE_TYPE_SSD_SATA, FALSE);
+    g.eController = CONTROLLER_INTEL;
+    Name("INTEL SSDSC2KB480G8", "");
+    Go();
+    Expect(strcmp(g.szProfileId, "intel-ssd") == 0, "Intel controller profile");
+    Expect(Lookup(0xE9, &sem, &enc) && sem == PROF_SEM_WEAR &&
+           enc == PROF_ENC_PERCENT, "Intel E9 wear percent");
+    Expect(!ProfileWriteVolume(sem, enc), "Intel E9 is not host writes");
+    Expect(Lookup(0xE1, &sem, &enc) && sem == PROF_SEM_HOST_WRITE &&
+           enc == PROF_ENC_BLOCK32 && ProfileWriteVolume(sem, enc), "Intel E1 blocks");
+    Expect(!Lookup(0xEA, &sem, &enc), "Intel EA is not an erase count");
+
+    Blank(DRIVE_TYPE_SSD_SATA, FALSE);
+    g.eController = CONTROLLER_PHISON;
+    Name("PHISON-EA", "");
+    Go();
+    Expect(!Lookup(0xEA, &sem, &enc), "Phison EA is not listed");
+    Expect(Lookup(0xA7, &sem, &enc) && ProfileEraseCount(sem, enc), "Phison A7 erase");
+}
+
 static void TestDecodeAndUsb(void)
 {
     unsigned __int64 out = 1;
@@ -436,6 +526,204 @@ static void TestDecodeAndUsb(void)
     Expect(g.eController == CONTROLLER_UNKNOWN, "USB stick controller");
     Expect(!ProfileLookup(&g, 0xE7, NULL, NULL), "USB stick has no endurance");
     Expect(!ProfileLookup(&g, 0xA9, NULL, NULL), "USB stick has no A9");
+
+    Expect(ProfileDecodeRaw(PROF_ENC_LO16, 0x1000AULL, &out) == 1 && out == 10,
+           "low 16");
+}
+
+static const PROF_ATTR kRankBad[] = {
+    { 0x11, PROF_SEM_MEDIA, PROF_ENC_COUNTER, 0, "Bad", "Bad", NULL, NULL,
+      PROF_RULE_WORSE, PROF_SLOT_NONE, PROF_SCOPE_ANY, 0, 1, 1, 0 },
+    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0 }
+};
+static const PROF_ATTR kRankCau[] = {
+    { 0x11, PROF_SEM_MEDIA, PROF_ENC_COUNTER, 0, "Cau", "Cau", NULL, NULL,
+      PROF_RULE_WORSE, PROF_SLOT_NONE, PROF_SCOPE_ANY, 0, 1, 0, 0 },
+    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0 }
+};
+
+static void TestHealthRule(void)
+{
+    PROF_HEALTH h;
+    PROFILE_DEF a, b;
+
+    Expect(ProfileCountRank(0, 0, 1, 0, 10, 1) == HEALTH_STATUS_GOOD, "zero stays good");
+    Expect(ProfileCountRank(1, 0, 1, 0, 10, 0) == HEALTH_STATUS_CAUTION, "ssd realloc caution");
+    Expect(ProfileCountRank(10, 0, 1, 0, 10, 0) == HEALTH_STATUS_CAUTION, "ssd realloc 10 stays caution");
+    Expect(ProfileCountRank(10, 0, 1, 0, 10, 1) == HEALTH_STATUS_BAD, "hdd realloc 10 is bad");
+    Expect(ProfileCountRank(9, 0, 1, 0, 10, 1) == HEALTH_STATUS_CAUTION, "hdd realloc 9 is caution");
+    Expect(ProfileCountRank(2, 0, 1, 0, 4, 1) == HEALTH_STATUS_CAUTION, "hdd pending 2");
+    Expect(ProfileCountRank(4, 0, 1, 0, 4, 1) == HEALTH_STATUS_BAD, "hdd pending 4");
+    Expect(ProfileCountRank(4, 0, 1, 0, 4, 0) == HEALTH_STATUS_CAUTION, "ssd pending 4");
+    Expect(ProfileCountRank(1, 0, 0, 1, 0, 0) == HEALTH_STATUS_BAD, "one uncorrectable is bad");
+    Expect(ProfileCountRank(1, 0, 1, 100, 0, 0) == HEALTH_STATUS_CAUTION, "one crc is caution");
+    Expect(ProfileCountRank(100, 0, 1, 100, 0, 0) == HEALTH_STATUS_BAD, "crc 100 is bad");
+    Expect(ProfileCountRank(3, 1, 5, 0, 0, 1) == HEALTH_STATUS_OBSERVE, "e2e below caution");
+    Expect(ProfileCountRank(5, 1, 5, 0, 0, 1) == HEALTH_STATUS_CAUTION, "e2e at caution");
+    Expect(ProfileCountRank(2, 0, 3, 0, 0, 1) == HEALTH_STATUS_GOOD, "two spin retries");
+    Expect(ProfileCountRank(3, 0, 3, 0, 0, 1) == HEALTH_STATUS_CAUTION, "three spin retries");
+    Expect(ProfileCountRank(-1, 0, 1, 0, 0, 0) == HEALTH_STATUS_UNKNOWN, "absent count");
+
+    Blank(DRIVE_TYPE_SSD_SATA, FALSE);
+    Name("UNKNOWN-SSD", "");
+    Go();
+    Expect(ProfileHealthRule(&g, 0x05, &h) && h.enc == PROF_ENC_LO16 &&
+           h.slot == PROF_SLOT_REALLOC && h.caution == 1 && h.bad == 0 &&
+           h.badHdd == 10 && h.rule == PROF_RULE_WORSE, "generic realloc rule");
+    Expect(ProfileHealthRule(&g, 0xC5, &h) && h.slot == PROF_SLOT_PENDING &&
+           h.badHdd == 4 && h.caution == 1, "generic pending rule");
+    Expect(ProfileHealthRule(&g, 0xC6, &h) && h.bad == 1 && h.slot == PROF_SLOT_UNCORR,
+           "generic uncorrectable rule");
+    Expect(ProfileHealthRule(&g, 0xC4, &h) && h.enc == PROF_ENC_REMAP &&
+           h.caution == 1 && h.bad == 0, "generic remap rule");
+    Expect(ProfileHealthRule(&g, 0xC7, &h) && h.sem == PROF_SEM_INTERFACE &&
+           h.slot == PROF_SLOT_CRC && h.bad == 100, "generic crc rule");
+    Expect(ProfileHealthRule(&g, 0xBC, &h) && h.sem == PROF_SEM_INTERFACE &&
+           h.enc == PROF_ENC_LO16 && h.caution == 10 && h.bad == 100,
+           "generic timeout rule");
+    Expect(ProfileHealthRule(&g, 0x0A, &h) && h.scope == PROF_SCOPE_HDD &&
+           h.caution == 3, "spin retry is hdd only");
+    Expect(ProfileHealthRule(&g, 0xBB, &h) && h.scope == PROF_SCOPE_HDD &&
+           h.enc == PROF_ENC_REPORTED && h.bad == 1, "reported uncorrectable is hdd");
+    Expect(ProfileHealthRule(&g, 0xB8, &h) && h.scope == PROF_SCOPE_HDD &&
+           h.observe == 1 && h.caution == 5, "end to end is hdd");
+
+    Blank(DRIVE_TYPE_SSD_SATA, FALSE);
+    g.eController = CONTROLLER_PHISON;
+    Name("PHISON-RULE", "");
+    Go();
+    Expect(ProfileHealthRule(&g, 0xA1, &h) && h.rule == PROF_RULE_OFF,
+           "spare remaining does not move the rank");
+    Expect(ProfileHealthRule(&g, 0xB2, &h) && h.sem == PROF_SEM_MEDIA &&
+           h.rule == PROF_RULE_WORSE && h.caution == 1 && h.bad == 0,
+           "used spare enters media");
+
+    Blank(DRIVE_TYPE_SSD_SATA, FALSE);
+    g.eController = CONTROLLER_SAMSUNG;
+    Name("SAMSUNG-RULE", "");
+    Go();
+    Expect(ProfileHealthRule(&g, 0xBB, &h) && h.bad == 1 && h.rule == PROF_RULE_WORSE,
+           "samsung uncorrectable is bad");
+    Expect(ProfileHealthRule(&g, 0xB7, &h) && h.rule == PROF_RULE_OFF,
+           "samsung 183 does not move the rank");
+    Expect(ProfileHealthRule(&g, 0xB3, &h) && h.caution == 1 && h.bad == 0,
+           "samsung used reserve enters media");
+
+    Blank(DRIVE_TYPE_HDD, FALSE);
+    g.eVendor = VENDOR_SEAGATE;
+    Name("ST1000DM003", "");
+    Go();
+    Expect(ProfileHealthRule(&g, 0xBB, &h) && h.enc == PROF_ENC_REPORTED &&
+           h.slot == PROF_SLOT_REPORTED && h.bad == 1, "seagate 187 rule");
+
+    ProfileClearRegistered();
+    DefExact(&a, "rank-bad", "RANKTIE", kRankBad, "test-register");
+    DefExact(&b, "rank-cau", "RANKTIE", kRankCau, "test-register");
+    Expect(ProfileRegister(&a), "rank bad");
+    Expect(ProfileRegister(&b), "rank caution");
+    Blank(DRIVE_TYPE_SSD_SATA, FALSE);
+    Name("RANKTIE", "");
+    Go();
+    Expect(!ProfileHealthRule(&g, 0x11, &h), "contested threshold is refused");
+    Expect(!Lookup(0x11, NULL, NULL), "contested threshold has no semantic");
+    Expect(ProfileListsAttr(&g, 0x11), "contested threshold stays listed");
+    ProfileClearRegistered();
+}
+
+/* Same score, higher specificity wins. A lower tier that disagrees refuses
+ * without marking the identity ambiguous. Agreement on that tier is used. */
+static void TestAttrTier(void)
+{
+    PROFILE_DEF longer, shorter, exact, media, wear;
+    int sem = 0, enc = 0;
+    const char* ru = NULL;
+    PROF_HEALTH h;
+
+    ProfileClearRegistered();
+    DefExact(&longer, "spec-long", "ZQWIDSPEC", kSpecLong, "test-register");
+    longer.kind = PROF_KIND_FAMILY;
+    DefExact(&shorter, "spec-short", "ZQWID", kSpecShort, "test-register");
+    shorter.kind = PROF_KIND_FAMILY;
+
+    Expect(ProfileRegister(&shorter), "short family first");
+    Expect(ProfileRegister(&longer), "long family second");
+    Blank(DRIVE_TYPE_SSD_SATA, FALSE);
+    Name("ZQWIDSPEC-DRIVE", "");
+    Go();
+    Expect(strcmp(g.szProfileId, "spec-long") == 0, "longer key is the profile");
+    Expect(g.nProfileScore == 90, "family score");
+    Expect(!g.bProfileAmbiguous, "different specificity is not a tie");
+    Expect(g.szProfileConflict[0] == '\0', "no identity conflict");
+    Expect(Lookup(0x11, &sem, &enc) && sem == PROF_SEM_MEDIA &&
+           enc == PROF_ENC_COUNTER, "longer row supplies media");
+    Expect(ProfileAttrLabel(&g, 0x11, &sem, &enc, &ru, NULL, NULL, NULL, NULL) &&
+           ru && strcmp(ru, "Long media") == 0, "label follows the longer row");
+
+    ProfileClearRegistered();
+    Expect(ProfileRegister(&longer), "long family first");
+    Expect(ProfileRegister(&shorter), "short family later");
+    Go();
+    Expect(strcmp(g.szProfileId, "spec-long") == 0, "longer key either order");
+    Expect(!g.bProfileAmbiguous, "still one identity winner");
+    Expect(Lookup(0x11, &sem, &enc) && sem == PROF_SEM_MEDIA,
+           "later shorter row does not replace media");
+    Expect(ProfileAttrLabel(&g, 0x11, &sem, &enc, &ru, NULL, NULL, NULL, NULL) &&
+           ru && strcmp(ru, "Long media") == 0, "label stays on the longer row");
+    ProfileClearRegistered();
+
+    DefExact(&exact, "cover-exact", "ZQCOVERX", NULL, "test-register");
+    DefExact(&media, "cover-media", "ZQCOVER", kCoverMedia, "test-register");
+    media.kind = PROF_KIND_FAMILY;
+    DefExact(&wear, "cover-wear", "ZQCOVER", kCoverWear, "test-register");
+    wear.kind = PROF_KIND_FAMILY;
+    g_db11 = 1;
+    Expect(ProfileRegister(&exact), "exact cover");
+    Expect(ProfileRegister(&media), "cover media first");
+    Expect(ProfileRegister(&wear), "cover wear later");
+    Blank(DRIVE_TYPE_SSD_SATA, FALSE);
+    Name("ZQCOVERX", "");
+    Go();
+    Expect(strcmp(g.szProfileId, "cover-exact") == 0, "exact profile stays");
+    Expect(g.nProfileScore == 98, "exact score above the families");
+    Expect(!g.bProfileAmbiguous, "lower-tier conflict is not identity ambiguity");
+    Expect(g.szProfileConflict[0] == '\0', "identity conflict stays empty");
+    Expect(g.eController == CONTROLLER_UNKNOWN, "cover does not invent a controller");
+    Expect(!Lookup(0x11, &sem, &enc), "disagreeing lower tier is refused");
+    Expect(ProfileListsAttr(&g, 0x11), "refused id stays listed");
+    Expect(!ProfileAttrLabel(&g, 0x11, &sem, &enc, &ru, NULL, NULL, NULL, NULL),
+           "refused id has no label");
+    Expect(!ProfileHealthRule(&g, 0x11, &h), "refused id has no health rule");
+
+    ProfileClearRegistered();
+    Expect(ProfileRegister(&wear), "cover wear first");
+    Expect(ProfileRegister(&exact), "exact cover second");
+    Expect(ProfileRegister(&media), "cover media later");
+    Go();
+    Expect(strcmp(g.szProfileId, "cover-exact") == 0, "exact profile either order");
+    Expect(!g.bProfileAmbiguous, "order does not make the profile ambiguous");
+    Expect(!Lookup(0x11, &sem, &enc), "lower tier still refused");
+    Expect(ProfileListsAttr(&g, 0x11), "listed either order");
+    g_db11 = 0;
+    ProfileClearRegistered();
+
+    DefExact(&exact, "cover-exact", "ZQCOVERX", NULL, "test-register");
+    DefExact(&media, "cover-same-b", "ZQCOVER", kCoverSame, "test-register");
+    media.kind = PROF_KIND_FAMILY;
+    DefExact(&wear, "cover-same-a", "ZQCOVER", kCoverSame, "test-register");
+    wear.kind = PROF_KIND_FAMILY;
+    Expect(ProfileRegister(&exact), "exact above agreement");
+    Expect(ProfileRegister(&media), "same b");
+    Expect(ProfileRegister(&wear), "same a");
+    Go();
+    Expect(strcmp(g.szProfileId, "cover-exact") == 0, "agreement keeps the exact profile");
+    Expect(g.nProfileScore == 98, "agreement does not change the score");
+    Expect(!g.bProfileAmbiguous, "agreeing lower tier is not an identity tie");
+    Expect(Lookup(0x11, &sem, &enc) && sem == PROF_SEM_MEDIA &&
+           enc == PROF_ENC_COUNTER, "agreeing lower tier supplies media");
+    memset(&h, 0, sizeof(h));
+    Expect(ProfileHealthRule(&g, 0x11, &h) && h.sem == PROF_SEM_MEDIA &&
+           h.caution == 2 && h.bad == 0, "agreed rule fields are kept");
+    ProfileClearRegistered();
 }
 
 int main(void)
@@ -444,8 +732,11 @@ int main(void)
     TestPriority();
     TestSameIdDifferentMeaning();
     TestFirmwareShape();
+    TestWriteVolume();
     TestRegister();
     TestDecodeAndUsb();
+    TestHealthRule();
+    TestAttrTier();
     ProfileClearRegistered();
     if (g_fail) {
         fprintf(stderr, "%d failed, %d checks\n", g_fail, g_check);

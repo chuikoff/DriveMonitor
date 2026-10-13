@@ -734,15 +734,12 @@ static void AssessHddHealth(DRIVE_INFO* pInfo)
     BOOL bGsenseUp = FALSE, bC5Up = FALSE, bMediaUp = FALSE;
     MECH_SNAP prev, now;
     int havePrev = 0;
-    int n187, n184;
 
-    n187 = AttrRawOrNeg1(pInfo, 0xBB);
-    n184 = AttrRawOrNeg1(pInfo, 0xB8);
     bMediaHurt = (pInfo->nReallocated > 0 ||
                   pInfo->nPendingSectors > 0 ||
                   pInfo->nUncorrectable > 0 ||
                   pInfo->nRemapEvents > 0 ||
-                  n187 > 0);
+                  pInfo->nReportedUncorrect > 0);
     bMediaClean = !bMediaHurt;
 
     pInfo->nGSenseDelta = -1;
@@ -789,34 +786,20 @@ static void AssessHddHealth(DRIVE_INFO* pInfo)
         bParkLow  = wear.bId193Val || wear.bId193Raw;
         bParkBad  = (v193 >= 0 && v193 <= 5);
 
-    /* Media RAW 05/196/197/198/187 and ATA-3 prefail. Not 193/1/7 Value bands. */
+    /* Media and interface ranks come from profile rules. Prefail and a
+     * failed self-test still sit on top of that rank. */
     if (SelfTestFailed(pInfo))
         pInfo->eReliability = HEALTH_STATUS_CRITICAL;
-    else if (pInfo->bPrefailNow ||
-             pInfo->nUncorrectable > 0 ||
-             pInfo->nPendingSectors >= 4 ||
-             pInfo->nReallocated >= 10 ||
-             n187 > 0)
-        pInfo->eReliability = HEALTH_STATUS_BAD;
-    else if (pInfo->nPendingSectors > 0 || pInfo->nReallocated > 0 ||
-             pInfo->nRemapEvents > 0 || n184 >= 5)
-        pInfo->eReliability = HEALTH_STATUS_CAUTION;
-    else if (pInfo->bPrefailPast || pInfo->bUsageFailed || n184 > 0)
-        pInfo->eReliability = HEALTH_STATUS_OBSERVE;
-    else
-        pInfo->eReliability = HEALTH_STATUS_GOOD;
-
-    /* Interface: 199 CRC, 188 timeouts (cable/power), 10 spin retries (PSU). */
-    {
-        int n188 = AttrRawOrNeg1(pInfo, 0xBC);
-        int n10  = AttrRawOrNeg1(pInfo, 0x0A);
-        if (pInfo->nCrcErrors >= 100 || n188 >= 100)
-            pInfo->eInterface = HEALTH_STATUS_BAD;
-        else if (pInfo->nCrcErrors > 0 || n188 >= 10 || n10 > 2)
-            pInfo->eInterface = HEALTH_STATUS_CAUTION;
-        else
-            pInfo->eInterface = HEALTH_STATUS_GOOD;
+    else {
+        pInfo->eReliability = pInfo->eMediaEvidence;
+        if (pInfo->bPrefailNow)
+            pInfo->eReliability = WorstHealth(pInfo->eReliability,
+                                              HEALTH_STATUS_BAD);
+        if (pInfo->bPrefailPast || pInfo->bUsageFailed)
+            pInfo->eReliability = WorstHealth(pInfo->eReliability,
+                                              HEALTH_STATUS_OBSERVE);
     }
+    pInfo->eInterface = pInfo->eInterfaceEvidence;
 
     /* Temperature: risk without surface damage is OBSERVE, not BAD. */
     pInfo->eTempBand = TempBandFromC(pInfo->nTemperatureC);
@@ -906,18 +889,15 @@ static void AssessSsdHealth(DRIVE_INFO* pInfo)
         (cw & NVME_CRIT_WARN_READ_ONLY) ||
         (cw & NVME_CRIT_WARN_RELIABILITY_DEGRADED))
         pInfo->eReliability = HEALTH_STATUS_CRITICAL;
-    else if (pInfo->bPrefailNow ||
-             pInfo->qwNVMeMediaErrors > 0 ||
-             pInfo->nUncorrectable > 0 ||
-             bSpareLow)
-        pInfo->eReliability = HEALTH_STATUS_BAD;
-    else if (pInfo->nReallocated > 0 || pInfo->nPendingSectors > 0 ||
-             pInfo->nRemapEvents > 0)
-        pInfo->eReliability = HEALTH_STATUS_CAUTION;
-    else if (pInfo->bPrefailPast || pInfo->bUsageFailed)
-        pInfo->eReliability = HEALTH_STATUS_OBSERVE;
-    else
-        pInfo->eReliability = HEALTH_STATUS_GOOD;
+    else {
+        pInfo->eReliability = pInfo->eMediaEvidence;
+        if (pInfo->bPrefailNow || pInfo->qwNVMeMediaErrors > 0 || bSpareLow)
+            pInfo->eReliability = WorstHealth(pInfo->eReliability,
+                                              HEALTH_STATUS_BAD);
+        if (pInfo->bPrefailPast || pInfo->bUsageFailed)
+            pInfo->eReliability = WorstHealth(pInfo->eReliability,
+                                              HEALTH_STATUS_OBSERVE);
+    }
 
     pInfo->eWear = WearStatusFromRemaining(pInfo->nEndurancePercent);
     if (pInfo->bIsNVMe && (int)pInfo->nvmeHealth.PercentageUsed > 95)
@@ -925,17 +905,8 @@ static void AssessSsdHealth(DRIVE_INFO* pInfo)
     if (pInfo->bIsNVMe && (int)pInfo->nvmeHealth.PercentageUsed >= 100)
         pInfo->eWear = HEALTH_STATUS_BAD;
 
-    if (pInfo->bIsNVMe)
-        pInfo->eInterface = HEALTH_STATUS_GOOD;
-    else {
-        int n188 = AttrRawOrNeg1(pInfo, 0xBC);
-        if (pInfo->nCrcErrors >= 100 || n188 >= 100)
-            pInfo->eInterface = HEALTH_STATUS_BAD;
-        else if (pInfo->nCrcErrors > 0 || n188 >= 10)
-            pInfo->eInterface = HEALTH_STATUS_CAUTION;
-        else
-            pInfo->eInterface = HEALTH_STATUS_GOOD;
-    }
+    pInfo->eInterface = pInfo->bIsNVMe ? HEALTH_STATUS_GOOD
+                                       : pInfo->eInterfaceEvidence;
 
     if (pInfo->bIsNVMe)
         pInfo->eTempBand = TempBandFromNvme(pInfo->nTemperatureC,
@@ -1004,6 +975,110 @@ static void FillTempExtrema(DRIVE_INFO* p)
     }
 }
 
+static int EvidenceCount(const DRIVE_INFO* p, const SMART_ATTRIBUTE* a,
+                         int enc, int* count)
+{
+    unsigned __int64 v;
+    const BYTE* raw;
+    int n;
+    if (!p || !a || !count) return 0;
+    raw = a->bRawValue;
+    *count = 0;
+    if (enc == PROF_ENC_LO16) {
+        *count = (int)((unsigned)raw[0] | ((unsigned)raw[1] << 8));
+        return 1;
+    }
+    if (enc == PROF_ENC_REPORTED) {
+        n = DecodeReportedUncorrect(raw, p->eVendor);
+        if (n < 0) return 0;
+        *count = n;
+        return 1;
+    }
+    if (enc == PROF_ENC_REMAP) {
+        n = DecodeRemapEvents(p, raw);
+        if (n < 0) return 0;
+        *count = n;
+        return 1;
+    }
+    if (enc == PROF_ENC_COUNTER) {
+        v = GetRawValue48(raw);
+        *count = (v > (unsigned __int64)INT_MAX) ? INT_MAX : (int)v;
+        return 1;
+    }
+    if (ProfileDecodeRaw(enc, GetRawValue48(raw), &v) != 1) return 0;
+    *count = (v > (unsigned __int64)INT_MAX) ? INT_MAX : (int)v;
+    return 1;
+}
+
+static int* EvidenceSlot(DRIVE_INFO* p, int slot)
+{
+    switch (slot) {
+    case PROF_SLOT_REALLOC:  return &p->nReallocated;
+    case PROF_SLOT_PENDING:  return &p->nPendingSectors;
+    case PROF_SLOT_UNCORR:   return &p->nUncorrectable;
+    case PROF_SLOT_REMAP:    return &p->nRemapEvents;
+    case PROF_SLOT_CRC:      return &p->nCrcErrors;
+    case PROF_SLOT_REPORTED: return &p->nReportedUncorrect;
+    default:                 return NULL;
+    }
+}
+
+static void ApplyOneEvidence(DRIVE_INFO* p, const SMART_ATTRIBUTE* a,
+                             const PROF_HEALTH* h, int* crcSeen)
+{
+    int count = 0;
+    int rank;
+    int* dest;
+    if (!h || h->rule != PROF_RULE_WORSE) return;
+    if (h->sem != PROF_SEM_MEDIA && h->sem != PROF_SEM_INTERFACE) return;
+    if (h->scope == PROF_SCOPE_HDD && !DriveIsHdd(p)) return;
+    if (h->scope == PROF_SCOPE_SSD && DriveIsHdd(p)) return;
+    if (h->fallback && h->slot == PROF_SLOT_CRC && crcSeen && *crcSeen) return;
+    if (!EvidenceCount(p, a, h->enc, &count)) return;
+    if (h->slot == PROF_SLOT_CRC && crcSeen) *crcSeen = 1;
+    dest = EvidenceSlot(p, h->slot);
+    if (dest && *dest < 0) *dest = count;
+    rank = ProfileCountRank(count, h->observe, h->caution, h->bad,
+                            h->badHdd, DriveIsHdd(p) ? 1 : 0);
+    if (h->sem == PROF_SEM_MEDIA)
+        p->eMediaEvidence = WorstHealth(p->eMediaEvidence,
+                                        (DRIVE_HEALTH_STATUS)rank);
+    else
+        p->eInterfaceEvidence = WorstHealth(p->eInterfaceEvidence,
+                                            (DRIVE_HEALTH_STATUS)rank);
+}
+
+/* Walk every attribute once. The channel rank is the worst profile rule.
+ * A drivedb CRC name fills the CRC slot only when no earlier rule did. */
+static void CollectChannelEvidence(DRIVE_INFO* p)
+{
+    const SMART_ATTRIBUTE* laterA[30];
+    PROF_HEALTH laterH[30];
+    int nLater = 0;
+    int crcSeen = 0;
+    int i;
+    if (!p) return;
+    p->eMediaEvidence = HEALTH_STATUS_GOOD;
+    p->eInterfaceEvidence = HEALTH_STATUS_GOOD;
+    for (i = 0; i < 30; i++) {
+        const SMART_ATTRIBUTE* a = &p->attrData.stAttributes[i];
+        PROF_HEALTH h;
+        if (a->bAttrID == 0) continue;
+        if (!ProfileHealthRule(p, a->bAttrID, &h)) continue;
+        if (h.fallback) {
+            if (nLater < 30) {
+                laterA[nLater] = a;
+                laterH[nLater] = h;
+                nLater++;
+            }
+            continue;
+        }
+        ApplyOneEvidence(p, a, &h, &crcSeen);
+    }
+    for (i = 0; i < nLater; i++)
+        ApplyOneEvidence(p, laterA[i], &laterH[i], &crcSeen);
+}
+
 void AssessDriveHealth(DRIVE_INFO* pInfo)
 {
     BYTE cw;
@@ -1024,6 +1099,8 @@ void AssessDriveHealth(DRIVE_INFO* pInfo)
     pInfo->nEndurancePercent   = -1;
     pInfo->eReliability        = HEALTH_STATUS_UNKNOWN;
     pInfo->eInterface          = HEALTH_STATUS_UNKNOWN;
+    pInfo->eMediaEvidence      = HEALTH_STATUS_GOOD;
+    pInfo->eInterfaceEvidence  = HEALTH_STATUS_GOOD;
     pInfo->eMechanics          = HEALTH_STATUS_UNKNOWN;
     pInfo->eWear               = HEALTH_STATUS_UNKNOWN;
     pInfo->nGSenseEvents       = -1;
@@ -1044,6 +1121,7 @@ void AssessDriveHealth(DRIVE_INFO* pInfo)
     pInfo->nUncorrectable      = -1;
     pInfo->nRemapEvents        = -1;
     pInfo->nCrcErrors          = -1;
+    pInfo->nReportedUncorrect  = -1;
     pInfo->bThresholdViolation = FALSE;
     pInfo->bPrefailNow         = FALSE;
     pInfo->bPrefailPast        = FALSE;
@@ -1062,28 +1140,6 @@ void AssessDriveHealth(DRIVE_INFO* pInfo)
         return;
     }
 
-    pInfo->nReallocated    = AttrRawOrNeg1(pInfo, 0x05);
-    pInfo->nPendingSectors = AttrRawOrNeg1(pInfo, 0xC5);
-    pInfo->nUncorrectable  = AttrRawOrNeg1(pInfo, 0xC6);
-    pInfo->nRemapEvents    = AttrRawOrNeg1(pInfo, 0xC4);
-    pInfo->nCrcErrors      = AttrRawOrNeg1(pInfo, 0xC7);
-    /* Phison MKP-521 attribute 218 is FIS CRC when 199 is not in the table. */
-    if (pInfo->nCrcErrors < 0 && DriveDbAttrIsCrc(pInfo, 0xDA)) {
-        int n218 = AttrRawOrNeg1(pInfo, 0xDA);
-        if (n218 >= 0)
-            pInfo->nCrcErrors = n218;
-    }
-    if (pInfo->eType == DRIVE_TYPE_HDD && !pInfo->bIsNVMe) {
-        pInfo->nGSenseEvents = AttrRawOrNeg1(pInfo, 0xBF);
-        if (pInfo->nGSenseEvents < 0)
-            pInfo->nGSenseEvents = AttrRawOrNeg1(pInfo, 0x0E);
-        if (pInfo->nGSenseEvents < 0)
-            pInfo->nGSenseEvents = AttrRawOrNeg1(pInfo, 0xDD);
-        pInfo->nLoadUnload = AttrRawOrNeg1(pInfo, 0xC1);
-        if (pInfo->nLoadUnload < 0)
-            pInfo->nLoadUnload = AttrRawOrNeg1(pInfo, 0xE1);
-        pInfo->nEmergencyRetract = AttrRawOrNeg1(pInfo, 0xC0);
-    }
     pInfo->nWriteErrorValue = AttrValueOrNeg1(pInfo, 0xC8);
     pInfo->nWriteErrorWorst = AttrWorstOrNeg1(pInfo, 0xC8);
     pInfo->nWriteErrorRaw   = AttrRawOrNeg1(pInfo, 0xC8);
@@ -1139,6 +1195,19 @@ void AssessDriveHealth(DRIVE_INFO* pInfo)
         (pInfo->wRotationRate >= 0x0401 ||
          (HasSmartAttr(pInfo, 0xC1) && HasSmartAttr(pInfo, 0x07))))
         pInfo->eType = DRIVE_TYPE_HDD;
+
+    if (pInfo->eType == DRIVE_TYPE_HDD && !pInfo->bIsNVMe) {
+        pInfo->nGSenseEvents = AttrRawOrNeg1(pInfo, 0xBF);
+        if (pInfo->nGSenseEvents < 0)
+            pInfo->nGSenseEvents = AttrRawOrNeg1(pInfo, 0x0E);
+        if (pInfo->nGSenseEvents < 0)
+            pInfo->nGSenseEvents = AttrRawOrNeg1(pInfo, 0xDD);
+        pInfo->nLoadUnload = AttrRawOrNeg1(pInfo, 0xC1);
+        if (pInfo->nLoadUnload < 0)
+            pInfo->nLoadUnload = AttrRawOrNeg1(pInfo, 0xE1);
+        pInfo->nEmergencyRetract = AttrRawOrNeg1(pInfo, 0xC0);
+    }
+    CollectChannelEvidence(pInfo);
 
     if (pInfo->eType == DRIVE_TYPE_HDD && !pInfo->bIsNVMe) {
         AssessHddHealth(pInfo);
@@ -2844,6 +2913,31 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
     }
 }
 
+/* Host or NAND writes with a named unit. A wear percent stays out. */
+static int WriteVolumeGiB(const DRIVE_INFO* p, BYTE id,
+                          unsigned __int64 nRaw, unsigned __int64* nGiB)
+{
+    int sem = PROF_SEM_NONE, enc = PROF_ENC_NONE;
+    if (!nGiB) return 0;
+    *nGiB = 0;
+    if (!p || !ProfileLookup(p, id, &sem, &enc) || !ProfileWriteVolume(sem, enc))
+        return 0;
+    if (enc == PROF_ENC_BLOCK32)
+        *nGiB = Smi225xHostGiB(nRaw);
+    else if (enc == PROF_ENC_SCALE &&
+             (p->eType == DRIVE_TYPE_SSD_SATA || p->eType == DRIVE_TYPE_M2_SATA))
+        *nGiB = ScaleAtaHostGiB(p, nRaw, FALSE);
+    else if (enc == PROF_ENC_LBA) {
+        if (nRaw < 2048ULL) return 0;
+        *nGiB = nRaw / (1024ULL * 1024ULL * 2ULL);
+    } else if (enc == PROF_ENC_GIB) {
+        if (nRaw == 0 || nRaw > 4000000ULL) return 0;
+        *nGiB = nRaw;
+    } else
+        return 0;
+    return *nGiB > 0;
+}
+
 /* ============================================================
  * SSD-specific indicator extraction
  * Extracts vendor-specific SSD health info
@@ -2909,28 +3003,15 @@ void ExtractSSDIndicators(DRIVE_INFO* pInfo)
             }
             break;
 
-        /* Total writes / NAND writes */
+        /* Total writes. A wear percent (Intel 233) is not GiB. */
         case 0xE9:
         case 0xF9:
             if (pInfo->nSSDTotalWritesGB < 0) {
-                int sem = PROF_SEM_NONE, enc = PROF_ENC_NONE;
-                unsigned __int64 nRaw, nGiB;
-                if (!ProfileLookup(pInfo, pA->bAttrID, &sem, &enc))
+                unsigned __int64 nGiB = 0;
+                if (!WriteVolumeGiB(pInfo, pA->bAttrID,
+                                    GetRawValue48(pA->bRawValue), &nGiB))
                     break;
-                nRaw = GetRawValue48(pA->bRawValue);
-                nGiB = 0;
-                if (enc == PROF_ENC_BLOCK32)
-                    nGiB = Smi225xHostGiB(nRaw);
-                else if (enc == PROF_ENC_SCALE &&
-                         (pInfo->eType == DRIVE_TYPE_SSD_SATA ||
-                          pInfo->eType == DRIVE_TYPE_M2_SATA))
-                    nGiB = ScaleAtaHostGiB(pInfo, nRaw, FALSE);
-                else if (enc == PROF_ENC_LBA) {
-                    if (nRaw < 2048ULL) break;
-                    nGiB = nRaw / (1024ULL * 1024ULL * 2ULL);
-                } else
-                    nGiB = nRaw;
-                if (nGiB == 0 || nGiB > 4000000ULL) break;
+                if (nGiB > 4000000ULL) break;
                 pInfo->nSSDTotalWritesGB = (int)nGiB;
             }
             break;
@@ -2939,29 +3020,11 @@ void ExtractSSDIndicators(DRIVE_INFO* pInfo)
          * Other SATA SSDs store LBAs; a sub-GiB count is not a GB total. */
         case 0xF1:
         case 0xF3: {
-            unsigned __int64 nRaw, nGiB = 0;
+            unsigned __int64 nGiB = 0;
             if (pInfo->nSSDTotalWritesGB >= 0) break;
-            nRaw = GetRawValue48(pA->bRawValue);
-            {
-                int sem = PROF_SEM_NONE, enc = PROF_ENC_NONE;
-                if (!ProfileLookup(pInfo, pA->bAttrID, &sem, &enc))
-                    break;
-                if (enc == PROF_ENC_SCALE &&
-                    (pInfo->eType == DRIVE_TYPE_SSD_SATA ||
-                     pInfo->eType == DRIVE_TYPE_M2_SATA))
-                    nGiB = ScaleAtaHostGiB(pInfo, nRaw, FALSE);
-                else if (enc == PROF_ENC_BLOCK32)
-                    nGiB = Smi225xHostGiB(nRaw);
-                else if (enc == PROF_ENC_LBA) {
-                    if (nRaw < 2048ULL) break;
-                    nGiB = nRaw / (1024ULL * 1024ULL * 2ULL);
-                } else if (enc == PROF_ENC_GIB) {
-                    if (nRaw == 0 || nRaw > 4000000ULL) break;
-                    nGiB = nRaw;
-                } else
-                    break;
-            }
-            if (nGiB == 0) break;
+            if (!WriteVolumeGiB(pInfo, pA->bAttrID,
+                                GetRawValue48(pA->bRawValue), &nGiB))
+                break;
             if (nGiB > 4000000ULL) nGiB = 4000000ULL;
             pInfo->nSSDTotalWritesGB = (int)nGiB;
             break;
@@ -3010,10 +3073,26 @@ void ExtractSSDIndicators(DRIVE_INFO* pInfo)
             }
             break;
         }
-        case 0xEA:
-            if (pInfo->nSSDAvgEraseCount < 0)
-                pInfo->nSSDAvgEraseCount = (int)GetRawValue(pA->bRawValue);
+        case 0xEA: {
+            int semEa = PROF_SEM_NONE, encEa = PROF_ENC_NONE;
+            unsigned rawEa;
+            if (pInfo->nSSDAvgEraseCount >= 0) break;
+            if (!ProfileLookup(pInfo, 0xEA, &semEa, &encEa) ||
+                !ProfileEraseCount(semEa, encEa))
+                break;
+            rawEa = GetRawValue(pA->bRawValue);
+            if (encEa == PROF_ENC_MAXAVG) {
+                unsigned avg, mx;
+                PhisonMaxAvgHalves(rawEa, &mx, &avg);
+                if (avg < 100000u)
+                    pInfo->nSSDAvgEraseCount = (int)avg;
+                if (pInfo->nSSDMaxEraseCount < 0 && mx > 0 && mx < 100000u)
+                    pInfo->nSSDMaxEraseCount = (int)mx;
+            } else if (rawEa <= 0x7FFFFFFFu) {
+                pInfo->nSSDAvgEraseCount = (int)rawEa;
+            }
             break;
+        }
 
         /* Max erase count */
         case 0xA5:

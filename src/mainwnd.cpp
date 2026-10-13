@@ -57,7 +57,7 @@ static void FormatNvmeHostBytes(unsigned __int64 units, char* szBuf, int nBufLen
 /* USB enclosure/chip name from SCSI INQUIRY; type name / VID:PID fallback.
  * Names come from DetectUsbBridgeType comments — no extra VID table. */
 
-/* ATA SSD: nSSDTotalWritesGB is vendor RAW, typically GiB (attr E9/F9). */
+/* ATA SSD: nSSDTotalWritesGB is a profile host/NAND volume, or -1. */
 static void FormatAtaWrites(int nGiB, char* szBuf, int nBufLen)
 {
     if (nGiB < 0) { szBuf[0] = '\0'; return; }
@@ -2994,28 +2994,23 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
     }
 
     case 0xF9:
-    {
-        unsigned __int64 nGiB = qw48;
-        if (nGiB > 0 && nGiB < 1000000ULL)
-            safe_snprintf(szMain, "%llu ГиБ записано", (unsigned long long)nGiB);
-        else
-            safe_snprintf(szMain, "%llu", (unsigned long long)nGiB);
-        break;
-    }
-
     case 0xE9:
     {
-        int semE9 = PROF_SEM_NONE, encE9 = PROF_ENC_NONE;
-        if (AttrEncOf(pDrv, bID, &semE9, &encE9) &&
-            encE9 == PROF_ENC_PERCENT && bVal <= 100) {
+        int semW = PROF_SEM_NONE, encW = PROF_ENC_NONE;
+        BOOL known = AttrEncOf(pDrv, bID, &semW, &encW);
+        if (known && encW == PROF_ENC_PERCENT && bVal <= 100) {
             safe_snprintf(szMain, "%u%%  индикатор износа", (unsigned)bVal);
             break;
         }
-        unsigned __int64 nGiB = qw48;
-        if (nGiB > 0 && nGiB < 1000000ULL)
-            safe_snprintf(szMain, "%llu ГиБ записано", (unsigned long long)nGiB);
+        if (known && ProfileWriteVolume(semW, encW) &&
+            encW == PROF_ENC_GIB && qw48 > 0 && qw48 <= 4000000ULL) {
+            safe_snprintf(szMain, "%llu ГиБ записано", (unsigned long long)qw48);
+            break;
+        }
+        if (qw48 > 0xFFFFFFFFULL)
+            safe_snprintf(szMain, "%llu", (unsigned long long)qw48);
         else
-            safe_snprintf(szMain, "%llu", (unsigned long long)nGiB);
+            safe_snprintf(szMain, "%lu", (unsigned long)dw32);
         break;
     }
 

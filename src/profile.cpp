@@ -1,14 +1,19 @@
 /* DriveMonitor - profile resolver. GPL-2.0-or-later. See LICENSE.
- * Picks one profile for a drive. Does not assign a health score.
+ * Picks one profile for a drive. A row may carry a channel rule.
+ * The finished grade is still computed by the health engine.
  *
  * Priority, highest first: model+firmware 100, exact model 98, family 90,
- * controller 80, vendor 70, generic ATA/NVMe 50. A longer model or firmware
- * key wins a tie on the score. If the score and the specificity are both
- * equal, the match is ambiguous: the lexically first id is recorded, the
- * other id is the conflict, and an attribute is used only when every tied
- * profile states the same semantic and encoding. Registration order is not
- * a tie-break. A firmware shape alone does not select a controller.
- * Brand alone is not a controller.
+ * controller 80, vendor 70, generic ATA/NVMe 50. The comparator is the
+ * score, then the specificity of the model and firmware key. The same
+ * comparator selects the attribute tier. If the score and the specificity
+ * are both equal, the identity match is ambiguous: the lexically first id
+ * is recorded and the other id is the conflict. An attribute on a tier is
+ * used only when every profile on that tier states the same semantic,
+ * encoding, and health-rule fields. If they disagree, or the attribute is
+ * missing from some of them, lookup refuses. If none of them name it, the
+ * next worse tier is tried. A lower-tier conflict does not mark the
+ * identity ambiguous. Registration order is not a tie-break. A firmware
+ * shape alone does not select a controller. Brand alone is not a controller.
  *
  * Builtin rows are this file. ProfileRegister adds a row without changing
  * the interpreter. drivedb.h is a separate matcher (DriveDbApply) and is
@@ -17,13 +22,28 @@
 
 #define PA(id, sem, enc) \
     { (unsigned char)(id), (unsigned char)(sem), (unsigned char)(enc), \
-      0, NULL, NULL, NULL, NULL }
+      0, NULL, NULL, NULL, NULL, \
+      0, 0, 0, 0, 0, 0, 0 }
 #define PN(id, sem, enc, ru, en) \
     { (unsigned char)(id), (unsigned char)(sem), (unsigned char)(enc), \
-      0, ru, en, NULL, NULL }
+      0, ru, en, NULL, NULL, \
+      0, 0, 0, 0, 0, 0, 0 }
 #define PNA(id, sem, enc, ru, en, unless, aru, aen) \
     { (unsigned char)(id), (unsigned char)(sem), (unsigned char)(enc), \
-      (unsigned char)(unless), ru, en, aru, aen }
+      (unsigned char)(unless), ru, en, aru, aen, \
+      0, 0, 0, 0, 0, 0, 0 }
+#define PH(id, sem, enc, rule, slot, scope, obs, cau, bad, badHdd) \
+    { (unsigned char)(id), (unsigned char)(sem), (unsigned char)(enc), \
+      0, NULL, NULL, NULL, NULL, \
+      (unsigned char)(rule), (unsigned char)(slot), (unsigned char)(scope), \
+      (unsigned short)(obs), (unsigned short)(cau), \
+      (unsigned short)(bad), (unsigned short)(badHdd) }
+#define PHN(id, sem, enc, ru, en, rule, slot, scope, obs, cau, bad, badHdd) \
+    { (unsigned char)(id), (unsigned char)(sem), (unsigned char)(enc), \
+      0, ru, en, NULL, NULL, \
+      (unsigned char)(rule), (unsigned char)(slot), (unsigned char)(scope), \
+      (unsigned short)(obs), (unsigned short)(cau), \
+      (unsigned short)(bad), (unsigned short)(badHdd) }
 
 typedef struct _DRIVE_PROFILE {
     const char* id;
@@ -43,20 +63,41 @@ typedef struct _DRIVE_PROFILE {
     const char* origin;
 } DRIVE_PROFILE;
 
+/* Threshold 0 is off. badHdd applies only on an HDD.
+ * Pending 4 and realloc 10 are BAD on HDD and stay CAUTION on SSD.
+ * 184 is observe from 1 and caution from 5, HDD only.
+ * 187 is BAD from 1 on HDD. 188 and CRC share the interface steps. */
 static const PROF_ATTR kAtaGeneric[] = {
-    PA(0x05, PROF_SEM_MEDIA,     PROF_ENC_COUNTER),
+    PH(0x05, PROF_SEM_MEDIA, PROF_ENC_LO16, PROF_RULE_WORSE,
+       PROF_SLOT_REALLOC, PROF_SCOPE_ANY, 0, 1, 0, 10),
     PA(0x09, PROF_SEM_NONE,      PROF_ENC_COUNTER),
+    PH(0x0A, PROF_SEM_INTERFACE, PROF_ENC_COUNTER, PROF_RULE_WORSE,
+       PROF_SLOT_NONE, PROF_SCOPE_HDD, 0, 3, 0, 0),
     PA(0x0C, PROF_SEM_NONE,      PROF_ENC_COUNTER),
+    PH(0xB8, PROF_SEM_MEDIA, PROF_ENC_COUNTER, PROF_RULE_WORSE,
+       PROF_SLOT_NONE, PROF_SCOPE_HDD, 1, 5, 0, 0),
+    PH(0xBB, PROF_SEM_MEDIA, PROF_ENC_REPORTED, PROF_RULE_WORSE,
+       PROF_SLOT_REPORTED, PROF_SCOPE_HDD, 0, 0, 1, 0),
+    PH(0xBC, PROF_SEM_INTERFACE, PROF_ENC_LO16, PROF_RULE_WORSE,
+       PROF_SLOT_NONE, PROF_SCOPE_ANY, 0, 10, 100, 0),
     PA(0xC2, PROF_SEM_THERMAL,   PROF_ENC_COUNTER),
-    PA(0xC5, PROF_SEM_MEDIA,     PROF_ENC_COUNTER),
-    PA(0xC6, PROF_SEM_MEDIA,     PROF_ENC_COUNTER),
-    PA(0xC7, PROF_SEM_INTERFACE, PROF_ENC_COUNTER),
+    PH(0xC4, PROF_SEM_MEDIA, PROF_ENC_REMAP, PROF_RULE_WORSE,
+       PROF_SLOT_REMAP, PROF_SCOPE_ANY, 0, 1, 0, 0),
+    PH(0xC5, PROF_SEM_MEDIA, PROF_ENC_COUNTER, PROF_RULE_WORSE,
+       PROF_SLOT_PENDING, PROF_SCOPE_ANY, 0, 1, 0, 4),
+    PH(0xC6, PROF_SEM_MEDIA, PROF_ENC_COUNTER, PROF_RULE_WORSE,
+       PROF_SLOT_UNCORR, PROF_SCOPE_ANY, 0, 0, 1, 0),
+    PH(0xC7, PROF_SEM_INTERFACE, PROF_ENC_COUNTER, PROF_RULE_WORSE,
+       PROF_SLOT_CRC, PROF_SCOPE_ANY, 0, 1, 100, 0),
     PA(0, 0, 0)
 };
 
 static const PROF_ATTR kPhison[] = {
     PN(0xA0, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Внезапные выключения", "Unsafe shutdowns"),
-    PN(0xA1, PROF_SEM_MEDIA,      PROF_ENC_COUNTER, "Резервные блоки (осталось)", "Spare blocks remaining"),
+    /* Remaining spare is not a defect count. */
+    PHN(0xA1, PROF_SEM_MEDIA, PROF_ENC_COUNTER,
+        "Резервные блоки (осталось)", "Spare blocks remaining",
+        PROF_RULE_OFF, PROF_SLOT_NONE, PROF_SCOPE_ANY, 0, 0, 0, 0),
     PN(0xA3, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Начальные плохие блоки", "Initial bad blocks"),
     PN(0xA4, PROF_SEM_ERASE,      PROF_ENC_COUNTER, "Всего стираний", "Total erase count"),
     PN(0xA5, PROF_SEM_ERASE,      PROF_ENC_COUNTER, "Макс. стираний", "Max erase count"),
@@ -77,7 +118,7 @@ static const PROF_ATTR kPhison[] = {
         "Счётчик NAND", "NAND counter", 0xA5, "Макс. стираний", "Max erase count"),
     PN(0xE7, PROF_SEM_ENDURANCE,  PROF_ENC_PERCENT, "Остаток ресурса SSD", "SSD life remaining"),
     PN(0xE8, PROF_SEM_WEAR,       PROF_ENC_PERCENT, "Резервное пространство", "Available reserved space"),
-    PN(0xE9, PROF_SEM_NAND_WRITE, PROF_ENC_COUNTER, "Записи NAND (ГиБ)", "NAND writes (GiB)"),
+    PN(0xE9, PROF_SEM_NAND_WRITE, PROF_ENC_GIB,     "Записи NAND (ГиБ)", "NAND writes (GiB)"),
     PN(0xF1, PROF_SEM_HOST_WRITE, PROF_ENC_SCALE,   "Записано хостом (ГБ)", "Host written (GB)"),
     PN(0xF2, PROF_SEM_HOST_READ,  PROF_ENC_SCALE,   "Прочитано хостом (ГБ)", "Host read (GB)"),
     PN(0xF3, PROF_SEM_HOST_WRITE, PROF_ENC_SCALE,   "Записано хостом (ГБ)", "Host written (GB)"),
@@ -89,8 +130,12 @@ static const PROF_ATTR kSamsungSsd[] = {
     PN(0xB3, PROF_SEM_MEDIA,      PROF_ENC_COUNTER, "Использовано резервных блоков", "Used reserved blocks"),
     PA(0xB5, PROF_SEM_NONE,       PROF_ENC_COUNTER),
     PN(0xB6, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Ошибки стирания", "Erase fail count"),
-    PA(0xB7, PROF_SEM_MEDIA,      PROF_ENC_COUNTER),
-    PN(0xBB, PROF_SEM_MEDIA,      PROF_ENC_COUNTER, "Неисправимые ошибки", "Uncorrectable errors"),
+    /* 183 is not a confirmed defect count on Samsung SSD. */
+    PH(0xB7, PROF_SEM_MEDIA, PROF_ENC_COUNTER, PROF_RULE_OFF,
+       PROF_SLOT_NONE, PROF_SCOPE_ANY, 0, 0, 0, 0),
+    PHN(0xBB, PROF_SEM_MEDIA, PROF_ENC_COUNTER,
+        "Неисправимые ошибки", "Uncorrectable errors",
+        PROF_RULE_WORSE, PROF_SLOT_NONE, PROF_SCOPE_ANY, 0, 0, 1, 0),
     PN(0xE7, PROF_SEM_ENDURANCE,  PROF_ENC_PERCENT, "Остаток ресурса SSD", "SSD life remaining"),
     PN(0xEB, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Защита от потери питания", "Power-loss protection"),
     PN(0xF1, PROF_SEM_HOST_WRITE, PROF_ENC_LBA,     "Записано хостом (ГБ)", "Host written (GB)"),
@@ -161,14 +206,18 @@ static const PROF_ATTR kMicron[] = {
 
 static const PROF_ATTR kSeagateHdd[] = {
     PN(0x01, PROF_SEM_NONE,      PROF_ENC_COUNTER, "Частота ошибок чтения (RAW вендора)", "Read Error Rate (vendor RAW)"),
-    PN(0xBB, PROF_SEM_MEDIA,     PROF_ENC_COUNTER, "Неисправимые ошибки", "Uncorrectable errors"),
+    PHN(0xBB, PROF_SEM_MEDIA, PROF_ENC_REPORTED,
+        "Неисправимые ошибки", "Uncorrectable errors",
+        PROF_RULE_WORSE, PROF_SLOT_REPORTED, PROF_SCOPE_ANY, 0, 0, 1, 0),
     PN(0xC3, PROF_SEM_NONE,      PROF_ENC_COUNTER, "Восстановлено ECC (чтение)", "Hardware ECC recovered"),
     PN(0xF0, PROF_SEM_NONE,      PROF_ENC_COUNTER, "Часы полёта головок", "Head flying hours"),
     PA(0, 0, 0)
 };
 
 static const PROF_ATTR kToshibaHdd[] = {
-    PN(0xC7, PROF_SEM_INTERFACE, PROF_ENC_COUNTER, "Ошибки CRC", "CRC errors"),
+    PHN(0xC7, PROF_SEM_INTERFACE, PROF_ENC_COUNTER,
+        "Ошибки CRC", "CRC errors",
+        PROF_RULE_WORSE, PROF_SLOT_CRC, PROF_SCOPE_ANY, 0, 1, 100, 0),
     PA(0, 0, 0)
 };
 
@@ -379,6 +428,16 @@ static int Specificity(const DRIVE_PROFILE* pr)
     return n;
 }
 
+/* Positive when A beats B. Zero when the score and the specificity match. */
+static int MatchCmp(int scoreA, int specA, int scoreB, int specB)
+{
+    if (scoreA != scoreB)
+        return (scoreA > scoreB) ? 1 : -1;
+    if (specA != specB)
+        return (specA > specB) ? 1 : -1;
+    return 0;
+}
+
 static const DRIVE_PROFILE* ProfileById(const char* id)
 {
     int i;
@@ -427,21 +486,25 @@ static int FlagsOf(const DRIVE_PROFILE* pr)
     return f;
 }
 
-/* Top non-generic matches. *nTies is the full count. The array holds
- * at most maxTop of them. *first is the lexically smallest id. */
-static void FillTop(const DRIVE_INFO* p, const DRIVE_PROFILE** top, int maxTop,
-                    int* nTies, int* nStored, const DRIVE_PROFILE** first,
-                    const DRIVE_PROFILE** second, int* scoreOut)
+/* Best non-generic tier strictly below (ceilScore, ceilSpec).
+ * *nTies is the full count. The array holds at most maxTop of them.
+ * *first is the lexically smallest id. */
+static void FillTier(const DRIVE_INFO* p, const DRIVE_PROFILE** top, int maxTop,
+                     int ceilScore, int ceilSpec,
+                     int* nTies, int* nStored, const DRIVE_PROFILE** first,
+                     const DRIVE_PROFILE** second, int* scoreOut, int* specOut)
 {
     char modelU[48], fwU[16];
     int bestScore = 0, bestSpec = -1;
+    int found = 0;
     int i, pass;
 
     *nTies = 0;
     *nStored = 0;
-    *first = NULL;
-    *second = NULL;
+    if (first) *first = NULL;
+    if (second) *second = NULL;
     *scoreOut = 0;
+    *specOut = 0;
     if (!p) return;
     ToUpperCopy(modelU, sizeof(modelU), p->szModel);
     ToUpperCopy(fwU, sizeof(fwU), p->szFirmware);
@@ -454,26 +517,43 @@ static void FillTop(const DRIVE_INFO* p, const DRIVE_PROFILE** top, int maxTop,
             score = ScoreProfile(pr, p, modelU, fwU);
             if (score <= 0) continue;
             spec = Specificity(pr);
+            if (MatchCmp(score, spec, ceilScore, ceilSpec) >= 0) continue;
             if (pass == 0) {
-                if (score > bestScore || (score == bestScore && spec > bestSpec)) {
+                if (!found || MatchCmp(score, spec, bestScore, bestSpec) > 0) {
                     bestScore = score;
                     bestSpec = spec;
+                    found = 1;
                 }
                 continue;
             }
-            if (score != bestScore || spec != bestSpec) continue;
+            if (!found || MatchCmp(score, spec, bestScore, bestSpec) != 0)
+                continue;
             (*nTies)++;
             if (*nStored < maxTop)
                 top[(*nStored)++] = pr;
+            if (!first) continue;
             if (!*first || strcmp(pr->id, (*first)->id) < 0) {
-                *second = *first;
+                if (second) *second = *first;
                 *first = pr;
-            } else if (!*second || strcmp(pr->id, (*second)->id) < 0) {
+            } else if (second && (!*second || strcmp(pr->id, (*second)->id) < 0)) {
                 *second = pr;
             }
         }
     }
+    if (!found) return;
     *scoreOut = bestScore;
+    *specOut = bestSpec;
+}
+
+/* Identity tier. 101 sits above PROF_SCORE_EXACT_FW. */
+static void FillTop(const DRIVE_INFO* p, const DRIVE_PROFILE** top, int maxTop,
+                    int* nTies, int* nStored, const DRIVE_PROFILE** first,
+                    const DRIVE_PROFILE** second, int* scoreOut)
+{
+    int spec = 0;
+    FillTier(p, top, maxTop, 101, 0, nTies, nStored, first, second,
+             scoreOut, &spec);
+    (void)spec;
 }
 
 static int TieLists(const DRIVE_PROFILE** top, int nStored, BYTE id)
@@ -495,65 +575,49 @@ static const PROF_ATTR* AgreedAttr(const DRIVE_PROFILE** top, int nStored,
         const PROF_ATTR* a = AttrOn(top[i], id);
         if (!a) return NULL;
         if (!first) first = a;
-        else if (a->sem != first->sem || a->enc != first->enc)
+        else if (a->sem != first->sem || a->enc != first->enc ||
+                 a->rule != first->rule || a->slot != first->slot ||
+                 a->scope != first->scope || a->observe != first->observe ||
+                 a->caution != first->caution || a->bad != first->bad ||
+                 a->badHdd != first->badHdd)
             return NULL;
     }
     return first;
 }
 
-/* Highest-scoring non-generic row that lists id. The identity winner can
- * be a model row that only names the chip; a lower row still supplies
- * the encoding when it does not contest the winner. */
-static const PROF_ATTR* LocalSpecificAttr(const DRIVE_INFO* p, BYTE id)
-{
-    char modelU[48], fwU[16];
-    const PROF_ATTR* bestA = NULL;
-    int bestScore = 0;
-    int i;
-    if (!p || id == 0) return NULL;
-    ToUpperCopy(modelU, sizeof(modelU), p->szModel);
-    ToUpperCopy(fwU, sizeof(fwU), p->szFirmware);
-    for (i = 0; i < ProfileCount(); i++) {
-        const DRIVE_PROFILE* pr = ProfileAt(i);
-        int score = ScoreProfile(pr, p, modelU, fwU);
-        const PROF_ATTR* a;
-        if (score <= 0 || pr->kind == PROF_KIND_GENERIC) continue;
-        a = AttrOn(pr, id);
-        if (a && score >= bestScore) {
-            bestA = a;
-            bestScore = score;
-        }
-    }
-    return bestA;
-}
-
 enum { CONF_NONE = 0, CONF_FOUND = 1, CONF_REFUSE = 2 };
 
+/* Walk tiers from the best match downward. Each tier uses MatchCmp, the
+ * same comparator as FillTop. Equal score and equal specificity use the
+ * conflict policy: every profile must agree, or the attribute is refused
+ * when any of them lists it. A tier that names nobody yields to the next
+ * worse tier. The walk does not change the identity winner. */
 static int ConfirmLocal(const DRIVE_INFO* p, BYTE id, const PROF_ATTR** out)
 {
     const DRIVE_PROFILE* top[PROF_TOP_MAX];
-    const DRIVE_PROFILE* first = NULL;
-    const DRIVE_PROFILE* second = NULL;
-    int nTies = 0, nStored = 0, score = 0;
-    const PROF_ATTR* a;
+    int ceilScore = 101;
+    int ceilSpec = 0;
+    int guard;
     if (out) *out = NULL;
     if (!p || id == 0) return CONF_NONE;
-    FillTop(p, top, PROF_TOP_MAX, &nTies, &nStored, &first, &second, &score);
-    if (nTies > 1) {
+    for (guard = 0; guard < PROF_TOP_MAX; guard++) {
+        int nTies = 0, nStored = 0, score = 0, spec = 0;
+        const PROF_ATTR* a;
+        FillTier(p, top, PROF_TOP_MAX, ceilScore, ceilSpec,
+                 &nTies, &nStored, NULL, NULL, &score, &spec);
+        if (nTies <= 0) return CONF_NONE;
+        if (nStored != nTies) return CONF_REFUSE;
         a = AgreedAttr(top, nStored, nTies, id);
         if (a) {
             if (out) *out = a;
             return CONF_FOUND;
         }
-        if (nStored == nTies && TieLists(top, nStored, id))
+        if (TieLists(top, nStored, id))
             return CONF_REFUSE;
-        if (nStored != nTies)
-            return CONF_REFUSE;
+        ceilScore = score;
+        ceilSpec = spec;
     }
-    a = LocalSpecificAttr(p, id);
-    if (!a) return CONF_NONE;
-    if (out) *out = a;
-    return CONF_FOUND;
+    return CONF_NONE;
 }
 
 static void ApplyIdentity(DRIVE_INFO* p, const DRIVE_PROFILE* winner, int score,
@@ -750,6 +814,118 @@ BOOL ProfileAttrLabel(const DRIVE_INFO* p, BYTE id,
     return TRUE;
 }
 
+int ProfileWriteVolume(int sem, int enc)
+{
+    if (sem != PROF_SEM_HOST_WRITE && sem != PROF_SEM_NAND_WRITE)
+        return 0;
+    return enc == PROF_ENC_GIB || enc == PROF_ENC_BLOCK32 ||
+           enc == PROF_ENC_SCALE || enc == PROF_ENC_LBA;
+}
+
+int ProfileEraseCount(int sem, int enc)
+{
+    if (sem != PROF_SEM_ERASE) return 0;
+    return enc == PROF_ENC_COUNTER || enc == PROF_ENC_MAXAVG;
+}
+
+static int StatusRank(int e)
+{
+    switch (e) {
+    case HEALTH_STATUS_GOOD:     return 1;
+    case HEALTH_STATUS_OBSERVE:  return 2;
+    case HEALTH_STATUS_CAUTION:  return 3;
+    case HEALTH_STATUS_BAD:      return 4;
+    case HEALTH_STATUS_WARNING:  return 4;
+    case HEALTH_STATUS_CRITICAL: return 5;
+    default:                     return 0;
+    }
+}
+
+static void NormalizeHealth(PROF_HEALTH* h)
+{
+    if (!h || h->rule == PROF_RULE_OFF) return;
+    if (h->sem != PROF_SEM_MEDIA && h->sem != PROF_SEM_INTERFACE) {
+        h->rule = PROF_RULE_OFF;
+        return;
+    }
+    if (h->rule == PROF_RULE_DEFAULT) {
+        h->rule = PROF_RULE_WORSE;
+        if (h->observe == 0 && h->caution == 0 && h->bad == 0 && h->badHdd == 0)
+            h->caution = 1;
+    }
+}
+
+static void FillHealth(PROF_HEALTH* o, const PROF_ATTR* a, int fallback)
+{
+    memset(o, 0, sizeof(*o));
+    o->sem = (int)a->sem;
+    o->enc = (int)a->enc;
+    o->rule = (int)a->rule;
+    o->slot = (int)a->slot;
+    o->scope = (int)a->scope;
+    o->observe = (int)a->observe;
+    o->caution = (int)a->caution;
+    o->bad = (int)a->bad;
+    o->badHdd = (int)a->badHdd;
+    o->fallback = fallback;
+    NormalizeHealth(o);
+}
+
+BOOL ProfileHealthRule(const DRIVE_INFO* p, BYTE id, PROF_HEALTH* out)
+{
+    const PROF_ATTR* a = NULL;
+    int c, sem = PROF_SEM_NONE, enc = PROF_ENC_NONE;
+    if (out) memset(out, 0, sizeof(*out));
+    if (!p || !out || id == 0) return FALSE;
+    c = ConfirmLocal(p, id, &a);
+    if (c == CONF_REFUSE) return FALSE;
+    if (c == CONF_FOUND && a) {
+        FillHealth(out, a, 0);
+        return TRUE;
+    }
+    {
+        const DRIVE_PROFILE* g = GenericFor(p);
+        a = g ? FindProfAttr(g->attrs, id) : NULL;
+    }
+    if (a) {
+        FillHealth(out, a, 0);
+        return TRUE;
+    }
+    if (!DriveDbLookup(p, id, &sem, &enc)) return FALSE;
+    out->sem = sem;
+    out->enc = enc;
+    out->rule = PROF_RULE_DEFAULT;
+    if (DriveDbAttrIsCrc(p, id)) {
+        out->sem = PROF_SEM_INTERFACE;
+        out->enc = PROF_ENC_COUNTER;
+        out->rule = PROF_RULE_WORSE;
+        out->slot = PROF_SLOT_CRC;
+        out->caution = 1;
+        out->bad = 100;
+        out->fallback = 1;
+    }
+    NormalizeHealth(out);
+    return TRUE;
+}
+
+int ProfileCountRank(int count, int observe, int caution, int bad,
+                     int badHdd, int isHdd)
+{
+    int r = HEALTH_STATUS_GOOD;
+    int b = bad;
+    if (count < 0) return HEALTH_STATUS_UNKNOWN;
+    if (isHdd && badHdd > 0 && (b == 0 || badHdd < b))
+        b = badHdd;
+    if (observe > 0 && count >= observe)
+        r = HEALTH_STATUS_OBSERVE;
+    if (caution > 0 && count >= caution &&
+        StatusRank(HEALTH_STATUS_CAUTION) > StatusRank(r))
+        r = HEALTH_STATUS_CAUTION;
+    if (b > 0 && count >= b && StatusRank(HEALTH_STATUS_BAD) > StatusRank(r))
+        r = HEALTH_STATUS_BAD;
+    return r;
+}
+
 int ProfileDecodeRaw(int enc, unsigned __int64 raw, unsigned __int64* out)
 {
     if (!out) return 0;
@@ -761,6 +937,9 @@ int ProfileDecodeRaw(int enc, unsigned __int64 raw, unsigned __int64* out)
         return 1;
     case PROF_ENC_COUNTER:
         *out = raw;
+        return 1;
+    case PROF_ENC_LO16:
+        *out = raw & 0xFFFFULL;
         return 1;
     case PROF_ENC_GIB:
         if (raw == 0 || raw > 4000000ULL) return 0;

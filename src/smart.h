@@ -455,8 +455,10 @@ typedef struct _DRIVE_INFO {
     int         nConfVendorDecoder;   /* 100 if 0 unknown attrs; else max(40, 100-10*nUnknown) */
     int         nConfHealthAssess;    /* how well we can defend GOOD/CAUTION/BAD */
     int         nEndurancePercent;    /* remaining life 0-100, -1 if N/A */
-    DRIVE_HEALTH_STATUS eReliability; /* media: realloc/pending/uncorrectable/NVMe media */
-    DRIVE_HEALTH_STATUS eInterface;   /* CRC / UDMA / link */
+    DRIVE_HEALTH_STATUS eReliability; /* media channel after profile rules and prefail */
+    DRIVE_HEALTH_STATUS eInterface;   /* CRC / timeouts / spin retry */
+    DRIVE_HEALTH_STATUS eMediaEvidence;     /* worst MEDIA rule, before prefail */
+    DRIVE_HEALTH_STATUS eInterfaceEvidence; /* worst INTERFACE rule */
     DRIVE_HEALTH_STATUS eMechanics;   /* HDD G-Sense / park; not a health percent */
     DRIVE_HEALTH_STATUS eWear;        /* SSD endurance remaining; not a Health% */
     int         nGSenseEvents;        /* attr BF/0E/DD RAW, -1 if absent */
@@ -472,11 +474,12 @@ typedef struct _DRIVE_INFO {
     TEMP_BAND   eTempBand;            /* SSD-focused temperature band */
     NORM_QUALITY eNormQuality;        /* usefulness of Value/Worst/Threshold */
     NORM_QUALITY eRawQuality;         /* usefulness of known media RAW counters */
-    int         nReallocated;         /* attr 05 RAW, -1 if attribute absent */
-    int         nPendingSectors;      /* attr C5 RAW, -1 if absent */
-    int         nUncorrectable;       /* attr C6 RAW, -1 if absent */
-    int         nRemapEvents;         /* attr C4 RAW, -1 if absent */
-    int         nCrcErrors;           /* attr C7 RAW, -1 if absent */
+    int         nReallocated;         /* REALLOC slot, -1 if absent */
+    int         nPendingSectors;      /* PENDING slot, -1 if absent */
+    int         nUncorrectable;       /* UNCORR slot, -1 if absent */
+    int         nRemapEvents;         /* REMAP slot, -1 if absent */
+    int         nCrcErrors;           /* CRC slot, -1 if absent */
+    int         nReportedUncorrect;   /* REPORTED slot, -1 if absent */
     BOOL        bThresholdViolation;  /* prefail Value<=thresh now (ATA-3); same as bPrefailNow */
     BOOL        bPrefailNow;          /* prefail current <= thresh, thresh != 0 */
     BOOL        bPrefailPast;         /* prefail worst <= thresh, current still above */
@@ -751,7 +754,8 @@ BOOL IsSmi225xFamily(const DRIVE_INFO* p);
 /* Profile resolver. Best candidate wins. Scores:
  * 100 model+firmware, 98 exact model, 90 family, 80 controller,
  * 70 vendor, 50 generic ATA/NVMe, 0 none.
- * A profile describes attribute semantics. It does not store a health score. */
+ * A profile describes attribute semantics and the channel rule.
+ * It does not store a finished health grade. */
 #define PROF_SCORE_EXACT_FW    100
 #define PROF_SCORE_EXACT_MODEL  98
 #define PROF_SCORE_FAMILY       90
@@ -780,6 +784,27 @@ BOOL IsSmi225xFamily(const DRIVE_INFO* p);
 #define PROF_ENC_GIB     6   /* raw value is already GiB */
 #define PROF_ENC_MAXAVG  7   /* raw16(avg16): max in the low half, average in the next */
 #define PROF_ENC_PAIR    8   /* two raw halves: later/early, or a raw16(raw16) pair */
+#define PROF_ENC_LO16    9   /* low 16 bits of RAW */
+#define PROF_ENC_REPORTED 10 /* reported-uncorrectable packing */
+#define PROF_ENC_REMAP   11  /* remap count; flying-hours copy is not a count */
+
+/* How a decoded count moves a channel. The profile stores the rule.
+ * The health engine does not keep a private threshold for an attribute id. */
+#define PROF_RULE_DEFAULT 0  /* MEDIA/INTERFACE: a positive count is CAUTION */
+#define PROF_RULE_WORSE   1  /* observe / caution / bad / badHdd as written */
+#define PROF_RULE_OFF     2  /* known semantic, does not move the rank */
+
+#define PROF_SLOT_NONE     0
+#define PROF_SLOT_REALLOC  1
+#define PROF_SLOT_PENDING  2
+#define PROF_SLOT_UNCORR   3
+#define PROF_SLOT_REMAP    4
+#define PROF_SLOT_CRC      5
+#define PROF_SLOT_REPORTED 6
+
+#define PROF_SCOPE_ANY 0
+#define PROF_SCOPE_HDD 1
+#define PROF_SCOPE_SSD 2
 
 /* How a matched profile reads life counters. Inherited along extends. */
 #define PROF_F_E7_VALUE      1  /* 231 life is normalized Value, not RAW */
@@ -808,7 +833,28 @@ typedef struct _PROF_ATTR {
     const char* nameEn;
     const char* altRu;
     const char* altEn;
+    unsigned char rule;       /* PROF_RULE_* */
+    unsigned char slot;       /* PROF_SLOT_*: which summary field, or none */
+    unsigned char scope;      /* PROF_SCOPE_* */
+    unsigned short observe;   /* 0 = this step is off */
+    unsigned short caution;
+    unsigned short bad;       /* both HDD and SSD; 0 = off */
+    unsigned short badHdd;    /* HDD only; 0 = off */
 } PROF_ATTR;
+
+/* Normalized channel rule for one attribute. rule is OFF or WORSE. */
+typedef struct _PROF_HEALTH {
+    int sem;
+    int enc;
+    int rule;
+    int slot;
+    int scope;
+    int observe;
+    int caution;
+    int bad;
+    int badHdd;
+    int fallback;             /* use only when that slot is still empty */
+} PROF_HEALTH;
 
 /* Extra profile. The caller keeps every pointer alive.
  * Adding one does not require a new branch in the interpreter. */
@@ -855,6 +901,18 @@ BOOL ProfileRegister(const PROFILE_DEF* def);
 void ProfileClearRegistered(void);
 /* 1 when RAW can be decoded with this encoding. SCALE and NONE are not safe. */
 int  ProfileDecodeRaw(int enc, unsigned __int64 raw, unsigned __int64* out);
+/* 1 when sem is host or NAND writes and enc names the unit.
+ * PERCENT and a bare COUNTER are not a volume. */
+int  ProfileWriteVolume(int sem, int enc);
+/* 1 when sem is ERASE and enc is a count or a max/avg pair. */
+int  ProfileEraseCount(int sem, int enc);
+/* Channel rule for id. FALSE when the attribute is unknown or contested.
+ * MEDIA/INTERFACE with PROF_RULE_DEFAULT becomes caution at 1. */
+BOOL ProfileHealthRule(const DRIVE_INFO* p, BYTE id, PROF_HEALTH* out);
+/* Rank of one decoded count. badHdd applies only when isHdd is nonzero.
+ * A threshold of 0 is off. count < 0 is UNKNOWN. */
+int  ProfileCountRank(int count, int observe, int caution, int bad,
+                      int badHdd, int isHdd);
 /* 1 when now >= prev. A backwards counter is not a delta. */
 int  ProfileRawDelta(unsigned __int64 prev, unsigned __int64 now, long long* delta);
 void FormatProfileDiagnostic(const DRIVE_INFO* p, char* buf, int nBuf);

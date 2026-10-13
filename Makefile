@@ -56,6 +56,14 @@ LDFLAGS = -mwindows \
 
 TESTDIR = tests
 TEST_TARGET = $(OUTDIR)/profile_test.exe
+DB_TEST_TARGET = $(OUTDIR)/drivedb_test.exe
+# Real drivedb.o plus identification, decode, and health. No GUI subsystem:
+# -mwindows would hide printf. profile_test.exe stays on its stubs.
+DB_TEST_OBJS = $(OBJDIR)/drivedb_test.o $(OBJDIR)/profile.o \
+          $(OBJDIR)/drivedb.o $(OBJDIR)/smart.o \
+          $(OBJDIR)/health_assessment.o $(OBJDIR)/lang.o \
+          $(OBJDIR)/ata_smart.o $(OBJDIR)/nvme_smart.o \
+          $(OBJDIR)/usb_bridge.o
 
 all: $(OUTDIR) $(OBJDIR) $(TARGET)
 	@echo ""
@@ -84,12 +92,18 @@ $(TARGET): $(OBJS) $(RES_O) | $(OUTDIR)
 	@echo "  LD  $@"
 	$(Q)$(CC) $(OBJS) $(RES_O) $(LDFLAGS) -o $@
 
-# Console resolver tests. profile.cpp only: drivedb and the GUI stay out.
-# DriveDbApply and DriveDbLookup are stubs in profile_test.cpp.
-test: $(OUTDIR) $(OBJDIR) $(TEST_TARGET)
+# profile_test.exe: profile.cpp only. DriveDbApply and DriveDbLookup are
+# stubs in profile_test.cpp. drivedb_test.exe links the real database.
+test: $(OUTDIR) $(OBJDIR) $(TEST_TARGET) $(DB_TEST_TARGET)
 	$(TEST_TARGET)
+	$(DB_TEST_TARGET)
 
 $(OBJDIR)/profile_test.o: $(TESTDIR)/profile_test.cpp $(SRCDIR)/smart.h | $(OBJDIR)
+	@echo "  CC  $<"
+	$(Q)$(CC) -O2 -DWIN32 -D_WIN32 -D_WINDOWS -DNDEBUG \
+	    -I$(SRCDIR) -finput-charset=UTF-8 $(CXXFLAGS) -c $< -o $@
+
+$(OBJDIR)/drivedb_test.o: $(TESTDIR)/drivedb_test.cpp $(SRCDIR)/smart.h | $(OBJDIR)
 	@echo "  CC  $<"
 	$(Q)$(CC) -O2 -DWIN32 -D_WIN32 -D_WINDOWS -DNDEBUG \
 	    -I$(SRCDIR) -finput-charset=UTF-8 $(CXXFLAGS) -c $< -o $@
@@ -98,6 +112,14 @@ $(TEST_TARGET): $(OBJDIR)/profile_test.o $(OBJDIR)/profile.o
 	@echo "  LD  $@"
 	$(Q)$(CC) $(OBJDIR)/profile_test.o $(OBJDIR)/profile.o \
 	    -static -static-libgcc -static-libstdc++ -lkernel32 -o $@
+
+$(DB_TEST_TARGET): $(DB_TEST_OBJS)
+	@echo "  LD  $@"
+	$(Q)$(CC) $(DB_TEST_OBJS) \
+	    -static -static-libgcc -static-libstdc++ \
+	    -lcomctl32 -lcomdlg32 -lshell32 \
+	    -luser32 -lgdi32 -lkernel32 -ladvapi32 -lole32 -luuid \
+	    -lgdiplus -lshlwapi -lsetupapi -lcfgmgr32 -o $@
 
 $(OBJDIR):
 ifeq ($(OS),Windows_NT)
