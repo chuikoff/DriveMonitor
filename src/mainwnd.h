@@ -52,30 +52,51 @@
 #define IDM_LANG_RU          2020
 #define IDM_LANG_EN          2021
 #define IDM_MONITOR          2022
+#define IDM_THEME_SYSTEM     2030
+#define IDM_THEME_LIGHT      2031
+#define IDM_THEME_DARK       2032
 #define IDT_HOTPLUG          3002
 #define IDT_MONITOR          3003
 #define WM_APP_REFRESH_DONE  (WM_APP + 1)
 #define WM_TRAYICON          (WM_APP + 2)
-#define DRIVE_BTN_H    56
+#define DRIVE_BTN_H    78
 #define DRIVE_BTN_GAP   6
-#define DRIVE_BTN_PANEL_W 200
-#define WINDOW_W     920
-#define WINDOW_H     960   /* ~32 SMART rows without v-scroll */
-#define WINDOW_H_MIN 620
-#define CLR_BG          RGB(236, 242, 252)
-#define CLR_PANEL       RGB(252, 254, 255)
-#define CLR_BORDER      RGB(186, 198, 216)
-#define CLR_TEXT        RGB(30,  35,  50)
-#define CLR_TEXT_DIM    RGB(90, 100, 120)
-#define CLR_GREEN       RGB(30,  150, 60)
-#define CLR_YELLOW      RGB(180, 120, 0)
-#define CLR_ORANGE      RGB(220, 110, 20)
-#define CLR_CRITICAL    RGB(40,  40,  40)
-#define CLR_RED         RGB(190, 30,  30)
-#define CLR_ACCENT      RGB(30,  100, 210)
-#define CLR_HEADER      RGB(220, 230, 244)
-#define CLR_ROW1        RGB(252, 254, 255)
-#define CLR_ROW2        RGB(240, 246, 252)
+#define DRIVE_BTN_PANEL_W 248
+#define WINDOW_W     1040   /* minimum */
+#define WINDOW_W_DEF 1200
+#define WINDOW_H     860
+#define WINDOW_H_MIN 640
+/* v2 palette. Light and dark sets live in mainwnd.cpp (UiApplyPalette).
+ * Status colors come in pairs: tinted pill background + readable text,
+ * both >= 4.5:1. See docs/UI_SPEC.md. */
+typedef struct _UI_PALETTE {
+    COLORREF bg, side, panel, sel, hover, border, border2;
+    COLORREF text, textDim, textFaint, accent, row2, rowHl, rowSel, btn;
+    COLORREF okBg, ok, riskBg, risk, warnBg, warn, badBg, bad;
+    COLORREF critBg, critFg, critText, neuBd, neu;
+} UI_PALETTE;
+extern UI_PALETTE g_Pal;
+extern int        g_bUiDark;
+extern int        g_bDemoMode;     /* --demo: fixture drives, no device I/O */
+extern int        g_nThemeOverride; /* --theme=light|dark: 1/2, 0 = none */
+
+#define CLR_BG          g_Pal.bg
+#define CLR_SIDE        g_Pal.side
+#define CLR_PANEL       g_Pal.panel
+#define CLR_BORDER      g_Pal.border
+#define CLR_BORDER2     g_Pal.border2
+#define CLR_TEXT        g_Pal.text
+#define CLR_TEXT_DIM    g_Pal.textDim
+#define CLR_TEXT_FAINT  g_Pal.textFaint
+#define CLR_GREEN       g_Pal.ok
+#define CLR_YELLOW      g_Pal.risk
+#define CLR_ORANGE      g_Pal.warn
+#define CLR_CRITICAL    g_Pal.critText
+#define CLR_RED         g_Pal.bad
+#define CLR_ACCENT      g_Pal.accent
+#define CLR_HEADER      g_Pal.panel
+#define CLR_ROW1        g_Pal.panel
+#define CLR_ROW2        g_Pal.row2
 
 extern DRIVE_INFO  g_Drives[MAX_DRIVES];
 extern int         g_nDriveCount;

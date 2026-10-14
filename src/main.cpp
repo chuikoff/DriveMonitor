@@ -94,7 +94,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                    LPSTR lpCmdLine, int nCmdShow)
 {
     (void)hPrevInstance;
-    (void)lpCmdLine;
+    /* Developer flags: --demo shows fixture drives without touching
+     * devices (screenshots, UI work). --theme=light|dark overrides the
+     * saved theme for this run only. */
+    if (lpCmdLine) {
+        if (strstr(lpCmdLine, "--demo")) g_bDemoMode = 1;
+        if (strstr(lpCmdLine, "--theme=dark")) g_nThemeOverride = 2;
+        else if (strstr(lpCmdLine, "--theme=light")) g_nThemeOverride = 1;
+    }
 
     SetUnhandledExceptionFilter(CrashFilter);
 
@@ -137,7 +144,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     }
 
     RECT wa;
-    int nW = UiWindowW(), nH = UiWindowH();
+    int nW = UiScale(WINDOW_W_DEF), nH = UiWindowH();
     int nScrW, nScrH, nX, nY;
     int nShow = nCmdShow;
     if (!SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0)) {
@@ -157,7 +164,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         0,
         "DriveMonitorMainWnd",
         "DriveMonitor",
-        WS_OVERLAPPEDWINDOW,
+        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         nX, nY, nW, nH,
         NULL, NULL, hInstance, NULL
     );
