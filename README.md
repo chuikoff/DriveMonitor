@@ -10,7 +10,7 @@
 
 **Текущий выпуск:** [1.7.23](https://github.com/chuikoff/DriveMonitor/releases/tag/1.7.23) (сборка 23) — скачать `DriveMonitor.exe`, запустить от администратора.
 
-**Бета:** [2.0.17-beta](https://github.com/chuikoff/DriveMonitor/releases/tag/2.0.17-beta) (сборка 17, GPL-2.0-or-later). Стабильный выпуск остаётся 1.7.23.
+**Бета:** [2.0.20-beta](https://github.com/chuikoff/DriveMonitor/releases/tag/2.0.20-beta) (сборка 20, GPL-2.0-or-later). Исходники этого тега: [дерево 2.0.20-beta](https://github.com/chuikoff/DriveMonitor/tree/2.0.20-beta).
 
 Windows 10 / 11. Снимок SMART на старте, при hotplug и по «Перечитать». «Вид → Мониторинг» (Ctrl+M) раз в минуту перечитывает диски; по умолчанию выключен. Пока мониторинг включён, в трее по иконке на диск с температурой, а кнопка «Свернуть» убирает окно в трей и чтение продолжается. Без мониторинга иконок в трее нет. Закрытие окна завершает программу. Без графика и теста поверхности. Интерфейс следует DPI монитора; масштаб 100–200% в меню «Вид» (Ctrl+±, Ctrl+0, Ctrl+колёсико).
 
@@ -26,7 +26,7 @@ Windows 10 / 11. Снимок SMART на старте, при hotplug и по «
 
 Имя USB-переходника берётся из VID/PID (например Realtek `0BDA:9201`), не из модели диска.
 
-**Диск** — SMART RETURN STATUS / NVMe Critical Warning. **Оценка** — ATA-3: prefail Value≤порог сейчас, In the past, usage на пороге, RAW носителя (05/197/198/187), self-test. Механика, температура и CRC — только в своих осях и лекции, **не** в overall. Ресурс SSD тоже не здоровье: 11–20% остатка — ось «РИСК», overall не трогает; ≤5% может поднять оценку не выше **ВНИМАНИЕ**. Шкала **ХОРОШО → РИСК → ТРЕБУЕТ ВНИМАНИЯ → ПЛОХО → КРИТИЧЕСКОЕ**.
+**Диск** — SMART RETURN STATUS / NVMe Critical Warning. **Оценка** начинается с носителя: prefail, self-test и RAW носителя. Подтверждённый CRC (атрибут 199, с единицы), таймауты команд, повторы раскрутки, перегрев, механика HDD и почти исчерпанный ресурс SSD поднимают чистый носитель до **ВНИМАНИЕ** и не дальше. «Риск» на боковой оси итог не меняет: 11–20% остатка ресурса остаются на оси износа. Строка CRC со 100 — «ПЛОХО», итог при чистом носителе всё равно **ВНИМАНИЕ**, и лекция говорит, что носитель в норме. Так же в 1.7.23. Шкала **ХОРОШО → РИСК → ТРЕБУЕТ ВНИМАНИЯ → ПЛОХО → КРИТИЧЕСКОЕ**.
 
 Не формула Health%. Неизвестный vendor RAW не оценивается как поломка (например ECC 195 у не-Seagate и 187 Hitachi/HGST с packing в старших байтах — «не оценивается», не ОК). ATA 190/194 — RAW[0] датчика, не инвертированный Value 100−T. Наработка — контекст, не штраф. C0 на SSD и небезопасные выключения NVMe — журнал питания, не поломка. Для NVMe пороги температуры — WCTEMP/CCTEMP диска, иначе ~50/60/70 °C.
 
@@ -56,7 +56,11 @@ make clean
 
 ### Лицензия
 
-GPL-2.0-or-later с версии 1.7.27. Copyright: Ari Sohandri Putra / ARImetic Inc. Изменения: [chuikoff](https://github.com/chuikoff). Опубликованный выпуск 1.7.23 и локальные сборки по 1.7.26 остаются под MIT. Текст GPL и сохранённое уведомление MIT — в LICENSE. Имена семейств и атрибутов известных моделей — из smartmontools `drivedb.h` (Christian Franke и соавторы, GPL-2.0-or-later), файл `third_party/smartmontools/drivedb.h`.
+DriveMonitor — Copyright (C) 2026 [chuikoff](https://github.com/chuikoff). С версии 1.7.27 это дерево распространяется под GPL-2.0-or-later.
+
+Опубликованный GPL-файл — бета [2.0.20-beta](https://github.com/chuikoff/DriveMonitor/releases/tag/2.0.20-beta). Исходники этого тега: [дерево](https://github.com/chuikoff/DriveMonitor/tree/2.0.20-beta), [tar.gz](https://github.com/chuikoff/DriveMonitor/archive/refs/tags/2.0.20-beta.tar.gz), [zip](https://github.com/chuikoff/DriveMonitor/archive/refs/tags/2.0.20-beta.zip).
+
+Имена семейств и атрибутов известных моделей — из smartmontools `drivedb.h` (Christian Franke и соавторы, GPL-2.0-or-later), файл `third_party/smartmontools/drivedb.h`.
 
 Поддержать: https://boosty.to/chuikoff
 
@@ -68,7 +72,7 @@ A one-shot Windows S.M.A.R.T. viewer with Russian and English UI. Language: **La
 
 **Current release:** [1.7.23](https://github.com/chuikoff/DriveMonitor/releases/tag/1.7.23) (build 23) — download `DriveMonitor.exe` and run it as Administrator.
 
-**Beta:** [2.0.17-beta](https://github.com/chuikoff/DriveMonitor/releases/tag/2.0.17-beta) (build 17, GPL-2.0-or-later). The stable release remains 1.7.23.
+**Beta:** [2.0.20-beta](https://github.com/chuikoff/DriveMonitor/releases/tag/2.0.20-beta) (build 20, GPL-2.0-or-later). Source for this tag: [tree 2.0.20-beta](https://github.com/chuikoff/DriveMonitor/tree/2.0.20-beta).
 
 Windows 10 / 11. One SMART snapshot at startup, on hotplug, and on Reread. **View → Monitor** (Ctrl+M) rereads once a minute; it is off by default. While monitoring is on, the tray shows one icon per disk with its temperature, and Minimize hides the window there while reading continues. With monitoring off there are no tray icons. Closing the window exits. No Health% formula. The UI follows monitor DPI; zoom 100–200% is under **View** (Ctrl+±, Ctrl+0, Ctrl+wheel).
 
@@ -84,7 +88,7 @@ It reads raw SMART via `DeviceIoControl` and shows: ID / Attribute / Value / Wor
 
 The USB adapter name comes from VID/PID (for example Realtek `0BDA:9201`), not from the drive model.
 
-**Drive** is SMART RETURN STATUS / NVMe Critical Warning. **Assessment** is ATA-3: prefail Value≤threshold now, In the past, usage at threshold, media RAW (05/197/198/187), self-test. Mechanics, temperature and CRC stay on their own axes and in the lecture — **not** in overall. SSD remaining life is wear, not health: 11–20% remaining is the Wear axis (WATCH) and does not move overall; ≤5% can raise overall no higher than **NEEDS ATTENTION**. Scale: **GOOD → WATCH → NEEDS ATTENTION → BAD → CRITICAL**.
+**Drive** is SMART RETURN STATUS / NVMe Critical Warning. **Assessment** starts from the media: prefail, self-test, and media RAW. Confirmed CRC (attribute 199, from 1), command timeouts, spin retries, overheating, HDD mechanics, and nearly exhausted SSD endurance raise a clean medium to **NEEDS ATTENTION** and no further. **WATCH** on a side axis leaves the headline alone: 11–20% life remaining stays on the wear axis. A CRC row at 100 is **BAD**; with a clean medium the headline is still **NEEDS ATTENTION**, and the lecture says the medium is fine. The 1.7.23 release did the same. Scale: **GOOD → WATCH → NEEDS ATTENTION → BAD → CRITICAL**.
 
 No Health% formula. Unknown vendor RAW is not scored as failure (for example ECC 195 on non-Seagate, and Hitachi/HGST 187 packing — **Not scored**, not OK). ATA 190/194 use sensor RAW[0], not inverted Value 100−T. Power-on hours are context, not a penalty. SSD C0 and NVMe unsafe shutdowns are a **power log**, not a fault. NVMe temperature limits come from the drive WCTEMP/CCTEMP, otherwise ~50/60/70 °C.
 
@@ -114,6 +118,10 @@ make clean
 
 ### License
 
-GPL-2.0-or-later from version 1.7.27. Copyright: Ari Sohandri Putra / ARImetic Inc. Changes: [chuikoff](https://github.com/chuikoff). The published 1.7.23 release and local builds through 1.7.26 stay MIT. The GPL text and the preserved MIT notice are in LICENSE. Family and attribute names for known models come from smartmontools `drivedb.h` (Christian Franke and others, GPL-2.0-or-later), file `third_party/smartmontools/drivedb.h`.
+DriveMonitor is Copyright (C) 2026 [chuikoff](https://github.com/chuikoff). From version 1.7.27 this tree is distributed under GPL-2.0-or-later.
+
+The published GPL executable is the [2.0.20-beta](https://github.com/chuikoff/DriveMonitor/releases/tag/2.0.20-beta) prerelease. Source for this tag: [tree](https://github.com/chuikoff/DriveMonitor/tree/2.0.20-beta), [tar.gz](https://github.com/chuikoff/DriveMonitor/archive/refs/tags/2.0.20-beta.tar.gz), [zip](https://github.com/chuikoff/DriveMonitor/archive/refs/tags/2.0.20-beta.zip).
+
+Family and attribute names for known models come from smartmontools `drivedb.h` (Christian Franke and others, GPL-2.0-or-later), file `third_party/smartmontools/drivedb.h`.
 
 Support: https://boosty.to/chuikoff

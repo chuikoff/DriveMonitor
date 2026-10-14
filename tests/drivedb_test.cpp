@@ -125,6 +125,15 @@ static int DbHas(BYTE id)
     return 0;
 }
 
+static const char* DbName(BYTE id)
+{
+    int i;
+    for (i = 0; i < g.nDriveDbAttrs; i++) {
+        if (g.driveDbAttr[i].id == id) return g.driveDbAttr[i].name;
+    }
+    return "";
+}
+
 static void ExpectSem(BYTE id, int wantSem, int wantEnc, const char* msg)
 {
     int sem = -1;
@@ -175,6 +184,30 @@ static void CaseEnd(const char* tag, int before)
     if (g_fail != before) Show(tag);
 }
 
+static const SMART_ATTRIBUTE* Attr(BYTE id)
+{
+    int i;
+    for (i = 0; i < 30; i++) {
+        if (g.attrData.stAttributes[i].bAttrID == id)
+            return &g.attrData.stAttributes[i];
+    }
+    return NULL;
+}
+
+/* Same rank the attribute row shows. SKIP means the rule does not grade. */
+static void ExpectRank(BYTE id, int wantEv, int wantRank, const char* msg)
+{
+    const SMART_ATTRIBUTE* a = Attr(id);
+    int rank = -99;
+    int ev;
+    Expect(a != NULL, msg);
+    if (!a) return;
+    ev = AttrEvidenceRank(&g, a, &rank);
+    ExpectInt(ev, wantEv, msg);
+    if (wantEv == ATTR_EV_RANK)
+        ExpectInt(rank, wantRank, msg);
+}
+
 /* ADATA SU800 / R0918B. Six-character firmware, so the 7-character
  * SM2258 overlay does not hide drivedb 169/241/160. */
 static void TestSu800(void)
@@ -206,8 +239,10 @@ static void TestSu800(void)
     ExpectNoLookup(251, "su800 251 not health");
     ExpectName(251, 1, "Остаток запасных блоков", "su800 251 generic name");
     ExpectSem(160, PROF_SEM_MEDIA, PROF_ENC_COUNTER, "su800 160");
-    ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_CAUTION, "su800 media");
-    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_CAUTION, "su800 headline");
+    /* 160 is a drivedb name, not a local rule. RAW 3 is Risk, not Caution. */
+    ExpectRank(160, ATTR_EV_RANK, (int)HEALTH_STATUS_OBSERVE, "su800 160 risk");
+    ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_OBSERVE, "su800 media");
+    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_OBSERVE, "su800 headline");
     ExpectInt(g.nEndurancePercent, 92, "su800 life kept");
     CaseEnd("su800", before);
 }
@@ -233,6 +268,8 @@ static void TestAs350(void)
     ExpectInt(g.nSSDLifeLeft, 4, "as350 life");
     ExpectInt(g.nEndurancePercent, 4, "as350 endurance");
     ExpectInt((int)g.eWear, (int)HEALTH_STATUS_BAD, "as350 wear");
+    ExpectInt(WearBadgeStatus(g.nEndurancePercent), (int)HEALTH_STATUS_CAUTION,
+              "as350 wear badge");
     ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_GOOD, "as350 media clean");
     ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_CAUTION, "as350 headline");
     ExpectNoLookup(166, "as350 166 not health");
@@ -244,7 +281,7 @@ static void TestAs350(void)
 }
 
 /* Kingston A400 + SBFK. Local Phison rows keep 169 and 241.
- * 218 is the drivedb CRC path when 199 has not filled the slot. */
+ * 218 is a CRC name. It is Risk and does not fill the CRC total. */
 static void TestA400Phison(void)
 {
     int before = g_fail;
@@ -263,9 +300,12 @@ static void TestA400Phison(void)
     ExpectSem(0xF1, PROF_SEM_HOST_WRITE, PROF_ENC_SCALE, "a400 F1 local scale");
     ExpectDecodeReject(PROF_ENC_SCALE, 2048, "a400 scale rejected");
     ExpectInt(g.nSSDTotalWritesGB, -1, "a400 no write total");
-    ExpectInt(g.nCrcErrors, 120, "a400 crc");
-    ExpectInt((int)g.eInterface, (int)HEALTH_STATUS_BAD, "a400 interface");
-    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_CAUTION, "a400 headline");
+    /* 218 is a CRC name, not attribute 199. The row is Risk. The confirmed
+     * CRC total stays empty, so the headline is not Caution. */
+    ExpectInt(g.nCrcErrors, -1, "a400 crc not published");
+    ExpectRank(218, ATTR_EV_RANK, (int)HEALTH_STATUS_OBSERVE, "a400 218 ranked");
+    ExpectInt((int)g.eInterface, (int)HEALTH_STATUS_OBSERVE, "a400 interface");
+    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_GOOD, "a400 headline");
     CaseEnd("a400-sbfk", before);
 }
 
@@ -279,6 +319,8 @@ static void TestA400CrcSlot(void)
     Expect(AddAttr(218, 100, 50), "a400crc slot 218");
     Run();
     ExpectInt(g.nCrcErrors, 0, "a400crc count");
+    ExpectRank(199, ATTR_EV_RANK, (int)HEALTH_STATUS_GOOD, "a400crc 199 ranked");
+    ExpectRank(218, ATTR_EV_SKIP, 0, "a400crc 218 suppressed");
     ExpectInt((int)g.eInterface, (int)HEALTH_STATUS_GOOD, "a400crc interface");
     ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_GOOD, "a400crc headline");
     ExpectInt((int)g.eWear, (int)HEALTH_STATUS_GOOD, "a400crc wear");
@@ -325,9 +367,10 @@ static void TestSpcc(void)
     ExpectInt(g.nSSDLifeLeft, 55, "spcc life");
     ExpectInt(g.nEndurancePercent, 55, "spcc endurance");
     ExpectInt((int)g.eWear, (int)HEALTH_STATUS_GOOD, "spcc wear");
-    ExpectInt(g.nCrcErrors, 7, "spcc crc");
-    ExpectInt((int)g.eInterface, (int)HEALTH_STATUS_CAUTION, "spcc interface");
-    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_CAUTION, "spcc headline");
+    ExpectInt(g.nCrcErrors, -1, "spcc crc not published");
+    ExpectRank(218, ATTR_EV_RANK, (int)HEALTH_STATUS_OBSERVE, "spcc 218 risk");
+    ExpectInt((int)g.eInterface, (int)HEALTH_STATUS_OBSERVE, "spcc interface");
+    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_GOOD, "spcc headline");
     ExpectSem(244, PROF_SEM_ERASE, PROF_ENC_COUNTER, "spcc 244");
     ExpectDecoded(PROF_ENC_COUNTER, 9, 9, "spcc 244 value");
     ExpectInt(g.nSSDAvgEraseCount, -1, "spcc erase not stored");
@@ -346,6 +389,7 @@ static void TestSamsung870(void)
     ExpectInt(g.nProfileScore, 100, "870 score");
     ExpectInt((int)g.eController, (int)CONTROLLER_SAMSUNG, "870 controller");
     ExpectStr(g.szModelFamily, "Samsung based SSDs", "870 family");
+    ExpectStr(g.szDriveDbTie, "", "870 no drivedb tie");
     ExpectSem(0xE7, PROF_SEM_ENDURANCE, PROF_ENC_PERCENT, "870 E7");
     ExpectInt(g.nSSDLifeLeft, 98, "870 life from value");
     ExpectInt(g.nEndurancePercent, 98, "870 endurance");
@@ -423,10 +467,321 @@ static void TestUsbSkip(void)
     CaseEnd("usb", before);
 }
 
+/* Two exact ZZTIEPROBE rows share a score. The earlier family is the
+ * label. 231 is endurance on that row and erase count on the later row,
+ * so it is not applied. 5 agrees and stays. 232 exists only on the later
+ * row and is not imported. */
+static void TestDriveDbTie(void)
+{
+    int before = g_fail;
+    int sem = -1, enc = -1;
+    char lecture[8192];
+    Base(DRIVE_TYPE_SSD_SATA, "ZZTIEPROBE", "1.0");
+    Expect(AddAttr(0xE7, 40, 40), "tie slot 231");
+    Expect(AddAttr(5, 100, 3), "tie slot 5");
+    Expect(AddAttr(232, 100, 15), "tie slot 232");
+    Run();
+    ExpectStr(g.szModelFamily, "Tie Probe Earlier", "tie family is earlier");
+    ExpectStr(g.szDriveDbTie, "Tie Probe Later", "tie names the other family");
+    Expect(!g.bProfileAmbiguous, "drivedb tie is not a profile tie");
+    ExpectStr(g.szProfileConflict, "", "drivedb tie is not szProfileConflict");
+    Expect(!DriveDbAttrEnc(&g, 231, &sem, &enc), "tie 231 dropped");
+    Expect(!DriveDbAttrEnc(&g, 232, &sem, &enc), "tie 232 not imported");
+    Expect(DriveDbAttrEnc(&g, 5, &sem, &enc), "tie 5 stored");
+    ExpectInt(sem, PROF_SEM_MEDIA, "tie 5 sem");
+    ExpectInt(enc, PROF_ENC_COUNTER, "tie 5 enc");
+    ExpectNoLookup(231, "tie 231 not endurance");
+    ExpectInt(g.nSSDLifeLeft, -1, "tie life unset");
+    ExpectInt(g.nEndurancePercent, -1, "tie endurance unset");
+    FormatHealthLecturePlain(&g, lecture, (int)sizeof(lecture));
+    ExpectHas(lecture, "Tie Probe Earlier", "tie lecture family");
+    ExpectHas(lecture, "Tie Probe Later", "tie lecture other");
+    ExpectHas(lecture, "не применяется", "tie lecture refusal");
+    CaseEnd("tie", before);
+}
+
+/* Row badge and the health channel share one rank. ROWTEST stays generic:
+ * an ST* model would select Seagate. */
+static void TestRowRank(void)
+{
+    int before;
+    char lecture[8192];
+
+    ExpectInt(WearBadgeStatus(4), (int)HEALTH_STATUS_CAUTION, "badge 4");
+    ExpectInt(WearBadgeStatus(5), (int)HEALTH_STATUS_CAUTION, "badge 5");
+    ExpectInt(WearBadgeStatus(8), (int)HEALTH_STATUS_CAUTION, "badge 8");
+    ExpectInt(WearBadgeStatus(10), (int)HEALTH_STATUS_CAUTION, "badge 10");
+    ExpectInt(WearBadgeStatus(15), (int)HEALTH_STATUS_OBSERVE, "badge 15");
+    ExpectInt(WearBadgeStatus(21), (int)HEALTH_STATUS_GOOD, "badge 21");
+    ExpectInt(WearBadgeStatus(-1), (int)HEALTH_STATUS_UNKNOWN, "badge none");
+
+    before = g_fail;
+    Base(DRIVE_TYPE_SSD_SATA, "ROWTEST", "1.0");
+    Expect(AddAttr(5, 100, 10), "row ssd5 slot");
+    Run();
+    ExpectStr(g.szProfileId, "ata-generic", "row ssd profile");
+    ExpectRank(5, ATTR_EV_RANK, (int)HEALTH_STATUS_CAUTION, "ssd realloc 10");
+    ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_CAUTION, "ssd realloc media");
+    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_CAUTION, "ssd realloc head");
+    CaseEnd("row-ssd5", before);
+
+    before = g_fail;
+    Base(DRIVE_TYPE_HDD, "ROWTEST", "1.0");
+    Expect(AddAttr(5, 100, 10), "row hdd5 slot");
+    Run();
+    ExpectStr(g.szProfileId, "ata-generic", "row hdd profile");
+    ExpectRank(5, ATTR_EV_RANK, (int)HEALTH_STATUS_BAD, "hdd realloc 10");
+    ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_BAD, "hdd realloc media");
+    CaseEnd("row-hdd5", before);
+
+    before = g_fail;
+    Base(DRIVE_TYPE_HDD, "ROWTEST", "1.0");
+    Expect(AddAttr(197, 100, 2), "row pend2 slot");
+    Run();
+    ExpectRank(197, ATTR_EV_RANK, (int)HEALTH_STATUS_CAUTION, "hdd pending 2");
+    CaseEnd("row-pend2", before);
+
+    before = g_fail;
+    Base(DRIVE_TYPE_HDD, "ROWTEST", "1.0");
+    Expect(AddAttr(197, 100, 4), "row pend4 slot");
+    Run();
+    ExpectRank(197, ATTR_EV_RANK, (int)HEALTH_STATUS_BAD, "hdd pending 4");
+    CaseEnd("row-pend4", before);
+
+    before = g_fail;
+    Base(DRIVE_TYPE_SSD_SATA, "ROWTEST", "1.0");
+    Expect(AddAttr(197, 100, 4), "row ssdp slot");
+    Run();
+    ExpectRank(197, ATTR_EV_RANK, (int)HEALTH_STATUS_CAUTION, "ssd pending 4");
+    CaseEnd("row-ssdp", before);
+
+    before = g_fail;
+    Base(DRIVE_TYPE_SSD_SATA, "ROWTEST", "1.0");
+    Expect(AddAttr(199, 100, 10), "row crc10 slot");
+    Run();
+    ExpectRank(199, ATTR_EV_RANK, (int)HEALTH_STATUS_CAUTION, "crc 10");
+    CaseEnd("row-crc10", before);
+
+    before = g_fail;
+    Base(DRIVE_TYPE_SSD_SATA, "ROWTEST", "1.0");
+    Expect(AddAttr(199, 100, 99), "row crc99 slot");
+    Run();
+    ExpectRank(199, ATTR_EV_RANK, (int)HEALTH_STATUS_CAUTION, "crc 99");
+    CaseEnd("row-crc99", before);
+
+    before = g_fail;
+    Base(DRIVE_TYPE_SSD_SATA, "ROWTEST", "1.0");
+    Expect(AddAttr(199, 100, 100), "row crc100 slot");
+    Run();
+    ExpectRank(199, ATTR_EV_RANK, (int)HEALTH_STATUS_BAD, "crc 100");
+    ExpectInt((int)g.eInterface, (int)HEALTH_STATUS_BAD, "crc 100 iface");
+    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_CAUTION, "crc 100 head");
+    CaseEnd("row-crc100", before);
+
+    before = g_fail;
+    Base(DRIVE_TYPE_SSD_SATA, "ROWTEST", "1.0");
+    Expect(AddAttr(187, 100, 3), "row ssd187 slot");
+    Run();
+    ExpectRank(187, ATTR_EV_SKIP, 0, "ssd 187 skipped");
+    ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_GOOD, "ssd 187 media");
+    CaseEnd("row-ssd187", before);
+
+    before = g_fail;
+    Base(DRIVE_TYPE_HDD, "ROWTEST", "1.0");
+    Expect(AddAttr(187, 100, 3), "row hdd187 slot");
+    Run();
+    ExpectRank(187, ATTR_EV_RANK, (int)HEALTH_STATUS_BAD, "hdd 187");
+    CaseEnd("row-hdd187", before);
+
+    before = g_fail;
+    Base(DRIVE_TYPE_SSD_SATA, "Samsung SSD 870 EVO 1TB", "SVT02B6Q");
+    Expect(AddAttr(0xBB, 100, 1), "row sam187 slot");
+    Run();
+    ExpectStr(g.szProfileId, "samsung-870-svt", "sam187 profile");
+    ExpectRank(0xBB, ATTR_EV_RANK, (int)HEALTH_STATUS_BAD, "samsung 187");
+    ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_BAD, "samsung 187 media");
+    CaseEnd("row-sam187", before);
+
+    before = g_fail;
+    Base(DRIVE_TYPE_SSD_SATA, "KINGSTON SA400S37240G", "SBFKB1H5");
+    Expect(AddAttr(0xA1, 100, 5), "row a1 slot");
+    Run();
+    ExpectRank(0xA1, ATTR_EV_SKIP, 0, "phison spare off");
+    ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_GOOD, "phison spare media");
+    CaseEnd("row-a1", before);
+
+    before = g_fail;
+    Base(DRIVE_TYPE_HDD, "WDC WD40EZAZ-00SF3B0", "80.00A80");
+    Run();
+    ExpectHas(g.szDriveDbWarn, "heise.de/-10800960", "smr url stored");
+    ExpectHas(g.szDriveDbWarn, "older WD SMR", "smr english stored");
+    ExpectNotHas(g.szDriveDbWarn, "у старых", "smr russian not stored");
+    FormatHealthLecturePlain(&g, lecture, (int)sizeof(lecture));
+    ExpectHas(lecture, "у старых WD SMR", "smr lecture ru");
+    ExpectHas(lecture, "heise.de/-10800960", "smr lecture url");
+    ExpectHas(lecture, "Замечание к семейству", "smr lecture label");
+    CaseEnd("row-smr", before);
+}
+
+/* SMART Modular attribute 1 is raw48 Uncorrectable_ECC_Cnt. The name is
+ * only a hint, so RAW 5 is Risk. RAW 0 stays Good. Attribute 199 keeps
+ * the local CRC thresholds. */
+static void TestSmartModular(void)
+{
+    int before = g_fail;
+    Base(DRIVE_TYPE_SSD_SATA, "SH9MST6D16GJSI01", "");
+    Expect(AddAttr(1, 100, 5), "smartmod slot 1");
+    Run();
+    ExpectStr(g.szModelFamily, "SMART Modular Technologies mSATA XL+ SLC SSDs",
+              "smartmod family");
+    ExpectSem(1, PROF_SEM_MEDIA, PROF_ENC_COUNTER, "smartmod 1");
+    ExpectRank(1, ATTR_EV_RANK, (int)HEALTH_STATUS_OBSERVE, "smartmod 1 risk");
+    ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_OBSERVE, "smartmod media");
+    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_OBSERVE, "smartmod headline");
+    Expect(g.eHealthStatus != HEALTH_STATUS_CAUTION, "smartmod not caution");
+    CaseEnd("smartmod-5", before);
+
+    before = g_fail;
+    Base(DRIVE_TYPE_SSD_SATA, "SH9MST6D16GJSI01", "");
+    Expect(AddAttr(1, 100, 0), "smartmod0 slot 1");
+    Run();
+    ExpectRank(1, ATTR_EV_RANK, (int)HEALTH_STATUS_GOOD, "smartmod 1 zero");
+    ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_GOOD, "smartmod0 media");
+    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_GOOD, "smartmod0 headline");
+    CaseEnd("smartmod-0", before);
+
+    before = g_fail;
+    Base(DRIVE_TYPE_SSD_SATA, "SH9MST6D16GJSI01", "");
+    Expect(AddAttr(199, 100, 10), "smartmod199 slot");
+    Run();
+    ExpectRank(199, ATTR_EV_RANK, (int)HEALTH_STATUS_CAUTION, "smartmod 199 local");
+    ExpectInt(g.nCrcErrors, 10, "smartmod 199 count");
+    ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_GOOD, "smartmod 199 media");
+    ExpectInt((int)g.eInterface, (int)HEALTH_STATUS_CAUTION, "smartmod 199 iface");
+    /* Confirmed CRC on a clean medium raises the headline to Caution.
+     * That ceiling is the 1.7.23 rule. */
+    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_CAUTION, "smartmod 199 headline");
+    CaseEnd("smartmod-199", before);
+}
+
+/* Packed presets are not one 48-bit count. A huge raw24/raw32 value
+ * stays unscored. A plain raw48 name on the same family is only Risk. */
+static void TestPackedName(void)
+{
+    int before = g_fail;
+    Base(DRIVE_TYPE_SSD_SATA, "ZZPACKPROBE", "1.0");
+    Expect(AddAttr(160, 100, 0x0100000005ULL), "pack slot 160");
+    Expect(AddAttr(161, 100, 0x0005002AULL), "pack slot 161");
+    Expect(AddAttr(218, 100, 0x0100000078ULL), "pack slot 218");
+    Run();
+    ExpectStr(g.szModelFamily, "Packed Name Probe", "pack family");
+    ExpectSem(160, PROF_SEM_MEDIA, PROF_ENC_PACKED, "pack 160");
+    ExpectSem(161, PROF_SEM_MEDIA, PROF_ENC_PACKED, "pack 161");
+    ExpectSem(218, PROF_SEM_INTERFACE, PROF_ENC_PACKED, "pack 218");
+    ExpectDecodeReject(PROF_ENC_PACKED, 0x0100000005ULL, "pack decode");
+    ExpectRank(160, ATTR_EV_SKIP, 0, "pack 160 skipped");
+    ExpectRank(161, ATTR_EV_SKIP, 0, "pack 161 skipped");
+    ExpectRank(218, ATTR_EV_SKIP, 0, "pack 218 skipped");
+    ExpectInt(g.nCrcErrors, -1, "pack crc empty");
+    ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_GOOD, "pack media");
+    ExpectInt((int)g.eInterface, (int)HEALTH_STATUS_GOOD, "pack iface");
+    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_GOOD, "pack headline");
+    CaseEnd("pack", before);
+
+    before = g_fail;
+    Base(DRIVE_TYPE_SSD_SATA, "ZZPACKPROBE", "1.0");
+    Expect(AddAttr(170, 100, 5), "pack170 slot");
+    Run();
+    ExpectSem(170, PROF_SEM_MEDIA, PROF_ENC_COUNTER, "pack 170");
+    ExpectRank(170, ATTR_EV_RANK, (int)HEALTH_STATUS_OBSERVE, "pack 170 risk");
+    ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_OBSERVE, "pack170 media");
+    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_OBSERVE, "pack170 headline");
+    Expect(g.eReliability != HEALTH_STATUS_CAUTION, "pack170 not caution");
+    CaseEnd("pack-170", before);
+}
+
+/* A 44-character -v name is stored as 43. The HDD/SSD flag after the
+ * comma still applies. 162 is a short HDD name on the same row. */
+static void TestLongPresetName(void)
+{
+    int before = g_fail;
+    Base(DRIVE_TYPE_HDD, "ZZLONGNAME", "");
+    Run();
+    ExpectStr(g.szModelFamily, "Long Name Probe", "long family");
+    Expect(DbHas(160), "long hdd keeps hdd name");
+    Expect(!DbHas(161), "long hdd drops ssd name");
+    Expect(DbHas(162), "long hdd keeps short name");
+    ExpectStr(DbName(160),
+              "ABCDEFGHIJ ABCDEFGHIJ ABCDEFGHIJ ABCDEFGHIJ",
+              "long hdd name cut");
+    CaseEnd("long-hdd", before);
+
+    before = g_fail;
+    Base(DRIVE_TYPE_SSD_SATA, "ZZLONGNAME", "");
+    Run();
+    Expect(!DbHas(160), "long ssd drops hdd name");
+    Expect(DbHas(161), "long ssd keeps ssd name");
+    Expect(!DbHas(162), "long ssd drops short hdd name");
+    ExpectStr(DbName(161),
+              "ABCDEFGHIJ ABCDEFGHIJ ABCDEFGHIJ ABCDEFGHIJ",
+              "long ssd name cut");
+    CaseEnd("long-ssd", before);
+}
+
+/* Must run before any other DriveDbApply. Two threads enter compile
+ * together. Each keeps its own DRIVE_INFO. The families are checked
+ * after both threads return. */
+static DRIVE_INFO gOnceA, gOnceB;
+
+struct OnceJob {
+    DRIVE_INFO* info;
+    DRIVE_TYPE type;
+    const char* model;
+    const char* fw;
+};
+
+static DWORD WINAPI OnceThread(LPVOID p)
+{
+    OnceJob* job = (OnceJob*)p;
+    memset(job->info, 0, sizeof(*job->info));
+    job->info->eType = job->type;
+    lstrcpynA(job->info->szModel, job->model, (int)sizeof(job->info->szModel));
+    lstrcpynA(job->info->szFirmware, job->fw, (int)sizeof(job->info->szFirmware));
+    DriveDbApply(job->info);
+    return 0;
+}
+
+static void TestCompileOnce(void)
+{
+    OnceJob a, b;
+    HANDLE th[2];
+    DWORD wr;
+    a.info = &gOnceA;
+    a.type = DRIVE_TYPE_SSD_SATA;
+    a.model = "Samsung SSD 870 EVO 1TB";
+    a.fw = "SVT02B6Q";
+    b.info = &gOnceB;
+    b.type = DRIVE_TYPE_HDD;
+    b.model = "ST1000DM003-1CH162";
+    b.fw = "CC47";
+    th[0] = CreateThread(NULL, 0, OnceThread, &a, 0, NULL);
+    th[1] = CreateThread(NULL, 0, OnceThread, &b, 0, NULL);
+    Expect(th[0] != NULL && th[1] != NULL, "once threads");
+    if (th[0] && th[1]) {
+        wr = WaitForMultipleObjects(2, th, TRUE, 60000);
+        Expect((int)wr == (int)WAIT_OBJECT_0, "once wait");
+    }
+    if (th[0]) CloseHandle(th[0]);
+    if (th[1]) CloseHandle(th[1]);
+    ExpectStr(gOnceA.szModelFamily, "Samsung based SSDs", "once samsung");
+    ExpectStr(gOnceB.szModelFamily, "Seagate Barracuda 7200.14 (AF)", "once barra");
+}
+
 int main(void)
 {
     printf("drivedb_test\n");
     fflush(stdout);
+    TestCompileOnce();
     TestSu800();
     TestAs350();
     TestA400Phison();
@@ -436,6 +791,11 @@ int main(void)
     TestSamsung870();
     TestBarracuda();
     TestUsbSkip();
+    TestDriveDbTie();
+    TestRowRank();
+    TestSmartModular();
+    TestPackedName();
+    TestLongPresetName();
     if (g_fail) {
         fprintf(stderr, "FAILED %d of %d checks\n", g_fail, g_check);
         return 1;

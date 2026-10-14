@@ -7,10 +7,16 @@
 #define IDR_VERSION     1
 
 #define DRIVEMONITOR_VERSION         "2.0"
-#define DRIVEMONITOR_BUILD           17
-#define DRIVEMONITOR_BUILD_STR       "17"
-#define DRIVEMONITOR_FILEVERSION     2,0,0,17
-#define DRIVEMONITOR_FILEVERSION_STR "2.0.17"
+#define DRIVEMONITOR_BUILD           20
+#define DRIVEMONITOR_BUILD_STR       "20"
+#define DRIVEMONITOR_FILEVERSION     2,0,0,20
+#define DRIVEMONITOR_FILEVERSION_STR "2.0.20"
+
+/* Tag that holds the source of the published GPL exe.
+ * 1.7.23 is the stable release and is not this tag.
+ * Change this when a newer GPL exe is published, to that tag. */
+#define DRIVEMONITOR_SOURCE_TAG "2.0.20-beta"
+#define DRIVEMONITOR_SOURCE_URL "https://github.com/chuikoff/DriveMonitor/tree/" DRIVEMONITOR_SOURCE_TAG
 
 #define IDC_ADAPTER_LABEL   1027
 #define IDC_ADAPTER_STATIC  1028

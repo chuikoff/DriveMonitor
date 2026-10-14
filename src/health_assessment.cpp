@@ -4,7 +4,12 @@
 /* ============================================================
  * Health: state + confidence + evidence
  *
- * Overall eHealthStatus is worst-of evidence (GOOD/CAUTION/BAD/UNKNOWN).
+ * eHealthStatus starts from the media channel and keeps that rank.
+ * A confirmed side axis at CAUTION or worse raises a clean medium
+ * at most to CAUTION. That is the 1.7.23 agreement: CRC, command
+ * timeouts, spin retries, temperature, HDD mechanics, and SSD wear.
+ * OBSERVE on a side axis stays on its row. A drivedb CRC name is
+ * only Risk, so it does not raise the headline.
  * nHealthPercent is SECONDARY estimated remaining life only (endurance),
  * never a fake % from worst/thresh or raw*N penalties.
  * nConfidence is completeness of evidence, not "how healthy".
@@ -281,17 +286,6 @@ static TEMP_BAND TempBandFromNvme(int nC, USHORT wWarnK, USHORT wCritK)
     return TEMP_BAND_NORMAL;
 }
 
-static DRIVE_HEALTH_STATUS TempStatusFromBand(TEMP_BAND eBand)
-{
-    switch (eBand) {
-    case TEMP_BAND_NORMAL:   return HEALTH_STATUS_GOOD;
-    case TEMP_BAND_ELEVATED: return HEALTH_STATUS_CAUTION;
-    case TEMP_BAND_HIGH:     return HEALTH_STATUS_CAUTION;
-    case TEMP_BAND_CRITICAL: return HEALTH_STATUS_BAD;
-    default:                 return HEALTH_STATUS_UNKNOWN;
-    }
-}
-
 static void FormatUintGrouped(unsigned long n, char* buf, int nBuf)
 {
     char tmp[32];
@@ -428,21 +422,6 @@ static const char* QualityNameRu(NORM_QUALITY q, BOOL bRaw)
     case NORM_QUALITY_HIGH:   return TN("ВЫСОКОЕ", "HIGH");
     default:                  return Tr(STR_POH_NONE);
     }
-}
-
-static int Utf8DispWidth(const char* s)
-{
-    int w = 0;
-    const unsigned char* p = (const unsigned char*)s;
-    if (!p) return 0;
-    while (*p) {
-        if (*p < 0x80) { p++; w++; }
-        else if ((*p & 0xE0) == 0xC0) { p += 2; w++; }
-        else if ((*p & 0xF0) == 0xE0) { p += 3; w++; }
-        else if ((*p & 0xF8) == 0xF0) { p += 4; w++; }
-        else p++;
-    }
-    return w;
 }
 
 static void PadUtf8(char* dst, int nDst, const char* s, int width)
@@ -590,34 +569,24 @@ static unsigned HddRateErrs(const DRIVE_INFO* p, BYTE id)
 }
 
 typedef struct {
-    BOOL bId1;
     BOOL bId7;
     BOOL bId193Val;
     BOOL bId193Raw;
-    BOOL bId195;
 } HDD_WEAR;
 
 static void HddWearFlags(const DRIVE_INFO* p, HDD_WEAR* w)
 {
-    int v1, w1, v7, w7, v193, v195, w195;
+    int v7, w7, v193;
     if (!w) return;
     ZeroMemory(w, sizeof(*w));
     if (!p) return;
-    v1   = AttrValueOrNeg1(p, 0x01);
-    w1   = AttrWorstOrNeg1(p, 0x01);
     v7   = AttrValueOrNeg1(p, 0x07);
     w7   = AttrWorstOrNeg1(p, 0x07);
     v193 = AttrValueOrNeg1(p, 0xC1);
-    v195 = AttrValueOrNeg1(p, 0xC3);
-    w195 = AttrWorstOrNeg1(p, 0xC3);
-    w->bId1      = HddRateNearThresh(v1, w1, FindThreshold(p, 0x01)) ||
-                   HddRateErrs(p, 0x01) > 0;
     w->bId7      = HddRateNearThresh(v7, w7, FindThreshold(p, 0x07)) ||
                    HddRateErrs(p, 0x07) > 0;
     w->bId193Val = (v193 >= 0 && v193 <= 15);
     w->bId193Raw = (p->nLoadUnload >= 300000);
-    w->bId195    = HddRateNearThresh(v195, w195, FindThreshold(p, 0xC3)) ||
-                   HddRateErrs(p, 0xC3) > 0;
 }
 
 void FormatHddObservePrompt(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen)
@@ -716,9 +685,11 @@ void FormatSsdCautionPrompt(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen)
         "There are signs that need watching. Click the status for details."));
 }
 
-/* A side axis may raise the HDD headline at most to CAUTION.
- * OBSERVE (a G-Sense count on a clean surface, a warm drive) stays
- * on its own row. BAD on CRC or temperature does not become "drive dying". */
+/* Confirmed side axis into the headline. CAUTION or worse becomes
+ * CAUTION. OBSERVE stays off the headline. Interface BAD (CRC >= 100)
+ * is included: the row can say BAD, the headline stops at CAUTION.
+ * The same ceiling has been in force since 1.7.23. A name-only CRC
+ * hint never reaches CAUTION, so it does not take this path. */
 static DRIVE_HEALTH_STATUS SideRaisesHeadline(DRIVE_HEALTH_STATUS e)
 {
     if (HealthRank(e) >= HealthRank(HEALTH_STATUS_CAUTION))
@@ -842,7 +813,9 @@ static void AssessHddHealth(DRIVE_INFO* pInfo)
     else
         pInfo->eMechanics = HEALTH_STATUS_UNKNOWN;
 
-    /* Media as-is. Side axes raise the headline at most to CAUTION. */
+    /* Media as-is. Confirmed interface (CRC from 1, timeouts, spin
+     * retries), mechanics, and temperature raise a clean surface
+     * at most to CAUTION. Same rule as 1.7.23. */
     pInfo->eHealthStatus = pInfo->eReliability;
     pInfo->eHealthStatus = WorstHealth(pInfo->eHealthStatus,
                                        SideRaisesHeadline(pInfo->eMechanics));
@@ -867,6 +840,15 @@ static DRIVE_HEALTH_STATUS WearStatusFromRemaining(int nLeft)
     if (nLeft <= 10) return HEALTH_STATUS_CAUTION;
     if (nLeft <= 20) return HEALTH_STATUS_OBSERVE;
     return HEALTH_STATUS_GOOD;
+}
+
+int WearBadgeStatus(int nLeft)
+{
+    int e = (int)WearStatusFromRemaining(nLeft);
+    if (e == HEALTH_STATUS_BAD || e == HEALTH_STATUS_WARNING ||
+        e == HEALTH_STATUS_CRITICAL)
+        return HEALTH_STATUS_CAUTION;
+    return e;
 }
 
 /* SSD/NVMe: media / wear / interface / temperature. No G-Sense channel. */
@@ -929,8 +911,9 @@ static void AssessSsdHealth(DRIVE_INFO* pInfo)
 
     pInfo->eMechanics = HEALTH_STATUS_UNKNOWN;
 
-    /* Media as-is. Wear, temperature, and (SATA only) interface raise the
-     * headline at most to CAUTION. OBSERVE wear (11–20% left) stays on its axis. */
+    /* Media as-is. Wear, temperature, and (SATA only) confirmed interface
+     * raise a clean NAND at most to CAUTION. OBSERVE wear (11–20% left)
+     * stays on its axis. A CRC name hint is Risk and does not raise. */
     pInfo->eHealthStatus = pInfo->eReliability;
     pInfo->eHealthStatus = WorstHealth(pInfo->eHealthStatus,
                                        SideRaisesHeadline(pInfo->eWear));
@@ -1023,21 +1006,74 @@ static int* EvidenceSlot(DRIVE_INFO* p, int slot)
     }
 }
 
+/* WORSE media/interface rule whose scope matches this drive. */
+static int ChannelScopeOk(const DRIVE_INFO* p, const PROF_HEALTH* h)
+{
+    if (!p || !h || h->rule != PROF_RULE_WORSE) return 0;
+    if (h->sem != PROF_SEM_MEDIA && h->sem != PROF_SEM_INTERFACE) return 0;
+    if (h->scope == PROF_SCOPE_HDD && !DriveIsHdd(p)) return 0;
+    if (h->scope == PROF_SCOPE_SSD && DriveIsHdd(p)) return 0;
+    return 1;
+}
+
+static int OtherCrcDecoded(const DRIVE_INFO* p, BYTE selfId)
+{
+    int i;
+    if (!p) return 0;
+    for (i = 0; i < 30; i++) {
+        const SMART_ATTRIBUTE* b = &p->attrData.stAttributes[i];
+        PROF_HEALTH h;
+        int count = 0;
+        if (b->bAttrID == 0 || b->bAttrID == selfId) continue;
+        if (!ProfileHealthRule(p, b->bAttrID, &h)) continue;
+        if (h.fallback || h.slot != PROF_SLOT_CRC) continue;
+        if (!ChannelScopeOk(p, &h)) continue;
+        if (!EvidenceCount(p, b, h.enc, &count)) continue;
+        return 1;
+    }
+    return 0;
+}
+
+int AttrEvidenceRank(const DRIVE_INFO* p, const SMART_ATTRIBUTE* a, int* rank)
+{
+    PROF_HEALTH h;
+    int count = 0;
+    if (rank) *rank = (int)HEALTH_STATUS_UNKNOWN;
+    if (!p || !a || a->bAttrID == 0) return ATTR_EV_NONE;
+    if (!ProfileHealthRule(p, a->bAttrID, &h)) {
+        if (ProfileListsAttr(p, a->bAttrID)) return ATTR_EV_SKIP;
+        return ATTR_EV_NONE;
+    }
+    if (h.sem != PROF_SEM_MEDIA && h.sem != PROF_SEM_INTERFACE)
+        return ATTR_EV_NONE;
+    if (h.rule != PROF_RULE_WORSE) return ATTR_EV_SKIP;
+    if (!ChannelScopeOk(p, &h)) return ATTR_EV_SKIP;
+    if (h.fallback && h.slot == PROF_SLOT_CRC &&
+        OtherCrcDecoded(p, a->bAttrID))
+        return ATTR_EV_SKIP;
+    if (!EvidenceCount(p, a, h.enc, &count)) return ATTR_EV_SKIP;
+    if (rank)
+        *rank = ProfileCountRank(count, h.observe, h.caution, h.bad,
+                                 h.badHdd, DriveIsHdd(p) ? 1 : 0);
+    return ATTR_EV_RANK;
+}
+
 static void ApplyOneEvidence(DRIVE_INFO* p, const SMART_ATTRIBUTE* a,
                              const PROF_HEALTH* h, int* crcSeen)
 {
     int count = 0;
     int rank;
     int* dest;
-    if (!h || h->rule != PROF_RULE_WORSE) return;
-    if (h->sem != PROF_SEM_MEDIA && h->sem != PROF_SEM_INTERFACE) return;
-    if (h->scope == PROF_SCOPE_HDD && !DriveIsHdd(p)) return;
-    if (h->scope == PROF_SCOPE_SSD && DriveIsHdd(p)) return;
+    if (!ChannelScopeOk(p, h)) return;
     if (h->fallback && h->slot == PROF_SLOT_CRC && crcSeen && *crcSeen) return;
     if (!EvidenceCount(p, a, h->enc, &count)) return;
     if (h->slot == PROF_SLOT_CRC && crcSeen) *crcSeen = 1;
-    dest = EvidenceSlot(p, h->slot);
-    if (dest && *dest < 0) *dest = count;
+    /* A drivedb name hint is observe-only. It must not replace the
+     * confirmed CRC total that the lecture and the matrix read. */
+    if (!(h->fallback && h->caution <= 0 && h->bad <= 0 && h->badHdd <= 0)) {
+        dest = EvidenceSlot(p, h->slot);
+        if (dest && *dest < 0) *dest = count;
+    }
     rank = ProfileCountRank(count, h->observe, h->caution, h->bad,
                             h->badHdd, DriveIsHdd(p) ? 1 : 0);
     if (h->sem == PROF_SEM_MEDIA)
@@ -1049,7 +1085,8 @@ static void ApplyOneEvidence(DRIVE_INFO* p, const SMART_ATTRIBUTE* a,
 }
 
 /* Walk every attribute once. The channel rank is the worst profile rule.
- * A drivedb CRC name fills the CRC slot only when no earlier rule did. */
+ * A drivedb CRC name is only a hint: it yields when attribute 199 already
+ * filled the slot, and it does not publish its own total. */
 static void CollectChannelEvidence(DRIVE_INFO* p)
 {
     const SMART_ATTRIBUTE* laterA[30];
@@ -1489,14 +1526,6 @@ static void LectureAddUnknownIdList(char* buf, int nBuf, const DRIVE_INFO* pInfo
 }
 
 
-static const char* ConfidenceBandName(int n)
-{
-    if (n >= 80) return "ВЫСОКАЯ";
-    if (n >= 55) return "СРЕДНЯЯ";
-    if (n > 0)   return "НИЗКАЯ";
-    return "нет данных";
-}
-
 static void LectureAddFact(char* buf, int nBuf, const char* name, const char* value)
 {
     char left[48];
@@ -1525,6 +1554,20 @@ static const char* HealthStatusMark(DRIVE_HEALTH_STATUS e)
     }
 }
 
+/* Upstream stores the heise warning in English. Translate it here so a
+ * language change does not depend on a rescan. Other notes stay as stored. */
+static const char* FamilyWarnText(const DRIVE_INFO* p)
+{
+    if (!p || !p->szDriveDbWarn[0]) return "";
+    if (strstr(p->szDriveDbWarn, "heise.de/-10800960"))
+        return TN(
+            "у старых WD SMR бывали серьёзные проблемы с записью. "
+            "https://www.heise.de/-10800960.html",
+            "Older WD SMR drives had serious write problems. "
+            "https://www.heise.de/-10800960.html");
+    return p->szDriveDbWarn;
+}
+
 static void LectureAddDualStatus(char* szBuf, int nBufLen, const DRIVE_INFO* pInfo)
 {
     LectureAddF(szBuf, nBufLen, TN("Диск: %s%s\r\nОценка: %s%s\r\n\r\n",
@@ -1549,11 +1592,18 @@ static void LectureAddDualStatus(char* szBuf, int nBufLen, const DRIVE_INFO* pIn
         LectureAddF(szBuf, nBufLen, TN("Семейство: %s\r\n\r\n",
                                        "Family: %s\r\n\r\n"),
                     pInfo->szModelFamily);
+    if (pInfo->szDriveDbTie[0])
+        LectureAddF(szBuf, nBufLen, TN(
+            "Та же оценка базы у семейства «%s». Подпись взята из более ранней строки. "
+            "Атрибут, в котором эти строки расходятся, не применяется.\r\n\r\n",
+            "The same database score also matches \"%s\". The label is the earlier row. "
+            "An attribute those rows disagree on is not applied.\r\n\r\n"),
+            pInfo->szDriveDbTie);
     if (pInfo->szDriveDbWarn[0])
         LectureAddF(szBuf, nBufLen, TN(
             "Замечание к семейству, не оценка этого диска: %s\r\n\r\n",
             "Family note, not this disk's verdict: %s\r\n\r\n"),
-                    pInfo->szDriveDbWarn);
+                    FamilyWarnText(pInfo));
 }
 
 static BOOL LectureAddSmartDataError(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen)
@@ -1619,27 +1669,35 @@ static void FormatHddLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
         {
             BOOL bSaid = FALSE;
             if (pInfo->bPrefailPast) {
-                LectureAdd(szBuf, nBufLen,
+                LectureAdd(szBuf, nBufLen, TN(
                     "Prefail-атрибут раньше опускался до порога. "
-                    "Сейчас значение снова выше порога.\r\n");
+                    "Сейчас значение снова выше порога.\r\n",
+                    "A prefail attribute reached its threshold before. "
+                    "The value is back above the threshold.\r\n"));
                 bSaid = TRUE;
             }
             if (pInfo->bUsageFailed) {
-                LectureAdd(szBuf, nBufLen,
-                    "Атрибут износа (old-age) на пороге. Это износ, не прогноз отказа.\r\n");
+                LectureAdd(szBuf, nBufLen, TN(
+                    "Атрибут износа (old-age) на пороге. Это износ, не прогноз отказа.\r\n",
+                    "An old-age attribute is at its threshold. That is wear, not a failure forecast.\r\n"));
                 bSaid = TRUE;
             }
             if (!bSaid)
-                LectureAdd(szBuf, nBufLen,
-                    "Есть факторы риска, повреждение поверхности не подтверждено.\r\n");
+                LectureAdd(szBuf, nBufLen, TN(
+                    "Есть факторы риска, повреждение поверхности не подтверждено.\r\n",
+                    "There are risk factors. Media damage is not confirmed.\r\n"));
             LectureAdd(szBuf, nBufLen, "\r\n");
         }
-        LectureAdd(szBuf, nBufLen, "Признаков повреждения поверхности:\r\n");
-        LectureAddF(szBuf, nBufLen, "  %s Переназначенные: %d\r\n",
+        LectureAdd(szBuf, nBufLen, TN("Признаков повреждения поверхности:\r\n",
+                                      "Media-damage signs:\r\n"));
+        LectureAddF(szBuf, nBufLen, TN("  %s Переназначенные: %d\r\n",
+                                       "  %s Reallocated: %d\r\n"),
                     (r <= 0) ? "\xE2\x9C\x93" : "\xE2\x9C\x97", r < 0 ? 0 : r);
-        LectureAddF(szBuf, nBufLen, "  %s Ожидающие: %d\r\n",
+        LectureAddF(szBuf, nBufLen, TN("  %s Ожидающие: %d\r\n",
+                                       "  %s Pending: %d\r\n"),
                     (pend <= 0) ? "\xE2\x9C\x93" : "\xE2\x9C\x97", pend < 0 ? 0 : pend);
-        LectureAddF(szBuf, nBufLen, "  %s Неисправимые: %d\r\n\r\n",
+        LectureAddF(szBuf, nBufLen, TN("  %s Неисправимые: %d\r\n\r\n",
+                                       "  %s Uncorrectable: %d\r\n\r\n"),
                     (u <= 0) ? "\xE2\x9C\x93" : "\xE2\x9C\x97", u < 0 ? 0 : u);
         LectureAdd(szBuf, nBufLen, TN("Рекомендация: Следить за динамикой SMART.\r\n",
                                       "Recommendation: Watch SMART over time.\r\n"));
@@ -1651,11 +1709,14 @@ static void FormatHddLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
                 "Есть реальные признаки деградации носителя.\r\n\r\n",
                 "There are real signs of media degradation.\r\n\r\n"));
             if (pend > 0)
-                LectureAddF(szBuf, nBufLen, "Ожидающие сектора: %d\r\n", pend);
+                LectureAddF(szBuf, nBufLen, TN("Ожидающие сектора: %d\r\n",
+                                               "Pending sectors: %d\r\n"), pend);
             if (r > 0)
-                LectureAddF(szBuf, nBufLen, "Переназначенные сектора: %d\r\n", r);
+                LectureAddF(szBuf, nBufLen, TN("Переназначенные сектора: %d\r\n",
+                                               "Reallocated sectors: %d\r\n"), r);
             if (pInfo->nRemapEvents > 0)
-                LectureAddF(szBuf, nBufLen, "События переназначения: %d\r\n",
+                LectureAddF(szBuf, nBufLen, TN("События переназначения: %d\r\n",
+                                               "Reallocation events: %d\r\n"),
                             pInfo->nRemapEvents);
             LectureAdd(szBuf, nBufLen,
                 TN("\r\nРекомендация: Держать резервную копию и следить за SMART.\r\n",
@@ -1807,9 +1868,11 @@ static void FormatSsdLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
             "Критических проблем не обнаружено.\r\n",
             "No critical problems found.\r\n"));
         if (pInfo->nEndurancePercent >= 0 && pInfo->nEndurancePercent <= 20)
-            LectureAddF(szBuf, nBufLen,
+            LectureAddF(szBuf, nBufLen, TN(
                 "Носитель, интерфейс и температура в норме. "
                 "Остаток ресурса %d%% — износ NAND, не здоровье.\r\n",
+                "Media, interface and temperature are OK. "
+                "Life remaining %d%% is NAND wear, not health.\r\n"),
                 pInfo->nEndurancePercent);
         else
             LectureAdd(szBuf, nBufLen,
@@ -1819,18 +1882,22 @@ static void FormatSsdLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
     case HEALTH_STATUS_OBSERVE:
         LectureAdd(szBuf, nBufLen, TN("Причина:\r\n", "Reason:\r\n"));
         if (pInfo->eWear == HEALTH_STATUS_OBSERVE && pInfo->nEndurancePercent >= 0)
-            LectureAddF(szBuf, nBufLen,
+            LectureAddF(szBuf, nBufLen, TN(
                 "Остаток ресурса %d%%. Это ещё не отказ, но запас NAND снижается.\r\n",
+                "Life remaining %d%%. Not a failure yet, but the NAND reserve is falling.\r\n"),
                 pInfo->nEndurancePercent);
         else if (pInfo->eTempStatus == HEALTH_STATUS_OBSERVE ||
                  pInfo->eTempStatus == HEALTH_STATUS_CAUTION)
-            LectureAdd(szBuf, nBufLen,
-                "Повышенная температура. Повреждение носителя не подтверждено.\r\n");
+            LectureAdd(szBuf, nBufLen, TN(
+                "Повышенная температура. Повреждение носителя не подтверждено.\r\n",
+                "Temperature is elevated. Media damage is not confirmed.\r\n"));
         else
-            LectureAdd(szBuf, nBufLen,
-                "Есть факторы риска, повреждение носителя не подтверждено.\r\n");
-        LectureAdd(szBuf, nBufLen,
-            "\r\nРекомендация: Следить за SMART и держать резервную копию.\r\n");
+            LectureAdd(szBuf, nBufLen, TN(
+                "Есть факторы риска, повреждение носителя не подтверждено.\r\n",
+                "There are risk factors. Media damage is not confirmed.\r\n"));
+        LectureAdd(szBuf, nBufLen, TN(
+            "\r\nРекомендация: Следить за SMART и держать резервную копию.\r\n",
+            "\r\nRecommendation: Watch SMART and keep a backup.\r\n"));
         break;
     case HEALTH_STATUS_CAUTION:
         LectureAdd(szBuf, nBufLen, TN("Причина:\r\n", "Reason:\r\n"));
@@ -1879,23 +1946,29 @@ static void FormatSsdLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
             break;
         }
         if (pInfo->nEndurancePercent >= 0 && pInfo->nEndurancePercent <= 5)
-            LectureAddF(szBuf, nBufLen,
+            LectureAddF(szBuf, nBufLen, TN(
                 "Остаток ресурса %d%%. Запас NAND почти исчерпан — "
                 "это износ, не ошибка носителя.\r\n",
+                "Life remaining %d%%. The NAND reserve is nearly exhausted — "
+                "that is wear, not a media error.\r\n"),
                 pInfo->nEndurancePercent);
         else if (pInfo->eWear == HEALTH_STATUS_CAUTION &&
                  pInfo->nEndurancePercent >= 0)
-            LectureAddF(szBuf, nBufLen,
-                "Остаток ресурса %d%%.\r\n", pInfo->nEndurancePercent);
+            LectureAddF(szBuf, nBufLen, TN("Остаток ресурса %d%%.\r\n",
+                                           "Life remaining %d%%.\r\n"),
+                        pInfo->nEndurancePercent);
         if (pInfo->nReallocated > 0)
-            LectureAddF(szBuf, nBufLen, "Переназначенные сектора: %d\r\n", pInfo->nReallocated);
+            LectureAddF(szBuf, nBufLen, TN("Переназначенные сектора: %d\r\n",
+                                           "Reallocated sectors: %d\r\n"),
+                        pInfo->nReallocated);
         if (pInfo->nPendingSectors > 0)
             LectureAddF(szBuf, nBufLen,
                 TN("Ожидающие сектора: %d. Могут уменьшиться, если сектор потом прочитался.\r\n",
                    "Pending sectors: %d. The count can drop if a sector reads later.\r\n"),
                 pInfo->nPendingSectors);
         if (pInfo->qwNVMeMediaErrors > 0)
-            LectureAddF(szBuf, nBufLen, "Ошибки носителя NVMe: %llu\r\n",
+            LectureAddF(szBuf, nBufLen, TN("Ошибки носителя NVMe: %llu\r\n",
+                                           "NVMe media errors: %llu\r\n"),
                         (unsigned long long)pInfo->qwNVMeMediaErrors);
         LectureAdd(szBuf, nBufLen,
             TN("\r\nРекомендация: Держать резервную копию и следить за SMART.\r\n",
@@ -2150,9 +2223,11 @@ void FormatHealthLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen)
                     "but attribute 187 is %d. That is a separate count, not proof the shocks damaged the surface.\r\n"),
                     n187o);
             else
-                LectureAdd(szBuf, nBufLen,
+                LectureAdd(szBuf, nBufLen, TN(
                     "G-Sense фиксирует события, связанные с ударом/вибрацией. "
-                    "Признаков повреждения поверхности на текущем SMART-снимке нет: 5/196/197/198 = 0.\r\n");
+                    "Признаков повреждения поверхности на текущем SMART-снимке нет: 5/196/197/198 = 0.\r\n",
+                    "G-Sense records shock or vibration. "
+                    "This SMART snapshot shows no surface damage: 5/196/197/198 = 0.\r\n"));
         }
     }
 
@@ -2388,7 +2463,6 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
         char szSpare[32], szMedia[32], szLife[32];
         int nSpare   = (int)pInfo->nvmeHealth.AvailableSpare;
         int nSpareTh = (int)pInfo->nvmeHealth.AvailableSpareThreshold;
-        int nUsed    = (int)pInfo->nvmeHealth.PercentageUsed;
 
         FormatNvmeCritWarnBits(cw, szCW, (int)sizeof(szCW));
 
@@ -2502,7 +2576,9 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
             LectureAdd(szBuf, nBufLen, TN("  ✓ Переназначенные сектора: 0\r\n",
                                           "  ✓ Reallocated sectors: 0\r\n"));
         else if (pInfo->nReallocated > 0)
-            LectureAddF(szBuf, nBufLen, "  ✗ Переназначенные сектора: %d\r\n", pInfo->nReallocated);
+            LectureAddF(szBuf, nBufLen, TN("  ✗ Переназначенные сектора: %d\r\n",
+                                           "  ✗ Reallocated sectors: %d\r\n"),
+                        pInfo->nReallocated);
         if (pInfo->nPendingSectors == 0)
             LectureAdd(szBuf, nBufLen, TN("  ✓ Ожидающие сектора: 0\r\n",
                                           "  ✓ Pending sectors: 0\r\n"));
@@ -2515,12 +2591,16 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
             LectureAdd(szBuf, nBufLen, TN("  ✓ Неисправимые сектора: 0\r\n",
                                           "  ✓ Uncorrectable sectors: 0\r\n"));
         else if (pInfo->nUncorrectable > 0)
-            LectureAddF(szBuf, nBufLen, "  ✗ Неисправимые сектора: %d\r\n", pInfo->nUncorrectable);
+            LectureAddF(szBuf, nBufLen, TN("  ✗ Неисправимые сектора: %d\r\n",
+                                           "  ✗ Uncorrectable sectors: %d\r\n"),
+                        pInfo->nUncorrectable);
         if (pInfo->nRemapEvents == 0)
             LectureAdd(szBuf, nBufLen, TN("  ✓ События переназначения: 0\r\n",
                                           "  ✓ Reallocation events: 0\r\n"));
         else if (pInfo->nRemapEvents > 0)
-            LectureAddF(szBuf, nBufLen, "  ✗ События переназначения: %d\r\n", pInfo->nRemapEvents);
+            LectureAddF(szBuf, nBufLen, TN("  ✗ События переназначения: %d\r\n",
+                                           "  ✗ Reallocation events: %d\r\n"),
+                        pInfo->nRemapEvents);
         if (pInfo->nReallocated >= 0 && pInfo->nRemapEvents >= 0 &&
             (pInfo->nReallocated > 0 || pInfo->nRemapEvents > 0)) {
             if (pInfo->nRemapEvents > 0 && pInfo->nReallocated == 0)
@@ -2553,33 +2633,42 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
         {
             int n187 = AttrRawOrNeg1(pInfo, 0xBB);
             if (n187 == 0)
-                LectureAdd(szBuf, nBufLen, "  ✓ Неисправимые ошибки (187): 0\r\n");
+                LectureAdd(szBuf, nBufLen, TN("  ✓ Неисправимые ошибки (187): 0\r\n",
+                                              "  ✓ Uncorrectable errors (187): 0\r\n"));
             else if (n187 > 0)
-                LectureAddF(szBuf, nBufLen, "  ✗ Неисправимые ошибки (187): %d\r\n", n187);
+                LectureAddF(szBuf, nBufLen, TN("  ✗ Неисправимые ошибки (187): %d\r\n",
+                                               "  ✗ Uncorrectable errors (187): %d\r\n"),
+                            n187);
         }
         if (WriteErrorScored(pInfo))
-            LectureAddF(szBuf, nBufLen,
+            LectureAddF(szBuf, nBufLen, TN(
                 "  ✗ Частота ошибок записи (200): значение %d, худший %d\r\n",
+                "  ✗ Write error rate (200): value %d, worst %d\r\n"),
                 pInfo->nWriteErrorValue,
                 pInfo->nWriteErrorWorst >= 0 ? pInfo->nWriteErrorWorst : pInfo->nWriteErrorValue);
         if (pInfo->nEndurancePercent >= 0)
-            LectureAddF(szBuf, nBufLen,
+            LectureAddF(szBuf, nBufLen, TN(
                 "  %s Заявленный остаток ресурса: %d%%   (это износ NAND, не здоровье)\r\n",
+                "  %s Reported life remaining: %d%%   (NAND wear, not health)\r\n"),
                 pInfo->nEndurancePercent <= 20 ? "\xE2\x9A\xA0" : "\xE2\x9C\x93",
                 pInfo->nEndurancePercent);
 
         if (nUnknown > 0) {
-            LectureAdd(szBuf, nBufLen, "\r\nНаблюдение:\r\n");
-            LectureAdd(szBuf, nBufLen,
+            LectureAdd(szBuf, nBufLen, TN("\r\nНаблюдение:\r\n", "\r\nNote:\r\n"));
+            LectureAdd(szBuf, nBufLen, TN(
                 "  ⚠ Есть vendor-specific SMART-счётчики с нестандартными RAW. "
                 "Их нельзя надёжно трактовать без профиля контроллера. "
-                "Unknown ≠ Bad: неназванный атрибут не штрафует здоровье.\r\n");
+                "Unknown ≠ Bad: неназванный атрибут не штрафует здоровье.\r\n",
+                "  ⚠ Vendor-specific SMART counters use a non-standard RAW. "
+                "They cannot be read reliably without a controller profile. "
+                "Unknown is not Bad: an unnamed attribute does not lower health.\r\n"));
         }
 
         LectureAdd(szBuf, nBufLen, TN("\r\nКонтекст (не штраф):\r\n", "\r\nContext (not a penalty):\r\n"));
         if (pInfo->nCrcErrors > 0)
-            LectureAddF(szBuf, nBufLen,
+            LectureAddF(szBuf, nBufLen, TN(
                 "  CRC UltraDMA: %d. Кабель/мост/порт, не здоровье носителя.\r\n",
+                "  UltraDMA CRC: %d. Cable, bridge, or port, not media health.\r\n"),
                 pInfo->nCrcErrors);
         else if (pInfo->nCrcErrors == 0)
             LectureAdd(szBuf, nBufLen, TN("  CRC UltraDMA: 0. Контекст, не штраф.\r\n",
@@ -2618,9 +2707,11 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
             "  Power cycles: %lu. Context, not a penalty.\r\n"),
             (unsigned long)pInfo->dwPowerCycleCount);
         if (nC0 >= 0 && DriveTreatsC0AsPowerLoss(pInfo)) {
-            LectureAddF(szBuf, nBufLen,
+            LectureAddF(szBuf, nBufLen, TN(
                 "  Аварийные отключения питания (192): %d. Журнал питания, не штраф. "
                 "Находка только при росте счётчика, не по абсолютному числу.\r\n",
+                "  Unsafe power-offs (192): %d. A power log, not a penalty. "
+                "It matters when the counter rises, not as an absolute number.\r\n"),
                 nC0);
         } else if (nC0 >= 0) {
             LectureAddF(szBuf, nBufLen, TN(
@@ -2643,8 +2734,9 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
                     "  G-Sense / power-on: %d events ≈ %d per 1000 h (context, not a score).\r\n"),
                     pInfo->nGSenseEvents, pInfo->nGSensePerKh);
             if (pInfo->nMechRisk >= 0)
-                LectureAddF(szBuf, nBufLen,
+                LectureAddF(szBuf, nBufLen, TN(
                     "  Mechanical risk: %d/100 (рост и корреляция; абсолютный BF не входит).\r\n",
+                    "  Mechanical risk: %d/100 (rise and correlation; the absolute BF count is not included).\r\n"),
                     pInfo->nMechRisk);
             if (pInfo->nEmergencyRetract >= 0)
                 LectureAddF(szBuf, nBufLen, TN(
@@ -2699,25 +2791,34 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
                 const SMART_ATTRIBUTE* a195 = FindAttr(pInfo, 0xC3);
                 unsigned nErr = a195 ? SeagateRateErrs(a195->bRawValue) : 0;
                 DWORD nOps = a195 ? SeagateRateOps(a195->bRawValue) : 0;
-                LectureAddF(szBuf, nBufLen,
+                LectureAddF(szBuf, nBufLen, TN(
                     "  ID 195 (Hardware ECC Recovered): %u ошибок коррекции / %lu секторов. "
                     "На HDD это штатная коррекция ошибок чтения пластины (как ID 1), "
                     "не NAND и не неисправимые сектора. RAW без тренда не оценивается.\r\n",
+                    "  ID 195 (Hardware ECC Recovered): %u corrected errors / %lu sectors. "
+                    "On an HDD this is normal platter-read correction (like ID 1), "
+                    "not NAND and not uncorrectable sectors. RAW without a trend is not scored.\r\n"),
                     nErr, (unsigned long)nOps);
             } else if (DriveIsHdd(pInfo)) {
-                LectureAddF(szBuf, nBufLen,
+                LectureAddF(szBuf, nBufLen, TN(
                     "  ID 195 (Hardware ECC Recovered): RAW %d. "
                     "На HDD это штатная коррекция чтения пластины, не NAND. "
                     "Без профиля вендора абсолютный RAW не оценивается.\r\n",
+                    "  ID 195 (Hardware ECC Recovered): RAW %d. "
+                    "On an HDD this is normal platter-read correction, not NAND. "
+                    "Without a vendor profile the absolute RAW is not scored.\r\n"),
                     nC3);
             } else {
                 ATTR_DECODE dec195;
                 GetAttrDecode(0xC3, pInfo, &dec195);
                 if (dec195.eState == ATTR_DECODE_UNKNOWN)
-                    LectureAddF(szBuf, nBufLen,
+                    LectureAddF(szBuf, nBufLen, TN(
                         "  ID 195 RAW: %d. На SSD это vendor-specific счётчик, "
                         "не Hardware ECC Recovered HDD и не «механизм NAND» по умолчанию. "
                         "Без профиля не оценивается.\r\n",
+                        "  ID 195 RAW: %d. On an SSD this is a vendor-specific counter, "
+                        "not HDD Hardware ECC Recovered and not a NAND mechanism by default. "
+                        "It is not scored without a profile.\r\n"),
                         nC3);
             }
         }
@@ -2763,9 +2864,10 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
             if (notable) {
                 char sz193[48];
                 if (v193 >= 0 && pInfo->nLoadUnload >= 0)
-                    safe_snprintf(sz193, "знач. %d, %d цикл.", v193, pInfo->nLoadUnload);
+                    safe_snprintf(sz193, TN("знач. %d, %d цикл.", "value %d, %d cycles"),
+                                  v193, pInfo->nLoadUnload);
                 else if (v193 >= 0)
-                    safe_snprintf(sz193, "знач. %d", v193);
+                    safe_snprintf(sz193, TN("знач. %d", "value %d"), v193);
                 else
                     safe_snprintf(sz193, "%d", pInfo->nLoadUnload);
                 /* 225 (0xE1) is the load-cycle counter when 193 is absent.

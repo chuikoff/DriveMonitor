@@ -14,7 +14,8 @@ static DRIVE_INFO g;
 
 extern "C" void DriveDbApply(DRIVE_INFO* p)
 {
-    (void)p;
+    if (!p) return;
+    p->szDriveDbTie[0] = '\0';
 }
 
 /* When g_dbE7 is set, drivedb claims 231 is wear/counter.
@@ -488,6 +489,7 @@ static void TestDecodeAndUsb(void)
     Expect(ProfileDecodeRaw(PROF_ENC_MAXAVG, 0xFFFFFFFFULL, &out) == 1, "maxavg");
     Expect(ProfileDecodeRaw(PROF_ENC_MAXAVG, 0x100000000ULL, &out) == 0, "maxavg wide");
     Expect(ProfileDecodeRaw(PROF_ENC_PAIR, 0x100000000ULL, &out) == 0, "pair wide");
+    Expect(ProfileDecodeRaw(PROF_ENC_PACKED, 5, &out) == 0, "packed unsafe");
     Expect(ProfileDecodeRaw(PROF_ENC_PERCENT, 1, NULL) == 0, "decode NULL out");
 
     Expect(ProfileRawDelta(10, 15, &delta) == 1 && delta == 5, "raw delta");

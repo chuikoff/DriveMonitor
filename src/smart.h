@@ -546,6 +546,10 @@ typedef struct _DRIVE_INFO {
      * It does not set the controller and it does not set a health score. */
     char        szModelFamily[96];
     char        szDriveDbWarn[160];
+    /* Another drivedb row matched at the same score. The family above is
+     * still the earlier row. Empty when the score has a single winner.
+     * This is not szProfileConflict. */
+    char        szDriveDbTie[96];
     int         nDriveDbAttrs;
     DRIVEDB_ATTR driveDbAttr[DRIVEDB_ATTR_MAX];
 } DRIVE_INFO;
@@ -787,6 +791,7 @@ BOOL IsSmi225xFamily(const DRIVE_INFO* p);
 #define PROF_ENC_LO16    9   /* low 16 bits of RAW */
 #define PROF_ENC_REPORTED 10 /* reported-uncorrectable packing */
 #define PROF_ENC_REMAP   11  /* remap count; flying-hours copy is not a count */
+#define PROF_ENC_PACKED  12  /* raw24/raw32 or raw16(raw16): not one counter */
 
 /* How a decoded count moves a channel. The profile stores the rule.
  * The health engine does not keep a private threshold for an attribute id. */
@@ -907,12 +912,25 @@ int  ProfileWriteVolume(int sem, int enc);
 /* 1 when sem is ERASE and enc is a count or a max/avg pair. */
 int  ProfileEraseCount(int sem, int enc);
 /* Channel rule for id. FALSE when the attribute is unknown or contested.
- * MEDIA/INTERFACE with PROF_RULE_DEFAULT becomes caution at 1. */
+ * A local MEDIA/INTERFACE rule with PROF_RULE_DEFAULT becomes caution at 1.
+ * A meaning taken only from a drivedb name is at most Risk, and a packed
+ * RAW (raw24/raw32, raw16(raw16)) is not graded. */
 BOOL ProfileHealthRule(const DRIVE_INFO* p, BYTE id, PROF_HEALTH* out);
 /* Rank of one decoded count. badHdd applies only when isHdd is nonzero.
  * A threshold of 0 is off. count < 0 is UNKNOWN. */
 int  ProfileCountRank(int count, int observe, int caution, int bad,
                       int badHdd, int isHdd);
+/* One attribute, the same channel rule AssessDriveHealth uses.
+ * ATTR_EV_NONE: not a media or interface rule.
+ * ATTR_EV_SKIP: the rule does not grade this drive or this RAW.
+ * ATTR_EV_RANK: *rank is GOOD, OBSERVE, CAUTION, or BAD. */
+#define ATTR_EV_NONE 0
+#define ATTR_EV_SKIP (-1)
+#define ATTR_EV_RANK 1
+int  AttrEvidenceRank(const DRIVE_INFO* p, const SMART_ATTRIBUTE* a, int* rank);
+/* Wear row and wear axis. The channel may be BAD at 5% or less remaining.
+ * The headline and this badge stop at CAUTION. nLeft < 0 is UNKNOWN. */
+int  WearBadgeStatus(int nLeft);
 /* 1 when now >= prev. A backwards counter is not a delta. */
 int  ProfileRawDelta(unsigned __int64 prev, unsigned __int64 now, long long* delta);
 void FormatProfileDiagnostic(const DRIVE_INFO* p, char* buf, int nBuf);

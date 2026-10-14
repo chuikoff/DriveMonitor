@@ -5,8 +5,12 @@
  *   SPDX-License-Identifier: GPL-2.0-or-later
  *   VERSION: 8.0  https://www.smartmontools.org
  * POSIX extended regexes match the whole model and, when present, firmware.
- * Among rows that match, the highest feature score wins. drivedb.h order
- * breaks a tie only. A row whose family names a different controller is
+ * Among rows that match, the highest feature score wins. An equal score
+ * keeps the earlier row, as smartmontools keeps the first match. That
+ * other family is recorded and shown. An attribute both rows name with
+ * a different semantic or encoding is not applied. This is not the
+ * local-profile rule, which refuses a tier when score and specificity
+ * are both equal. A row whose family names a different controller is
  * skipped when this program already knows the controller. -d device-type
  * options are not sent. USB bridge rows are not probes. */
 #include "smart_internal.h"
@@ -26,6 +30,43 @@ struct drive_settings {
 
 static const drive_settings kDriveDb[] = {
 #include "../third_party/smartmontools/drivedb.h"
+    /* Not an upstream row. Two exact matches of ZZTIEPROBE, so a tie can
+     * be tested without editing drivedb.h. A real disk is not named that.
+     * The earlier row stays the label. 231 disagrees and is dropped.
+     * 5 agrees and stays. 232 exists only on the later row and is not
+     * imported. */
+    { "Tie Probe Earlier",
+      "ZZTIEPROBE",
+      "", "",
+      "-v 231,raw48,Lifetime_Left "
+      "-v 5,raw48,Reallocated_Sector_Ct "
+    },
+    { "Tie Probe Later",
+      "ZZTIEPROBE",
+      "", "",
+      "-v 231,raw48,Total_Erase_Count "
+      "-v 5,raw48,Reallocated_Sector_Ct "
+      "-v 232,raw48,Lifetime_Left "
+    },
+    /* Not an upstream row. A packed RAW must not be scored as one count,
+     * and a plain name hint must not become Caution from 1. */
+    { "Packed Name Probe",
+      "ZZPACKPROBE",
+      "", "",
+      "-v 160,raw24/raw32,Uncorrectable_Error_Cnt "
+      "-v 161,raw16(raw16),Reallocated_Block_Ct "
+      "-v 170,raw48,Uncorrectable_ECC_Cnt "
+      "-v 218,raw24/raw32,CRC_Error_Count "
+    },
+    /* Not an upstream row. A name longer than the 43-character store
+     * must still reach the HDD/SSD flag after the comma. */
+    { "Long Name Probe",
+      "ZZLONGNAME",
+      "", "",
+      "-v 160,raw48,ABCDEFGHIJ_ABCDEFGHIJ_ABCDEFGHIJ_ABCDEFGHIJX,HDD "
+      "-v 161,raw48,ABCDEFGHIJ_ABCDEFGHIJ_ABCDEFGHIJ_ABCDEFGHIJX,SSD "
+      "-v 162,raw48,Short_Name,HDD "
+    },
 };
 
 enum { DRIVEDB_N = (int)(sizeof(kDriveDb) / sizeof(kDriveDb[0])) };
@@ -40,7 +81,7 @@ struct DbRx {
 };
 
 static std::vector<DbRx> gRx;
-static bool gCompiled = false;
+static INIT_ONCE gDbOnce = INIT_ONCE_STATIC_INIT;
 
 static void TrimCopy(char* dst, int cap, const char* src)
 {
@@ -80,26 +121,42 @@ static bool CompilePat(std::regex* out, const char* pat)
     }
 }
 
-static void CompileDb(void)
+/* One compiler. Other callers wait until the table is published.
+ * FALSE leaves the once unmarked, so a later call tries again.
+ * A throw must not escape: InitOnce is a C callback. */
+static BOOL CALLBACK CompileDbOnce(PINIT_ONCE once, PVOID param, PVOID* ctx)
 {
     int i;
-    if (gCompiled) return;
-    gRx.resize((size_t)DRIVEDB_N);
-    for (i = 0; i < DRIVEDB_N; i++) {
-        DbRx* rx = &gRx[(size_t)i];
-        const drive_settings* e = &kDriveDb[i];
-        rx->tried = true;
-        rx->modelOk = false;
-        rx->fwAny = true;
-        rx->fwOk = false;
-        if (EntrySkipped(e)) continue;
-        rx->modelOk = CompilePat(&rx->model, e->modelregexp);
-        if (e->firmwareregexp && e->firmwareregexp[0]) {
-            rx->fwAny = false;
-            rx->fwOk = CompilePat(&rx->fw, e->firmwareregexp);
+    (void)once;
+    (void)param;
+    (void)ctx;
+    try {
+        gRx.resize((size_t)DRIVEDB_N);
+        for (i = 0; i < DRIVEDB_N; i++) {
+            DbRx* rx = &gRx[(size_t)i];
+            const drive_settings* e = &kDriveDb[i];
+            rx->tried = true;
+            rx->modelOk = false;
+            rx->fwAny = true;
+            rx->fwOk = false;
+            if (EntrySkipped(e)) continue;
+            rx->modelOk = CompilePat(&rx->model, e->modelregexp);
+            if (e->firmwareregexp && e->firmwareregexp[0]) {
+                rx->fwAny = false;
+                rx->fwOk = CompilePat(&rx->fw, e->firmwareregexp);
+            }
         }
+    } catch (...) {
+        return FALSE;
     }
-    gCompiled = true;
+    return TRUE;
+}
+
+/* TRUE when every row has been compiled, including rows that failed
+ * their own pattern and stay unmatched. */
+static bool CompileDb(void)
+{
+    return InitOnceExecuteOnce(&gDbOnce, CompileDbOnce, NULL, NULL) != FALSE;
 }
 
 static bool MatchEntry(int i, const char* model, const char* fw)
@@ -188,6 +245,21 @@ static bool HasCI(const char* low, const char* tok)
     return low && tok && strstr(low, tok) != NULL;
 }
 
+/* raw24/raw32, raw16(raw16), raw24(raw8): two fields in one RAW.
+ * A plain raw48/raw16 has neither marker. */
+static int RawFormatComposite(const char* fmt)
+{
+    if (!fmt || !fmt[0]) return 0;
+    return strchr(fmt, '(') != NULL || strchr(fmt, '/') != NULL;
+}
+
+/* A name can say "uncorrectable" while the preset stores two fields.
+ * That RAW is not a 48-bit count. */
+static int NameHintEnc(const char* fmt)
+{
+    return RawFormatComposite(fmt) ? PROF_ENC_PACKED : PROF_ENC_COUNTER;
+}
+
 static void MapAttr(const char* fmt, const char* name, int* sem, int* enc)
 {
     char low[44];
@@ -252,13 +324,13 @@ static void MapAttr(const char* fmt, const char* name, int* sem, int* enc)
     }
     if (HasCI(low, "crc") && !HasCI(low, "fail")) {
         *sem = PROF_SEM_INTERFACE;
-        *enc = PROF_ENC_COUNTER;
+        *enc = NameHintEnc(fmt);
         return;
     }
     if (HasCI(low, "realloc") || HasCI(low, "pending_sector") ||
         HasCI(low, "current_pending") || HasCI(low, "uncorrect")) {
         *sem = PROF_SEM_MEDIA;
-        *enc = PROF_ENC_COUNTER;
+        *enc = NameHintEnc(fmt);
         return;
     }
     /* A raw format is still a decode. Health scoring ignores sem NONE.
@@ -269,6 +341,8 @@ static void MapAttr(const char* fmt, const char* name, int* sem, int* enc)
     else if (fmt && (strstr(fmt, "raw16(raw16)") != NULL ||
                      strstr(fmt, "raw24/raw24") != NULL))
         *enc = PROF_ENC_PAIR;
+    else if (RawFormatComposite(fmt))
+        *enc = PROF_ENC_PACKED;
     else if (strncmp(fmt ? fmt : "", "raw", 3) == 0)
         *enc = PROF_ENC_COUNTER;
     else
@@ -283,20 +357,27 @@ static bool HealthSem(int sem)
            sem == PROF_SEM_MEDIA || sem == PROF_SEM_INTERFACE;
 }
 
-static void StoreAttr(DRIVE_INFO* p, unsigned id, int sem, int enc, const char* name)
+struct AttrBag {
+    DRIVEDB_ATTR* attr;
+    int* n;
+    int cap;
+};
+
+static void StoreAttr(AttrBag* b, unsigned id, int sem, int enc, const char* name)
 {
     DRIVEDB_ATTR* a;
     int i, n;
+    if (!b || !b->attr || !b->n) return;
     if (!name || !name[0] || id == 0 || id > 255) return;
-    if (p->nDriveDbAttrs >= DRIVEDB_ATTR_MAX) return;
-    for (i = 0; i < p->nDriveDbAttrs; i++) {
-        if (p->driveDbAttr[i].id == (BYTE)id) {
-            a = &p->driveDbAttr[i];
+    if (*b->n >= b->cap || *b->n >= DRIVEDB_ATTR_MAX) return;
+    for (i = 0; i < *b->n; i++) {
+        if (b->attr[i].id == (BYTE)id) {
+            a = &b->attr[i];
             goto fill;
         }
     }
-    a = &p->driveDbAttr[p->nDriveDbAttrs];
-    p->nDriveDbAttrs++;
+    a = &b->attr[*b->n];
+    (*b->n)++;
 fill:
     a->id = (BYTE)id;
     a->sem = (BYTE)sem;
@@ -310,7 +391,7 @@ fill:
     a->name[n] = '\0';
 }
 
-static void ParsePresets(DRIVE_INFO* p, const char* presets, BOOL hdd)
+static void ParsePresets(AttrBag* b, const char* presets, BOOL hdd)
 {
     const char* s;
     if (!presets) return;
@@ -348,9 +429,13 @@ static void ParsePresets(DRIVE_INFO* p, const char* presets, BOOL hdd)
         if (*s == ',') {
             s++;
             n = 0;
-            while (*s && *s != ',' && *s != ' ' && *s != '\t' &&
-                   n < (int)sizeof(name) - 1) {
-                name[n++] = *s++;
+            /* name[] keeps 43 characters. The rest of a longer preset
+             * name is skipped through to the comma, so ,HDD or ,SSD
+             * is still read. */
+            while (*s && *s != ',' && *s != ' ' && *s != '\t') {
+                if (n < (int)sizeof(name) - 1)
+                    name[n++] = *s;
+                s++;
             }
             name[n] = '\0';
             if (*s == ',') {
@@ -365,7 +450,37 @@ static void ParsePresets(DRIVE_INFO* p, const char* presets, BOOL hdd)
         if (strcmp(flag, "HDD") == 0 && !hdd) continue;
         if (strcmp(flag, "SSD") == 0 && hdd) continue;
         MapAttr(fmt, name, &sem, &enc);
-        StoreAttr(p, (unsigned)id, sem, enc, name);
+        StoreAttr(b, (unsigned)id, sem, enc, name);
+    }
+}
+
+/* An id both rows name is contested when the semantic or the encoding
+ * differs. The same meaning keeps the earlier name. An id only one row
+ * names is not a vote: the earlier row's set stays, and the later row's
+ * extra ids are not imported. */
+static void DropContested(DRIVE_INFO* p, const DRIVEDB_ATTR* extra, int nExtra)
+{
+    int i = 0;
+    if (!p || !extra || nExtra <= 0) return;
+    while (i < p->nDriveDbAttrs) {
+        int j, contested = 0;
+        for (j = 0; j < nExtra; j++) {
+            if (extra[j].id != p->driveDbAttr[i].id) continue;
+            if (extra[j].sem != p->driveDbAttr[i].sem ||
+                extra[j].enc != p->driveDbAttr[i].enc)
+                contested = 1;
+            break;
+        }
+        if (!contested) {
+            i++;
+            continue;
+        }
+        if (i + 1 < p->nDriveDbAttrs) {
+            memmove(&p->driveDbAttr[i], &p->driveDbAttr[i + 1],
+                    (size_t)(p->nDriveDbAttrs - i - 1) * sizeof(DRIVEDB_ATTR));
+        }
+        p->nDriveDbAttrs--;
+        memset(&p->driveDbAttr[p->nDriveDbAttrs], 0, sizeof(DRIVEDB_ATTR));
     }
 }
 
@@ -562,31 +677,44 @@ static int EntryScore(const DRIVE_INFO* p, const drive_settings* e)
 void DriveDbApply(DRIVE_INFO* p)
 {
     char model[48], fw[16];
-    int i, best, bestScore;
+    int i, t, best, bestScore, nTies, tieOverflow;
+    int ties[32];
     BOOL hdd;
     const drive_settings* e;
+    AttrBag bag;
 
     if (!p) return;
     p->szModelFamily[0] = '\0';
     p->szDriveDbWarn[0] = '\0';
+    p->szDriveDbTie[0] = '\0';
     p->nDriveDbAttrs = 0;
     TrimCopy(model, (int)sizeof(model), p->szModel);
     TrimCopy(fw, (int)sizeof(fw), p->szFirmware);
     if (!model[0]) return;
 
-    CompileDb();
+    if (!CompileDb()) return;
     best = -1;
     bestScore = -1;
+    nTies = 0;
+    tieOverflow = 0;
     for (i = 0; i < DRIVEDB_N; i++) {
         int score;
         if (EntrySkipped(&kDriveDb[i])) continue;
         if (!FamilyAgrees(p->eController, kDriveDb[i].modelfamily)) continue;
         if (!MatchEntry(i, model, fw)) continue;
         score = EntryScore(p, &kDriveDb[i]);
-        /* Equal scores keep the earlier row: drivedb.h order is only a tie. */
+        /* A higher score replaces the winner. An equal score keeps the
+         * earlier row and remembers the other one. */
         if (best < 0 || score > bestScore) {
             best = i;
             bestScore = score;
+            nTies = 0;
+            tieOverflow = 0;
+        } else if (score == bestScore) {
+            if (nTies < (int)(sizeof(ties) / sizeof(ties[0])))
+                ties[nTies++] = i;
+            else
+                tieOverflow = 1;
         }
     }
     if (best < 0) return;
@@ -596,20 +724,39 @@ void DriveDbApply(DRIVE_INFO* p)
     if (e->warningmsg && e->warningmsg[0] &&
         strcmp(e->warningmsg, "Default settings") != 0 &&
         strncmp(e->warningmsg, "Version", 7) != 0) {
-        /* Family notes are not this disk's verdict. The heise line is the
-         * English warning vendored for older WD SMR drives. */
-        if (strstr(e->warningmsg, "heise.de/-10800960"))
-            lstrcpynA(p->szDriveDbWarn,
-                "у старых WD SMR бывали серьёзные проблемы с записью. "
-                "https://www.heise.de/-10800960.html",
-                (int)sizeof(p->szDriveDbWarn));
-        else
-            lstrcpynA(p->szDriveDbWarn, e->warningmsg,
-                      (int)sizeof(p->szDriveDbWarn));
+        /* Family notes are not this disk's verdict. Keep the upstream
+         * text. The lecture translates the WD SMR heise note. */
+        lstrcpynA(p->szDriveDbWarn, e->warningmsg,
+                  (int)sizeof(p->szDriveDbWarn));
+    }
+    for (t = 0; t < nTies && !p->szDriveDbTie[0]; t++) {
+        const char* fam = kDriveDb[ties[t]].modelfamily;
+        if (fam && fam[0])
+            lstrcpynA(p->szDriveDbTie, fam, (int)sizeof(p->szDriveDbTie));
     }
     if (p->bIsNVMe) return;
     hdd = (p->eType == DRIVE_TYPE_HDD && !p->bIsNVMe);
-    ParsePresets(p, e->presets, hdd);
+    bag.attr = p->driveDbAttr;
+    bag.n = &p->nDriveDbAttrs;
+    bag.cap = DRIVEDB_ATTR_MAX;
+    ParsePresets(&bag, e->presets, hdd);
+    /* Rows past the ones we stored were not compared. Do not apply a
+     * meaning that might be the disputed one. */
+    if (tieOverflow) {
+        p->nDriveDbAttrs = 0;
+        return;
+    }
+    for (t = 0; t < nTies; t++) {
+        DRIVEDB_ATTR extra[DRIVEDB_ATTR_MAX];
+        int nExtra = 0;
+        AttrBag xb;
+        memset(extra, 0, sizeof(extra));
+        xb.attr = extra;
+        xb.n = &nExtra;
+        xb.cap = DRIVEDB_ATTR_MAX;
+        ParsePresets(&xb, kDriveDb[ties[t]].presets, hdd);
+        DropContested(p, extra, nExtra);
+    }
 }
 
 const char* DriveDbAttrName(const DRIVE_INFO* p, BYTE id)

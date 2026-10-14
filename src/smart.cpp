@@ -694,6 +694,7 @@ static RAW_ENC RawEncFromProf(int enc)
     case PROF_ENC_COUNTER:
     case PROF_ENC_MAXAVG:
     case PROF_ENC_PAIR:
+    case PROF_ENC_PACKED:
     case PROF_ENC_GIB:
     case PROF_ENC_BLOCK32:
     case PROF_ENC_SCALE:

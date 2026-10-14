@@ -864,6 +864,9 @@ static void DoSaveDriveReport(HWND hWnd)
     ReportMdKv(buf, kCap, &len, Tr(STR_MODEL), ReportDash(pInfo->szModel));
     if (pInfo->szModelFamily[0])
         ReportMdKv(buf, kCap, &len, TN("Семейство", "Family"), pInfo->szModelFamily);
+    if (pInfo->szDriveDbTie[0])
+        ReportMdKv(buf, kCap, &len, TN("Та же оценка базы", "Same database score"),
+                   pInfo->szDriveDbTie);
     {
         const char* brand = GetVendorName(pInfo->eVendor);
         if (pInfo->eVendor == VENDOR_UNKNOWN || pInfo->eVendor == VENDOR_OTHER)
@@ -2382,6 +2385,7 @@ void UpdateDriveInfo(HWND hWnd, int nDriveIdx)
         char szRow4Buf[48];
         const char* szTempAx;
         const char* szRow4Val;
+        DRIVE_HEALTH_STATUS shownWear;
         if (pInfo->nTemperatureC <= 0)
             szTempAx = Tr(STR_POH_NONE);
         else
@@ -2395,18 +2399,26 @@ void UpdateDriveInfo(HWND hWnd, int nDriveIdx)
             else
                 szRow4Val = GetHealthStatusName(pInfo->eMechanics);
         } else {
+            /* eWear stays BAD at 5% or less. The axis stops at CAUTION,
+             * the same cap as the headline. Do not invent a percent. */
             SetDlgItemTextU8(hWnd, IDC_AXIS_ROW4_L, Tr(STR_WEAR));
+            shownWear = pInfo->eWear;
+            if (shownWear == HEALTH_STATUS_BAD ||
+                shownWear == HEALTH_STATUS_WARNING ||
+                shownWear == HEALTH_STATUS_CRITICAL)
+                shownWear = HEALTH_STATUS_CAUTION;
             if (pInfo->eWear != HEALTH_STATUS_UNKNOWN && pInfo->nEndurancePercent >= 0) {
                 safe_snprintf(szRow4Buf, "%s (%d%%)",
-                    GetHealthStatusName(pInfo->eWear), pInfo->nEndurancePercent);
+                    GetHealthStatusName(shownWear),
+                    pInfo->nEndurancePercent);
                 szRow4Val = szRow4Buf;
             } else if (pInfo->eWear != HEALTH_STATUS_UNKNOWN) {
-                szRow4Val = GetHealthStatusName(pInfo->eWear);
+                szRow4Val = GetHealthStatusName(shownWear);
             } else if (pInfo->nEndurancePercent >= 0) {
                 safe_snprintf(szRow4Buf, "%d%%", pInfo->nEndurancePercent);
                 szRow4Val = szRow4Buf;
             } else {
-                szRow4Val = "нет данных";
+                szRow4Val = TN("нет данных", "no data");
             }
         }
         SetDlgItemTextU8(hWnd, IDC_AXIS_MEDIA_V, GetAxisStatusName(pInfo->eReliability, FALSE));
@@ -2599,11 +2611,13 @@ static void FormatAtaTempValue(BYTE id, const BYTE* pRaw, BYTE bVal, BYTE bWorst
     nMin = (int)a.bRawValue[2];
     life = AtaTempLifetimeMaxC(&a);
     if (nMin >= 1 && nMin <= 125 && life > nMin && life <= 125)
-        safe_snprintf_n(szMain, nMain,
-            "%d \xC2\xB0""C (%d \xC2\xB0""F)  мин:%d макс:%d", nC, nF, nMin, life);
+        safe_snprintf_n(szMain, nMain, TN(
+            "%d \xC2\xB0""C (%d \xC2\xB0""F)  мин:%d макс:%d",
+            "%d \xC2\xB0""C (%d \xC2\xB0""F)  min:%d max:%d"), nC, nF, nMin, life);
     else if (life > nC && life >= 1 && life <= 125)
-        safe_snprintf_n(szMain, nMain,
-            "%d \xC2\xB0""C (%d \xC2\xB0""F)  макс:%d", nC, nF, life);
+        safe_snprintf_n(szMain, nMain, TN(
+            "%d \xC2\xB0""C (%d \xC2\xB0""F)  макс:%d",
+            "%d \xC2\xB0""C (%d \xC2\xB0""F)  max:%d"), nC, nF, life);
     else
         safe_snprintf_n(szMain, nMain, "%d \xC2\xB0""C (%d \xC2\xB0""F)", nC, nF);
 }
@@ -2999,12 +3013,14 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
         int semW = PROF_SEM_NONE, encW = PROF_ENC_NONE;
         BOOL known = AttrEncOf(pDrv, bID, &semW, &encW);
         if (known && encW == PROF_ENC_PERCENT && bVal <= 100) {
-            safe_snprintf(szMain, "%u%%  индикатор износа", (unsigned)bVal);
+            safe_snprintf(szMain, TN("%u%%  индикатор износа",
+                                     "%u%%  wear indicator"), (unsigned)bVal);
             break;
         }
         if (known && ProfileWriteVolume(semW, encW) &&
             encW == PROF_ENC_GIB && qw48 > 0 && qw48 <= 4000000ULL) {
-            safe_snprintf(szMain, "%llu ГиБ записано", (unsigned long long)qw48);
+            safe_snprintf(szMain, TN("%llu ГиБ записано", "%llu GiB written"),
+                          (unsigned long long)qw48);
             break;
         }
         if (qw48 > 0xFFFFFFFFULL)
@@ -3069,7 +3085,8 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
 
     case 0xB1:
         if (pDrv && (pDrv->nProfileFlags & PROF_F_B1_LIFE) && bVal <= 100) {
-            safe_snprintf(szMain, "износ/остаток %u%%", (unsigned)bVal);
+            safe_snprintf(szMain, TN("износ/остаток %u%%", "wear/life %u%%"),
+                          (unsigned)bVal);
             break;
         }
         if (qw48 > 0xFFFFFFFFULL)
@@ -3084,7 +3101,8 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
         if (AttrEncOf(pDrv, bID, &semCa, &encCa) &&
             semCa == PROF_SEM_ENDURANCE && encCa == PROF_ENC_PERCENT &&
             bVal <= 100) {
-            safe_snprintf(szMain, "%u%% ресурса", (unsigned)bVal);
+            safe_snprintf(szMain, TN("%u%% ресурса", "%u%% life remaining"),
+                          (unsigned)bVal);
             break;
         }
         if (qw48 > 0xFFFFFFFFULL)
@@ -3102,7 +3120,8 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
         if (!split && eCtl == CONTROLLER_PHISON && dw32 > 0xFFFFUL)
             split = TRUE;
         if (eCtl == CONTROLLER_MICRON)
-            safe_snprintf(szMain, "%lu среднее стираний", (unsigned long)dw32);
+            safe_snprintf(szMain, TN("%lu среднее стираний", "%lu average erases"),
+                          (unsigned long)dw32);
         else if (split) {
             unsigned mx, avg;
             PhisonMaxAvgHalves(dw32, &mx, &avg);
@@ -3111,13 +3130,14 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
         } else if (eCtl == CONTROLLER_MAXIO) {
             safe_snprintf(szMain, "%lu", (unsigned long)(dw32 & 0xFFFFUL));
         } else
-            safe_snprintf(szMain, "%lu циклов выравнивания", (unsigned long)dw32);
+            safe_snprintf(szMain, TN("%lu циклов выравнивания", "%lu wear-leveling cycles"),
+                          (unsigned long)dw32);
         break;
     }
 
     case 0xA1:
     case 0xB2:
-        safe_snprintf(szMain, "%lu блоков", (unsigned long)dw32);
+        safe_snprintf(szMain, TN("%lu блоков", "%lu blocks"), (unsigned long)dw32);
         break;
 
     case 0xAB:
@@ -3129,9 +3149,10 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
             unsigned lo = (unsigned)(dw32 & 0xFFFFu);
             safe_snprintf(szMain, "%u / %u", hi, lo);
         } else if (dw32 == 0)
-            safe_snprintf(szMain, "0 сбоев  (ОК)");
+            safe_snprintf(szMain, "%s", TN("0 сбоев  (ОК)", "0 failures (OK)"));
         else
-            safe_snprintf(szMain, "%lu сбоев  (!)", (unsigned long)dw32);
+            safe_snprintf(szMain, TN("%lu сбоев  (!)", "%lu failures  (!)"),
+                          (unsigned long)dw32);
         break;
 
     case 0xAA:
@@ -3139,7 +3160,8 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
         int encA = PROF_ENC_NONE;
         AttrEncOf(pDrv, bID, NULL, &encA);
         if (encA == PROF_ENC_PERCENT && bVal <= 100) {
-            safe_snprintf(szMain, "%u%%  резервное пространство", (unsigned)bVal);
+            safe_snprintf(szMain, TN("%u%%  резервное пространство",
+                                     "%u%%  reserved space"), (unsigned)bVal);
         } else if (encA == PROF_ENC_PAIR) {
             /* MKP-521 / z54z10: bytes [1:0] early, bytes [5:4] later.
              * A low/high 24-bit split labels the factory count as later. */
@@ -3159,7 +3181,8 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
         int spareBlk = -1;
         int si;
         if (eCtl == CONTROLLER_INTEL && bVal <= 100) {
-            safe_snprintf(szMain, "%u%%  резервное пространство", (unsigned)bVal);
+            safe_snprintf(szMain, TN("%u%%  резервное пространство",
+                                     "%u%%  reserved space"), (unsigned)bVal);
             break;
         }
         /* Phison S11: 232 RAW copies spare blocks (161). Value is the percent.
@@ -3181,13 +3204,15 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
         }
         {
             DWORD pct = dw32 ? dw32 : (DWORD)bVal;
-            safe_snprintf(szMain, "%lu%%  резервное пространство", (unsigned long)pct);
+            safe_snprintf(szMain, TN("%lu%%  резервное пространство",
+                                     "%lu%%  reserved space"), (unsigned long)pct);
         }
         break;
     }
 
     case 0xF0:
-        safe_snprintf(szMain, "%lu ч полёта головок", (unsigned long)(DWORD)w16);
+        safe_snprintf(szMain, TN("%lu ч полёта головок", "%lu head flying hours"),
+                      (unsigned long)(DWORD)w16);
         break;
 
     case 0xE1:
@@ -3264,7 +3289,25 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
     safe_snprintf_n(szBuf, nBufLen, "%s", szMain);
 }
 
-/* Status from RAW counters and collapsed Value, not from Value==100. */
+/* Canonical status token. The list paints it through Tr(STR_ST_*). */
+static const char* RankToken(int rank)
+{
+    switch (rank) {
+    case HEALTH_STATUS_BAD:
+    case HEALTH_STATUS_WARNING:
+        return "ПЛОХО";
+    case HEALTH_STATUS_CAUTION:
+        return "Внимание";
+    case HEALTH_STATUS_OBSERVE:
+        return "Риск";
+    case HEALTH_STATUS_GOOD:
+        return "ОК";
+    default:
+        return "Не оценивается";
+    }
+}
+
+/* Status from the profile channel rule, not from a private ID threshold. */
 static const char* AtaRowStatus(const DRIVE_INFO* p, const SMART_ATTRIBUTE* a,
                                 BYTE bThresh, BOOL bFailed)
 {
@@ -3273,7 +3316,8 @@ static const char* AtaRowStatus(const DRIVE_INFO* p, const SMART_ATTRIBUTE* a,
     BYTE worst = a->bWorstValue;
     BOOL ssd = p->bIsNVMe || p->eType == DRIVE_TYPE_SSD_SATA ||
                p->eType == DRIVE_TYPE_M2_SATA;
-    int n = -1;
+    int rank = (int)HEALTH_STATUS_UNKNOWN;
+    int ev;
 
     if (bFailed) {
         if (a->wStatusFlags & 0x0001)
@@ -3286,6 +3330,10 @@ static const char* AtaRowStatus(const DRIVE_INFO* p, const SMART_ATTRIBUTE* a,
         bThresh > 0 && worst != 0 && worst != 255 && worst <= bThresh)
         return "было";
 
+    ev = AttrEvidenceRank(p, a, &rank);
+    if (ev == ATTR_EV_RANK) return RankToken(rank);
+    if (ev == ATTR_EV_SKIP) return "Не оценивается";
+
     if (ssd && (id == 0xE7 || id == 0xA9)) {
         int nLeft = p->nEndurancePercent;
         int semLife = PROF_SEM_NONE;
@@ -3294,38 +3342,7 @@ static const char* AtaRowStatus(const DRIVE_INFO* p, const SMART_ATTRIBUTE* a,
                        ProfileLookup(p, 0xA9, &semLife, NULL) &&
                        semLife == PROF_SEM_ENDURANCE);
         if (!lifeId || nLeft < 0) return "Не оценивается";
-        if (nLeft >= 0 && nLeft <= 5) return "ПЛОХО";
-        if (nLeft >= 0 && nLeft <= 10) return "Внимание";
-        if (nLeft >= 0 && nLeft <= 20) return "Риск";
-        return "ОК";
-    }
-
-    if (id == 0x05) n = p->nReallocated;
-    else if (id == 0xC4) {
-        if (p->nRemapEvents < 0 && GetRawValue48(a->bRawValue) != 0)
-            return "Не оценивается";
-        n = p->nRemapEvents;
-    }
-    else if (id == 0xC5) n = p->nPendingSectors;
-    else if (id == 0xC6) n = p->nUncorrectable;
-    else if (id == 0xC7) n = p->nCrcErrors;
-    else if (id == 0xDA && DriveDbAttrIsCrc(p, 0xDA) &&
-             p->nCrcErrors > 0 &&
-             (int)GetRawValue(a->bRawValue) == p->nCrcErrors)
-        n = p->nCrcErrors;
-    if (n > 0) {
-        if (id == 0xC6 || n >= 10 || (id == 0xC5 && n >= 4))
-            return "ПЛОХО";
-        return "Внимание";
-    }
-
-    if (id == 0xBB) {
-        int n187 = DecodeReportedUncorrect(a->bRawValue, p->eVendor);
-        if (n187 < 0) return "Не оценивается";
-        if (n187 > 0) return "ПЛОХО";
-        if (val <= 1) return "ПЛОХО";
-        if (val <= 10) return "Внимание";
-        return "ОК";
+        return RankToken(WearBadgeStatus(nLeft));
     }
 
     if (id == 0xC3) {
@@ -3380,17 +3397,12 @@ static const char* AtaRowStatus(const DRIVE_INFO* p, const SMART_ATTRIBUTE* a,
             return "Внимание";
         return "ОК";
     }
-    if (id == 0xB8 && !ssd && GetRawValue(a->bRawValue) > 0)
-        return "Внимание";
-    if (id == 0x0A && !ssd && GetRawValue(a->bRawValue) > 2)
-        return "контекст";
-
     if (id == 0xC0 && DriveTreatsC0AsPowerLoss(p))
         return (GetRawValue(a->bRawValue) > 0) ? "журнал питания" : "ОК";
     if ((id == 0xA0 || id == 0xAE) && GetRawValue(a->bRawValue) > 0)
         return "журнал питания";
-    /* 188 command timeout: cable/power, not media. 189 high-fly: vibration. */
-    if ((id == 0xBC || id == 0xBD) && !ssd && GetRawValue(a->bRawValue) > 0)
+    /* 189 high-fly writes are vibration context. 188 is a profile rule. */
+    if (id == 0xBD && !ssd && GetRawValue(a->bRawValue) > 0)
         return "контекст";
 
     if (!ssd && IsShockSensorAttr(id)) {
@@ -3577,12 +3589,10 @@ void UpdateAttrList(HWND hWnd, int nDriveIdx)
 
         safe_snprintf(szPctU,"%d %%",(int)pLog->PercentageUsed);
         {
-            const char* szWearSt = "ОК";
+            const char* szWearSt;
             int nLeft = 100 - (int)pLog->PercentageUsed;
             if (nLeft < 0) nLeft = 0;
-            if (pLog->PercentageUsed >= 100 || nLeft <= 5) szWearSt = "ПЛОХО";
-            else if (nLeft <= 10) szWearSt = "Внимание";
-            else if (nLeft <= 20) szWearSt = "Риск";
+            szWearSt = RankToken(WearBadgeStatus(nLeft));
             NVME_ROW("05h", TN("Износ", "Percentage used"), szPctU, szWearSt);
         }
 
@@ -3843,8 +3853,8 @@ void RefreshData(HWND hWnd)
     }
 }
 
-#define ABOUT_W  440
-#define ABOUT_H  360
+#define ABOUT_W  540
+#define ABOUT_H  382
 #define LECTURE_W 640
 #define LECTURE_H 640
 #define IDC_LECTURE_TEXT      3600
@@ -3854,6 +3864,7 @@ void RefreshData(HWND hWnd)
 #define IDC_ABOUT_LINK       3500
 #define IDC_ABOUT_LIC_STATUS 3501
 #define IDC_ABOUT_ACTIVATE   3502
+#define IDC_ABOUT_SOURCE     3503
 
 #define PROP_ABOUT_FONT_BOLD  "dmFntB"
 #define PROP_ABOUT_FONT_LINK  "dmFntL"
@@ -3918,56 +3929,63 @@ static LRESULT CALLBACK AboutDlgProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM
                 hDlg, (HMENU)0, g_hInst, NULL);
 
             HWND hCopy = CreateWindowExU8(0, "STATIC",
-                "\xC2\xA9 2026 chuikoff",
+                "\xC2\xA9 2026 chuikoff \xE2\x80\x94 GPL-2.0-or-later",
                 WS_CHILD | WS_VISIBLE | SS_CENTER,
                 UiScale(20), UiScale(118), cx - UiScale(40), UiScale(18),
                 hDlg, (HMENU)0, g_hInst, NULL);
             SendMessageA(hCopy, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
 
-            HWND hDrv = CreateWindowExU8(0, "STATIC",
-                Tr(STR_ABOUT_AUTHOR),
-                WS_CHILD | WS_VISIBLE | SS_CENTER,
-                UiScale(20), UiScale(140), cx - UiScale(40), UiScale(18),
-                hDlg, (HMENU)0, g_hInst, NULL);
-            SendMessageA(hDrv, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
-
             CreateWindowExU8(0, "STATIC", "",
                 WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ,
-                UiScale(20), UiScale(166), cx - UiScale(40), UiScale(2),
+                UiScale(20), UiScale(144), cx - UiScale(40), UiScale(2),
                 hDlg, (HMENU)0, g_hInst, NULL);
 
             {
                 HWND hLicStatus = CreateWindowExU8(0, "STATIC",
                     Tr(STR_ABOUT_FOSS),
                     WS_CHILD | WS_VISIBLE | SS_CENTER,
-                    UiScale(20), UiScale(176), cx - UiScale(40), UiScale(18),
+                    UiScale(20), UiScale(152), cx - UiScale(40), UiScale(18),
                     hDlg, (HMENU)IDC_ABOUT_LIC_STATUS, g_hInst, NULL);
                 SendMessageA(hLicStatus, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
 
+                HWND hSrcCap = CreateWindowExU8(0, "STATIC",
+                    Tr(STR_ABOUT_SOURCE),
+                    WS_CHILD | WS_VISIBLE | SS_CENTER,
+                    UiScale(12), UiScale(172), cx - UiScale(24), UiScale(18),
+                    hDlg, (HMENU)0, g_hInst, NULL);
+                SendMessageA(hSrcCap, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+
                 HWND hActivate = CreateWindowExU8(0, "BUTTON", Tr(STR_ABOUT_SUPPORT),
                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                    (cx - UiScale(120)) / 2, UiScale(200), UiScale(120), UiScale(26),
+                    (cx - UiScale(120)) / 2, UiScale(218), UiScale(120), UiScale(26),
                     hDlg, (HMENU)IDC_ABOUT_ACTIVATE, g_hInst, NULL);
                 SendMessageA(hActivate, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
             }
 
             CreateWindowExU8(0, "STATIC", "",
                 WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ,
-                UiScale(20), UiScale(234), cx - UiScale(40), UiScale(2),
+                UiScale(20), UiScale(254), cx - UiScale(40), UiScale(2),
                 hDlg, (HMENU)0, g_hInst, NULL);
 
             HFONT hFontLink = UiMakeFont(12, FW_NORMAL, TRUE);
             SetPropA(hDlg, PROP_ABOUT_FONT_LINK, (HANDLE)hFontLink);
+            HWND hSource = CreateWindowExU8(0, "STATIC",
+                DRIVEMONITOR_SOURCE_URL,
+                WS_CHILD | WS_VISIBLE | SS_CENTER | SS_NOTIFY,
+                UiScale(12), UiScale(190), cx - UiScale(24), UiScale(18),
+                hDlg, (HMENU)IDC_ABOUT_SOURCE, g_hInst, NULL);
+            SendMessageA(hSource, WM_SETFONT, (WPARAM)hFontLink, TRUE);
+
             HWND hLink = CreateWindowExU8(0, "STATIC",
                 DONATE_URL,
                 WS_CHILD | WS_VISIBLE | SS_CENTER | SS_NOTIFY,
-                UiScale(20), UiScale(244), cx - UiScale(40), UiScale(18),
+                UiScale(20), UiScale(264), cx - UiScale(40), UiScale(18),
                 hDlg, (HMENU)IDC_ABOUT_LINK, g_hInst, NULL);
             SendMessageA(hLink, WM_SETFONT, (WPARAM)hFontLink, TRUE);
 
             HWND hBtn = CreateWindowExU8(0, "BUTTON", "OK",
                 WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-                (cx - UiScale(80)) / 2, UiScale(274), UiScale(80), UiScale(26),
+                (cx - UiScale(80)) / 2, UiScale(294), UiScale(80), UiScale(26),
                 hDlg, (HMENU)IDOK, g_hInst, NULL);
             SendMessageA(hBtn, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
 
@@ -3987,6 +4005,17 @@ static LRESULT CALLBACK AboutDlgProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM
                  HIWORD(wParam) == STN_CLICKED) {
             OpenDonatePage(hDlg);
         }
+        else if (LOWORD(wParam) == IDC_ABOUT_SOURCE &&
+                 HIWORD(wParam) == STN_CLICKED) {
+            HINSTANCE hOpen = ShellExecuteA(hDlg, "open", DRIVEMONITOR_SOURCE_URL,
+                                            NULL, NULL, SW_SHOWNORMAL);
+            if ((INT_PTR)hOpen <= 32) {
+                MessageBoxU8(hDlg,
+                    "Не удалось открыть браузер.\n" DRIVEMONITOR_SOURCE_URL,
+                    "DriveMonitor",
+                    MB_ICONWARNING | MB_OK);
+            }
+        }
         return 0;
 
     case WM_NOTIFY:
@@ -3998,8 +4027,8 @@ static LRESULT CALLBACK AboutDlgProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM
             int  nID   = GetDlgCtrlID(hCtrl);
             HDC  hdcSt = (HDC)wParam;
             SetBkMode(hdcSt, TRANSPARENT);
-            if (nID == IDC_ABOUT_LINK) {
-                /* Boosty link - render in hyperlink blue. */
+            if (nID == IDC_ABOUT_LINK || nID == IDC_ABOUT_SOURCE) {
+                /* Boosty and source links render in hyperlink blue. */
                 SetTextColor(hdcSt, RGB(0, 102, 204));
             } else if (nID == IDC_ABOUT_LIC_STATUS) {
                 /* FOSS banner - render in green to signal "free / good". */
@@ -4014,7 +4043,9 @@ static LRESULT CALLBACK AboutDlgProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM
             GetCursorPos(&pt);
             ScreenToClient(hDlg, &pt);
             HWND hOver = ChildWindowFromPoint(hDlg, pt);
-            if (hOver && GetDlgCtrlID(hOver) == IDC_ABOUT_LINK && s_hCursorHand) {
+            if (hOver && s_hCursorHand &&
+                (GetDlgCtrlID(hOver) == IDC_ABOUT_LINK ||
+                 GetDlgCtrlID(hOver) == IDC_ABOUT_SOURCE)) {
                 SetCursor(s_hCursorHand);
                 return TRUE;
             }

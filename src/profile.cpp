@@ -894,14 +894,18 @@ BOOL ProfileHealthRule(const DRIVE_INFO* p, BYTE id, PROF_HEALTH* out)
     if (!DriveDbLookup(p, id, &sem, &enc)) return FALSE;
     out->sem = sem;
     out->enc = enc;
-    out->rule = PROF_RULE_DEFAULT;
-    if (DriveDbAttrIsCrc(p, id)) {
+    /* The name is a hint, not a confirmed counter layout. A packed RAW
+     * (raw24/raw32, raw16(raw16)) is not one number, so it is not graded.
+     * A plain counter stops at Risk: count >= 1 is observe, never caution. */
+    if (enc == PROF_ENC_PACKED || enc == PROF_ENC_PAIR || enc == PROF_ENC_MAXAVG) {
+        out->rule = PROF_RULE_OFF;
+        return TRUE;
+    }
+    out->rule = PROF_RULE_WORSE;
+    out->observe = 1;
+    if (DriveDbAttrIsCrc(p, id) && enc == PROF_ENC_COUNTER) {
         out->sem = PROF_SEM_INTERFACE;
-        out->enc = PROF_ENC_COUNTER;
-        out->rule = PROF_RULE_WORSE;
         out->slot = PROF_SLOT_CRC;
-        out->caution = 1;
-        out->bad = 100;
         out->fallback = 1;
     }
     NormalizeHealth(out);
@@ -959,6 +963,7 @@ int ProfileDecodeRaw(int enc, unsigned __int64 raw, unsigned __int64* out)
         if (raw > 0xFFFFFFFFULL) return 0;
         *out = raw;
         return 1;
+    case PROF_ENC_PACKED:
     case PROF_ENC_SCALE:
     case PROF_ENC_NONE:
     default:
