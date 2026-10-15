@@ -57,10 +57,11 @@ LDFLAGS = -mwindows \
 TESTDIR = tests
 TEST_TARGET = $(OUTDIR)/profile_test.exe
 DB_TEST_TARGET = $(OUTDIR)/drivedb_test.exe
-# Real drivedb.o plus identification, decode, and health. No GUI subsystem:
-# -mwindows would hide printf. profile_test.exe stays on its stubs.
+# Identification, decode, and health, plus drivedb_dmtest.o. The release
+# drivedb.o has no probe rows. -mwindows would hide printf.
+# profile_test.exe stays on its stubs.
 DB_TEST_OBJS = $(OBJDIR)/drivedb_test.o $(OBJDIR)/profile.o \
-          $(OBJDIR)/drivedb.o $(OBJDIR)/smart.o \
+          $(OBJDIR)/drivedb_dmtest.o $(OBJDIR)/smart.o \
           $(OBJDIR)/health_assessment.o $(OBJDIR)/lang.o \
           $(OBJDIR)/ata_smart.o $(OBJDIR)/nvme_smart.o \
           $(OBJDIR)/usb_bridge.o
@@ -102,6 +103,11 @@ $(OBJDIR)/profile_test.o: $(TESTDIR)/profile_test.cpp $(SRCDIR)/smart.h | $(OBJD
 	@echo "  CC  $<"
 	$(Q)$(CC) -O2 -DWIN32 -D_WIN32 -D_WINDOWS -DNDEBUG \
 	    -I$(SRCDIR) -finput-charset=UTF-8 $(CXXFLAGS) -c $< -o $@
+
+$(OBJDIR)/drivedb_dmtest.o: $(SRCDIR)/drivedb.cpp $(SRCDIR)/resource.h \
+        third_party/smartmontools/drivedb.h | $(OBJDIR)
+	@echo "  CC  $(SRCDIR)/drivedb.cpp (DM_TESTS)"
+	$(Q)$(CC) $(CFLAGS) $(CXXFLAGS) -DDM_TESTS -c $(SRCDIR)/drivedb.cpp -o $@
 
 $(OBJDIR)/drivedb_test.o: $(TESTDIR)/drivedb_test.cpp $(SRCDIR)/smart.h | $(OBJDIR)
 	@echo "  CC  $<"

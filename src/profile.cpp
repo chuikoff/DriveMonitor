@@ -66,7 +66,8 @@ typedef struct _DRIVE_PROFILE {
 /* Threshold 0 is off. badHdd applies only on an HDD.
  * Pending 4 and realloc 10 are BAD on HDD and stay CAUTION on SSD.
  * 184 is observe from 1 and caution from 5, HDD only.
- * 187 is BAD from 1 on HDD. 188 and CRC share the interface steps. */
+ * 187 is BAD from 1 on HDD. On a generic SSD it is not scored.
+ * Crucial and Micron keep their own raw48 rule. 188 and CRC share the interface steps. */
 static const PROF_ATTR kAtaGeneric[] = {
     PH(0x05, PROF_SEM_MEDIA, PROF_ENC_LO16, PROF_RULE_WORSE,
        PROF_SLOT_REALLOC, PROF_SCOPE_ANY, 0, 1, 0, 10),
@@ -204,6 +205,17 @@ static const PROF_ATTR kMicron[] = {
     PA(0, 0, 0)
 };
 
+/* smartmontools: Crucial/Micron client SSDs, attribute 187 is raw48
+ * Reported_Uncorrect (the default ATA meaning; the -v line is commented
+ * because it repeats that default). A confirmed count is caution from 1.
+ * Samsung and HDD 187 stay bad from 1. A generic SSD still does not score it. */
+static const PROF_ATTR kCrucialMicron[] = {
+    PHN(0xBB, PROF_SEM_MEDIA, PROF_ENC_COUNTER,
+        "Неисправимые ошибки", "Uncorrectable errors",
+        PROF_RULE_WORSE, PROF_SLOT_NONE, PROF_SCOPE_SSD, 0, 1, 0, 0),
+    PA(0, 0, 0)
+};
+
 static const PROF_ATTR kSeagateHdd[] = {
     PN(0x01, PROF_SEM_NONE,      PROF_ENC_COUNTER, "Частота ошибок чтения (RAW вендора)", "Read Error Rate (vendor RAW)"),
     PHN(0xBB, PROF_SEM_MEDIA, PROF_ENC_REPORTED,
@@ -266,6 +278,8 @@ static const DRIVE_PROFILE kProfiles[] = {
       VENDOR_UNKNOWN, CONTROLLER_MAXIO, 0, 0, NULL, NULL, NULL,
       PROF_F_E7_VALUE, NULL },
 
+    { "crucial-micron", NULL, PROF_KIND_VENDOR, NULL, NULL, PROF_FW_NONE,
+      VENDOR_MICRON, CONTROLLER_UNKNOWN, 0, 0, NULL, NULL, kCrucialMicron, 0, NULL },
     { "seagate-hdd", NULL, PROF_KIND_VENDOR, NULL, NULL, PROF_FW_NONE,
       VENDOR_SEAGATE, CONTROLLER_UNKNOWN, 0, 1, NULL, NULL, kSeagateHdd, 0, NULL },
     { "toshiba-hdd", NULL, PROF_KIND_VENDOR, NULL, NULL, PROF_FW_NONE,
@@ -273,6 +287,10 @@ static const DRIVE_PROFILE kProfiles[] = {
 
     { "samsung-870", "samsung-ssd", PROF_KIND_FAMILY, "870", NULL, PROF_FW_NONE,
       VENDOR_UNKNOWN, CONTROLLER_SAMSUNG, 0, 0, NULL, NULL, NULL, 0, NULL },
+    /* IDENTIFY often omits the brand and keeps CT…MX200…. The vendor row
+     * still covers Crucial_ and Micron_ models that are not MX200. */
+    { "mx200", NULL, PROF_KIND_FAMILY, "MX200", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_UNKNOWN, 0, 0, NULL, NULL, kCrucialMicron, 0, NULL },
 
     { "micron-2400", NULL, PROF_KIND_EXACT, "MICRON_2400", NULL, PROF_FW_NONE,
       VENDOR_UNKNOWN, CONTROLLER_SMI, 1, 0, "Silicon Motion SM2269XT", "1.4.0", NULL, 0, NULL },
@@ -896,17 +914,20 @@ BOOL ProfileHealthRule(const DRIVE_INFO* p, BYTE id, PROF_HEALTH* out)
     out->enc = enc;
     /* The name is a hint, not a confirmed counter layout. A packed RAW
      * (raw24/raw32, raw16(raw16)) is not one number, so it is not graded.
-     * A plain counter stops at Risk: count >= 1 is observe, never caution. */
+     * A plain counter stops at Risk on the row: count >= 1 is observe,
+     * never caution, and it does not enter the media channel. */
     if (enc == PROF_ENC_PACKED || enc == PROF_ENC_PAIR || enc == PROF_ENC_MAXAVG) {
         out->rule = PROF_RULE_OFF;
         return TRUE;
     }
     out->rule = PROF_RULE_WORSE;
     out->observe = 1;
+    /* Name only. The row can say Risk. The media channel, which the
+     * headline copies, stays on confirmed rules. */
+    out->fallback = 1;
     if (DriveDbAttrIsCrc(p, id) && enc == PROF_ENC_COUNTER) {
         out->sem = PROF_SEM_INTERFACE;
         out->slot = PROF_SLOT_CRC;
-        out->fallback = 1;
     }
     NormalizeHealth(out);
     return TRUE;

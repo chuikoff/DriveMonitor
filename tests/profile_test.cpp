@@ -16,6 +16,7 @@ extern "C" void DriveDbApply(DRIVE_INFO* p)
 {
     if (!p) return;
     p->szDriveDbTie[0] = '\0';
+    p->bDriveDbTieUnnamed = FALSE;
 }
 
 /* When g_dbE7 is set, drivedb claims 231 is wear/counter.
@@ -617,6 +618,38 @@ static void TestHealthRule(void)
     Go();
     Expect(ProfileHealthRule(&g, 0xBB, &h) && h.enc == PROF_ENC_REPORTED &&
            h.slot == PROF_SLOT_REPORTED && h.bad == 1, "seagate 187 rule");
+
+    Blank(DRIVE_TYPE_SSD_SATA, FALSE);
+    g.eVendor = VENDOR_MICRON;
+    Name("CRUCIAL-RULE", "");
+    Go();
+    Expect(strcmp(g.szProfileId, "crucial-micron") == 0, "crucial vendor profile");
+    Expect(ProfileHealthRule(&g, 0xBB, &h) && h.enc == PROF_ENC_COUNTER &&
+           h.scope == PROF_SCOPE_SSD && h.caution == 1 && h.bad == 0 &&
+           h.rule == PROF_RULE_WORSE, "crucial micron 187 is caution");
+
+    Blank(DRIVE_TYPE_SSD_SATA, FALSE);
+    g.eVendor = VENDOR_MICRON;
+    g.eController = CONTROLLER_MICRON;
+    Name("MICRON-CTL", "");
+    Go();
+    Expect(strcmp(g.szProfileId, "micron-ssd") == 0, "micron controller identity");
+    Expect(ProfileHealthRule(&g, 0xBB, &h) && h.caution == 1 && h.bad == 0 &&
+           h.enc == PROF_ENC_COUNTER, "micron controller uses vendor 187");
+
+    Blank(DRIVE_TYPE_HDD, FALSE);
+    g.eVendor = VENDOR_MICRON;
+    Name("CRUCIAL-HDD", "");
+    Go();
+    Expect(ProfileHealthRule(&g, 0xBB, &h) && h.scope == PROF_SCOPE_HDD &&
+           h.bad == 1, "micron vendor does not cover hdd 187");
+
+    Blank(DRIVE_TYPE_SSD_SATA, FALSE);
+    Name("CT500MX200SSD1", "");
+    Go();
+    Expect(strcmp(g.szProfileId, "mx200") == 0, "mx200 family without brand");
+    Expect(ProfileHealthRule(&g, 0xBB, &h) && h.caution == 1 && h.bad == 0,
+           "mx200 187 is caution");
 
     ProfileClearRegistered();
     DefExact(&a, "rank-bad", "RANKTIE", kRankBad, "test-register");

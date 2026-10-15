@@ -239,10 +239,11 @@ static void TestSu800(void)
     ExpectNoLookup(251, "su800 251 not health");
     ExpectName(251, 1, "Остаток запасных блоков", "su800 251 generic name");
     ExpectSem(160, PROF_SEM_MEDIA, PROF_ENC_COUNTER, "su800 160");
-    /* 160 is a drivedb name, not a local rule. RAW 3 is Risk, not Caution. */
+    /* 160 is a drivedb name, not a local rule. RAW 3 is Risk on the row.
+     * The media channel and the headline stay Good. */
     ExpectRank(160, ATTR_EV_RANK, (int)HEALTH_STATUS_OBSERVE, "su800 160 risk");
-    ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_OBSERVE, "su800 media");
-    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_OBSERVE, "su800 headline");
+    ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_GOOD, "su800 media");
+    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_GOOD, "su800 headline");
     ExpectInt(g.nEndurancePercent, 92, "su800 life kept");
     CaseEnd("su800", before);
 }
@@ -483,6 +484,7 @@ static void TestDriveDbTie(void)
     Run();
     ExpectStr(g.szModelFamily, "Tie Probe Earlier", "tie family is earlier");
     ExpectStr(g.szDriveDbTie, "Tie Probe Later", "tie names the other family");
+    Expect(!g.bDriveDbTieUnnamed, "named tie is not unnamed");
     Expect(!g.bProfileAmbiguous, "drivedb tie is not a profile tie");
     ExpectStr(g.szProfileConflict, "", "drivedb tie is not szProfileConflict");
     Expect(!DriveDbAttrEnc(&g, 231, &sem, &enc), "tie 231 dropped");
@@ -498,6 +500,49 @@ static void TestDriveDbTie(void)
     ExpectHas(lecture, "Tie Probe Later", "tie lecture other");
     ExpectHas(lecture, "не применяется", "tie lecture refusal");
     CaseEnd("tie", before);
+}
+
+/* Equal score with an empty family. Disagreed 231 is still dropped, and
+ * the lecture names the gap. ZZTIEANON's earlier row has no family.
+ * ZZTIENONE's later row has no family. */
+static void TestDriveDbTieUnnamed(void)
+{
+    int before = g_fail;
+    int sem = -1, enc = -1;
+    char lecture[8192];
+
+    Base(DRIVE_TYPE_SSD_SATA, "ZZTIEANON", "1.0");
+    Expect(AddAttr(231, 100, 40), "anonwin slot 231");
+    Expect(AddAttr(5, 100, 3), "anonwin slot 5");
+    Run();
+    ExpectStr(g.szModelFamily, "", "anonwin family empty");
+    ExpectStr(g.szDriveDbTie, "Anon Tie Later", "anonwin names the later family");
+    Expect(g.bDriveDbTieUnnamed, "anonwin marks the empty family");
+    Expect(!DriveDbAttrEnc(&g, 231, &sem, &enc), "anonwin 231 dropped");
+    Expect(DriveDbAttrEnc(&g, 5, &sem, &enc), "anonwin 5 stored");
+    FormatHealthLecturePlain(&g, lecture, (int)sizeof(lecture));
+    ExpectHas(lecture, "Семейство: нет имени", "anonwin lecture family");
+    ExpectHas(lecture, "Anon Tie Later", "anonwin lecture other");
+    ExpectHas(lecture, "нет имени семейства", "anonwin lecture gap");
+    ExpectHas(lecture, "не применяется", "anonwin lecture refusal");
+    CaseEnd("tie-anon-win", before);
+
+    before = g_fail;
+    Base(DRIVE_TYPE_SSD_SATA, "ZZTIENONE", "1.0");
+    Expect(AddAttr(231, 100, 40), "anontie slot 231");
+    Expect(AddAttr(5, 100, 3), "anontie slot 5");
+    Run();
+    ExpectStr(g.szModelFamily, "Anon Tie Earlier", "anontie family is earlier");
+    ExpectStr(g.szDriveDbTie, "", "anontie has no other name");
+    Expect(g.bDriveDbTieUnnamed, "anontie marks the empty family");
+    Expect(!DriveDbAttrEnc(&g, 231, &sem, &enc), "anontie 231 dropped");
+    Expect(DriveDbAttrEnc(&g, 5, &sem, &enc), "anontie 5 stored");
+    FormatHealthLecturePlain(&g, lecture, (int)sizeof(lecture));
+    ExpectHas(lecture, "Anon Tie Earlier", "anontie lecture family");
+    ExpectHas(lecture, "без имени семейства", "anontie lecture gap");
+    ExpectHas(lecture, "не применяется", "anontie lecture refusal");
+    ExpectNotHas(lecture, "Семейство: нет имени", "anontie keeps its family");
+    CaseEnd("tie-anon-other", before);
 }
 
 /* Row badge and the health channel share one rank. ROWTEST stays generic:
@@ -540,6 +585,17 @@ static void TestRowRank(void)
     Run();
     ExpectRank(197, ATTR_EV_RANK, (int)HEALTH_STATUS_CAUTION, "hdd pending 2");
     CaseEnd("row-pend2", before);
+
+    /* Confirmed media Risk still sets the headline. Attribute 184 is a
+     * local HDD rule: observe from 1, caution from 5. */
+    before = g_fail;
+    Base(DRIVE_TYPE_HDD, "ROWTEST", "1.0");
+    Expect(AddAttr(184, 100, 3), "row e2e slot");
+    Run();
+    ExpectRank(184, ATTR_EV_RANK, (int)HEALTH_STATUS_OBSERVE, "hdd e2e 3");
+    ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_OBSERVE, "hdd e2e media");
+    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_OBSERVE, "hdd e2e headline");
+    CaseEnd("row-e2e", before);
 
     before = g_fail;
     Base(DRIVE_TYPE_HDD, "ROWTEST", "1.0");
@@ -603,6 +659,41 @@ static void TestRowRank(void)
     CaseEnd("row-sam187", before);
 
     before = g_fail;
+    Base(DRIVE_TYPE_SSD_SATA, "Crucial_CT500MX200SSD1", "MU01");
+    Expect(AddAttr(187, 100, 3), "mx200 slot");
+    Run();
+    ExpectStr(g.szProfileId, "mx200", "mx200 profile");
+    ExpectRank(187, ATTR_EV_RANK, (int)HEALTH_STATUS_CAUTION, "mx200 187");
+    ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_CAUTION, "mx200 media");
+    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_CAUTION, "mx200 head");
+    CaseEnd("row-mx200", before);
+
+    before = g_fail;
+    Base(DRIVE_TYPE_SSD_SATA, "Crucial_CT500MX200SSD1", "MU01");
+    Expect(AddAttr(187, 100, 0), "mx200 zero slot");
+    Run();
+    ExpectRank(187, ATTR_EV_RANK, (int)HEALTH_STATUS_GOOD, "mx200 187 zero");
+    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_GOOD, "mx200 zero head");
+    CaseEnd("row-mx200-0", before);
+
+    before = g_fail;
+    Base(DRIVE_TYPE_SSD_SATA, "CT500MX200SSD1", "MU01");
+    Expect(AddAttr(187, 100, 3), "mx200 bare slot");
+    Run();
+    ExpectStr(g.szProfileId, "mx200", "mx200 bare profile");
+    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_CAUTION, "mx200 bare head");
+    CaseEnd("row-mx200-bare", before);
+
+    before = g_fail;
+    Base(DRIVE_TYPE_SSD_SATA, "Micron_M500_MTFDDAK960MAV", "MU05");
+    Expect(AddAttr(187, 100, 3), "m500 slot");
+    Run();
+    ExpectStr(g.szProfileId, "crucial-micron", "m500 profile");
+    ExpectRank(187, ATTR_EV_RANK, (int)HEALTH_STATUS_CAUTION, "m500 187");
+    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_CAUTION, "m500 head");
+    CaseEnd("row-m500", before);
+
+    before = g_fail;
     Base(DRIVE_TYPE_SSD_SATA, "KINGSTON SA400S37240G", "SBFKB1H5");
     Expect(AddAttr(0xA1, 100, 5), "row a1 slot");
     Run();
@@ -624,8 +715,8 @@ static void TestRowRank(void)
 }
 
 /* SMART Modular attribute 1 is raw48 Uncorrectable_ECC_Cnt. The name is
- * only a hint, so RAW 5 is Risk. RAW 0 stays Good. Attribute 199 keeps
- * the local CRC thresholds. */
+ * only a hint, so RAW 5 is Risk on the row and the headline stays Good.
+ * RAW 0 stays Good. Attribute 199 keeps the local CRC thresholds. */
 static void TestSmartModular(void)
 {
     int before = g_fail;
@@ -636,8 +727,8 @@ static void TestSmartModular(void)
               "smartmod family");
     ExpectSem(1, PROF_SEM_MEDIA, PROF_ENC_COUNTER, "smartmod 1");
     ExpectRank(1, ATTR_EV_RANK, (int)HEALTH_STATUS_OBSERVE, "smartmod 1 risk");
-    ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_OBSERVE, "smartmod media");
-    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_OBSERVE, "smartmod headline");
+    ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_GOOD, "smartmod media");
+    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_GOOD, "smartmod headline");
     Expect(g.eHealthStatus != HEALTH_STATUS_CAUTION, "smartmod not caution");
     CaseEnd("smartmod-5", before);
 
@@ -694,8 +785,8 @@ static void TestPackedName(void)
     Run();
     ExpectSem(170, PROF_SEM_MEDIA, PROF_ENC_COUNTER, "pack 170");
     ExpectRank(170, ATTR_EV_RANK, (int)HEALTH_STATUS_OBSERVE, "pack 170 risk");
-    ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_OBSERVE, "pack170 media");
-    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_OBSERVE, "pack170 headline");
+    ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_GOOD, "pack170 media");
+    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_GOOD, "pack170 headline");
     Expect(g.eReliability != HEALTH_STATUS_CAUTION, "pack170 not caution");
     CaseEnd("pack-170", before);
 }
@@ -792,6 +883,7 @@ int main(void)
     TestBarracuda();
     TestUsbSkip();
     TestDriveDbTie();
+    TestDriveDbTieUnnamed();
     TestRowRank();
     TestSmartModular();
     TestPackedName();

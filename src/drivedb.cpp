@@ -30,7 +30,10 @@ struct drive_settings {
 
 static const drive_settings kDriveDb[] = {
 #include "../third_party/smartmontools/drivedb.h"
-    /* Not an upstream row. Two exact matches of ZZTIEPROBE, so a tie can
+#ifdef DM_TESTS
+    /* Test rows only. DriveMonitor.exe is built without DM_TESTS.
+     * drivedb_test.exe links a second object compiled with -DDM_TESTS.
+     * Not an upstream row. Two exact matches of ZZTIEPROBE, so a tie can
      * be tested without editing drivedb.h. A real disk is not named that.
      * The earlier row stays the label. 231 disagrees and is dropped.
      * 5 agrees and stays. 232 exists only on the later row and is not
@@ -48,8 +51,8 @@ static const drive_settings kDriveDb[] = {
       "-v 5,raw48,Reallocated_Sector_Ct "
       "-v 232,raw48,Lifetime_Left "
     },
-    /* Not an upstream row. A packed RAW must not be scored as one count,
-     * and a plain name hint must not become Caution from 1. */
+    /* A packed RAW must not be scored as one count, and a plain name
+     * hint must not become Caution from 1. */
     { "Packed Name Probe",
       "ZZPACKPROBE",
       "", "",
@@ -58,8 +61,8 @@ static const drive_settings kDriveDb[] = {
       "-v 170,raw48,Uncorrectable_ECC_Cnt "
       "-v 218,raw24/raw32,CRC_Error_Count "
     },
-    /* Not an upstream row. A name longer than the 43-character store
-     * must still reach the HDD/SSD flag after the comma. */
+    /* A name longer than the 43-character store must still reach the
+     * HDD/SSD flag after the comma. */
     { "Long Name Probe",
       "ZZLONGNAME",
       "", "",
@@ -67,6 +70,33 @@ static const drive_settings kDriveDb[] = {
       "-v 161,raw48,ABCDEFGHIJ_ABCDEFGHIJ_ABCDEFGHIJ_ABCDEFGHIJX,SSD "
       "-v 162,raw48,Short_Name,HDD "
     },
+    /* Equal score, empty family. 231 disagrees and is dropped. The
+     * lecture must say so: there is no family name to print. */
+    { "",
+      "ZZTIEANON",
+      "", "",
+      "-v 231,raw48,Lifetime_Left "
+      "-v 5,raw48,Reallocated_Sector_Ct "
+    },
+    { "Anon Tie Later",
+      "ZZTIEANON",
+      "", "",
+      "-v 231,raw48,Total_Erase_Count "
+      "-v 5,raw48,Reallocated_Sector_Ct "
+    },
+    { "Anon Tie Earlier",
+      "ZZTIENONE",
+      "", "",
+      "-v 231,raw48,Lifetime_Left "
+      "-v 5,raw48,Reallocated_Sector_Ct "
+    },
+    { "",
+      "ZZTIENONE",
+      "", "",
+      "-v 231,raw48,Total_Erase_Count "
+      "-v 5,raw48,Reallocated_Sector_Ct "
+    },
+#endif
 };
 
 enum { DRIVEDB_N = (int)(sizeof(kDriveDb) / sizeof(kDriveDb[0])) };
@@ -687,6 +717,7 @@ void DriveDbApply(DRIVE_INFO* p)
     p->szModelFamily[0] = '\0';
     p->szDriveDbWarn[0] = '\0';
     p->szDriveDbTie[0] = '\0';
+    p->bDriveDbTieUnnamed = FALSE;
     p->nDriveDbAttrs = 0;
     TrimCopy(model, (int)sizeof(model), p->szModel);
     TrimCopy(fw, (int)sizeof(fw), p->szFirmware);
@@ -729,11 +760,19 @@ void DriveDbApply(DRIVE_INFO* p)
         lstrcpynA(p->szDriveDbWarn, e->warningmsg,
                   (int)sizeof(p->szDriveDbWarn));
     }
-    for (t = 0; t < nTies && !p->szDriveDbTie[0]; t++) {
+    for (t = 0; t < nTies; t++) {
         const char* fam = kDriveDb[ties[t]].modelfamily;
-        if (fam && fam[0])
-            lstrcpynA(p->szDriveDbTie, fam, (int)sizeof(p->szDriveDbTie));
+        if (fam && fam[0]) {
+            if (!p->szDriveDbTie[0])
+                lstrcpynA(p->szDriveDbTie, fam, (int)sizeof(p->szDriveDbTie));
+        } else {
+            /* An empty family still contests attributes. The lecture
+             * needs a mark, because there is no name to print. */
+            p->bDriveDbTieUnnamed = TRUE;
+        }
     }
+    if (nTies > 0 && !(e->modelfamily && e->modelfamily[0]))
+        p->bDriveDbTieUnnamed = TRUE;
     if (p->bIsNVMe) return;
     hdd = (p->eType == DRIVE_TYPE_HDD && !p->bIsNVMe);
     bag.attr = p->driveDbAttr;

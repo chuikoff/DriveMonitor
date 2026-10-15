@@ -547,9 +547,13 @@ typedef struct _DRIVE_INFO {
     char        szModelFamily[96];
     char        szDriveDbWarn[160];
     /* Another drivedb row matched at the same score. The family above is
-     * still the earlier row. Empty when the score has a single winner.
-     * This is not szProfileConflict. */
+     * still the earlier row. Empty when the score has a single winner,
+     * or when that other row has no family name. This is not
+     * szProfileConflict. */
     char        szDriveDbTie[96];
+    /* An equal-score row has an empty family. The lecture and the report
+     * still say the tie exists and that a disagreed attribute is dropped. */
+    BOOL        bDriveDbTieUnnamed;
     int         nDriveDbAttrs;
     DRIVEDB_ATTR driveDbAttr[DRIVEDB_ATTR_MAX];
 } DRIVE_INFO;
@@ -858,7 +862,7 @@ typedef struct _PROF_HEALTH {
     int caution;
     int bad;
     int badHdd;
-    int fallback;             /* use only when that slot is still empty */
+    int fallback;             /* drivedb name hint, not a confirmed rule */
 } PROF_HEALTH;
 
 /* Extra profile. The caller keeps every pointer alive.
