@@ -484,7 +484,7 @@ typedef struct _DRIVE_INFO {
     BOOL        bPrefailNow;          /* prefail current <= thresh, thresh != 0 */
     BOOL        bPrefailPast;         /* prefail worst <= thresh, current still above */
     BOOL        bUsageFailed;         /* old-age current <= thresh, thresh != 0 */
-    char        szEvidence[384];      /* one-line Russian evidence for UI */
+    char        szEvidence[384];      /* one-line evidence in the UI language at assessment */
     DRIVE_VENDOR     eVendor;            /* Drive brand from model string */
     DRIVE_CONTROLLER eController;        /* SSD ASIC / HDD MCU */
     char        szControllerChip[72];    /* e.g. "Silicon Motion SM2262EN/…" */

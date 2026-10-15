@@ -55,9 +55,9 @@ static void FormatNvmeHostBytes(unsigned __int64 units, char* szBuf, int nBufLen
     double bytes = (double)units * 512000.0;
     double tb = bytes / 1e12;
     if (tb >= 1.0)
-        safe_snprintf_n(szBuf, nBufLen, "%.1f ТБ", tb);
+        safe_snprintf_n(szBuf, nBufLen, TN("%.1f ТБ", "%.1f TB"), tb);
     else
-        safe_snprintf_n(szBuf, nBufLen, "%.1f ГБ", bytes / 1e9);
+        safe_snprintf_n(szBuf, nBufLen, TN("%.1f ГБ", "%.1f GB"), bytes / 1e9);
 }
 
 /* USB enclosure/chip name from SCSI INQUIRY; type name / VID:PID fallback.
@@ -68,9 +68,9 @@ static void FormatAtaWrites(int nGiB, char* szBuf, int nBufLen)
 {
     if (nGiB < 0) { szBuf[0] = '\0'; return; }
     if (nGiB >= 1024)
-        safe_snprintf_n(szBuf, nBufLen, "%.1f ТБ", (double)nGiB / 1024.0);
+        safe_snprintf_n(szBuf, nBufLen, TN("%.1f ТБ", "%.1f TB"), (double)nGiB / 1024.0);
     else
-        safe_snprintf_n(szBuf, nBufLen, "%d ГБ", nGiB);
+        safe_snprintf_n(szBuf, nBufLen, TN("%d ГБ", "%d GB"), nGiB);
 }
 
 /* Unified SMART headline for every drive type:
@@ -81,9 +81,9 @@ static void FormatSmartHeadline(const DRIVE_INFO* pInfo, char* szBuf, int nBufLe
     char szSpare[32], szWear[32], szWritten[32];
     if (!pInfo || nBufLen <= 0) return;
     szBuf[0] = '\0';
-    lstrcpynA(szSpare, "н/д", sizeof(szSpare));
-    lstrcpynA(szWear, "н/д", sizeof(szWear));
-    lstrcpynA(szWritten, "н/д", sizeof(szWritten));
+    lstrcpynA(szSpare, TN("н/д", "n/a"), sizeof(szSpare));
+    lstrcpynA(szWear, TN("н/д", "n/a"), sizeof(szWear));
+    lstrcpynA(szWritten, TN("н/д", "n/a"), sizeof(szWritten));
 
     if (pInfo->bIsNVMe && pInfo->bSMART_Supported) {
         safe_snprintf(szSpare, "%d%%",
@@ -100,8 +100,10 @@ static void FormatSmartHeadline(const DRIVE_INFO* pInfo, char* szBuf, int nBufLe
             FormatAtaWrites(pInfo->nSSDTotalWritesGB, szWritten, sizeof(szWritten));
     }
 
-    safe_snprintf_n(szBuf, nBufLen, "Запас %s  ·  Износ %s  ·  Записано %s",
-              szSpare, szWear, szWritten);
+    safe_snprintf_n(szBuf, nBufLen,
+        TN("Запас %s  ·  Износ %s  ·  Записано %s",
+           "Spare %s  ·  Wear %s  ·  Written %s"),
+        szSpare, szWear, szWritten);
 }
 
 static void FormatUsbAdapterName(const DRIVE_INFO* p, char* szBuf, int nBufLen)
@@ -251,8 +253,9 @@ int UiScale(int px)
 /* Logical (96 DPI, 100% zoom) SMART-list column widths and visual order.
  * Layout used to force these on every WM_SIZE, so a drag was lost at once
  * and nothing was written to the registry. */
-static const int kAttrColDef[ATTR_NCOLS] = { 72, 200, 70, 50, 50, 108, 180, 116 };
-static int g_attrColLogical[ATTR_NCOLS] = { 72, 200, 70, 50, 50, 108, 180, 116 };
+/* Worst is 68: "Худший" does not fit in the old 50 with the header inset. */
+static const int kAttrColDef[ATTR_NCOLS] = { 72, 200, 70, 68, 50, 108, 180, 116 };
+static int g_attrColLogical[ATTR_NCOLS] = { 72, 200, 70, 68, 50, 108, 180, 116 };
 static int g_attrColOrder[ATTR_NCOLS] = { 0, 1, 2, 3, 4, 5, 6, 7 };
 
 static int AttrColOrderValid(const int* order)
@@ -336,6 +339,9 @@ static void AttrColsLoad(void)
         if (ok) {
             for (i = 0; i < ATTR_NCOLS; i++)
                 g_attrColLogical[i] = (int)w[i];
+            /* Saved 50 is the first default. The header "Худший" is clipped there. */
+            if (g_attrColLogical[3] == 50)
+                g_attrColLogical[3] = kAttrColDef[3];
         }
     }
     sz = sizeof(o);
@@ -1228,7 +1234,8 @@ static void DoSafeEject(HWND hWnd)
     if (!SafeEjectPhysicalDrive(pInfo->nDriveIndex, szErr, (int)sizeof(szErr))) {
         MessageBoxU8(hWnd,
             szErr[0] ? szErr :
-                "Не удалось извлечь диск. Закройте файлы и повторите.",
+                TN("Не удалось извлечь диск. Закройте файлы и повторите.",
+                   "Could not eject the drive. Close any open files and try again."),
             "DriveMonitor", MB_OK | MB_ICONWARNING);
         return;
     }
@@ -2876,7 +2883,7 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
     {
         WORD wMs = w16;
         if (wMs > 0 && wMs < 30000)
-            safe_snprintf(szMain, "%u ms", wMs);
+            safe_snprintf(szMain, TN("%u мс", "%u ms"), wMs);
         else
             safe_snprintf(szMain, "%lu", (unsigned long)dw32);
         break;
@@ -2950,7 +2957,9 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
         if (UseSeagateRateRaw(pDrv)) {
             unsigned nErr = SeagateRateErrs(pRaw);
             DWORD nOps = SeagateRateOps(pRaw);
-            safe_snprintf(szMain, "%u ош. чтения / %lu секторов", nErr, (unsigned long)nOps);
+            safe_snprintf(szMain, TN("%u ош. чтения / %lu секторов",
+                                     "%u read errors / %lu sectors"),
+                          nErr, (unsigned long)nOps);
             break;
         }
         if (eType == DRIVE_TYPE_HDD) {
@@ -3044,7 +3053,9 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
         if (UseSeagateRateRaw(pDrv)) {
             unsigned nErr = SeagateRateErrs(pRaw);
             DWORD nOps = SeagateRateOps(pRaw);
-            safe_snprintf(szMain, "%u ошибок чтения / %lu секторов", nErr, (unsigned long)nOps);
+            safe_snprintf(szMain, TN("%u ошибок чтения / %lu секторов",
+                                     "%u read errors / %lu sectors"),
+                          nErr, (unsigned long)nOps);
             break;
         }
         if (dw32 == 0)
@@ -3061,7 +3072,9 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
         if (UseSeagateRateRaw(pDrv)) {
             unsigned nErr = SeagateRateErrs(pRaw);
             DWORD nOps = SeagateRateOps(pRaw);
-            safe_snprintf(szMain, "%u ошибок позиц. / %lu seeks", nErr, (unsigned long)nOps);
+            safe_snprintf(szMain, TN("%u ошибок позиц. / %lu поисков",
+                                     "%u seek errors / %lu seeks"),
+                          nErr, (unsigned long)nOps);
             break;
         }
         if (dw32 == 0)
@@ -5011,8 +5024,8 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
     case WM_NOTIFY:
         {
             NMHDR* pHdr = (NMHDR*)lParam;
-            /* Status badge for col 6 only. Code comes from lItemlParam
-             * (set at fill time). Never LVM_GETITEM / CreateFont here. */
+            /* Status badge is ATTR_COL_STATUS. Code comes from lItemlParam
+             * (set at fill time). Never CreateFont here. */
             {
                 HWND hList = GetDlgItem(hWnd, IDC_ATTR_LIST);
                 HWND hHdr  = hList ? ListView_GetHeader(hList) : NULL;
@@ -5070,7 +5083,14 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                             return CDRF_NEWFONT;
 
                         int nSt = (int)(pCD->nmcd.lItemlParam & 0xFF);
-                        RECT rcCell = pCD->nmcd.rc;
+                        RECT rcCell;
+                        /* nmcd.rc for a subitem sits above the row. The list
+                         * cell rect is in the same coordinates as this HDC. */
+                        if (!ListView_GetSubItemRect((HWND)pCD->nmcd.hdr.hwndFrom,
+                                                     (int)pCD->nmcd.dwItemSpec,
+                                                     ATTR_COL_STATUS, LVIR_BOUNDS,
+                                                     &rcCell))
+                            rcCell = pCD->nmcd.rc;
                         if (nSt == ATTRST_NONE || (rcCell.right - rcCell.left) < 8)
                             return CDRF_DODEFAULT;
 
@@ -5130,7 +5150,7 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                             ZeroMemory(&li, sizeof(li));
                             li.mask = LVIF_TEXT;
                             li.iItem = (int)pCD->nmcd.dwItemSpec;
-                            li.iSubItem = 6;
+                            li.iSubItem = ATTR_COL_STATUS;
                             li.pszText = wz;
                             li.cchTextMax = 40;
                             if (!SendMessageW(pCD->nmcd.hdr.hwndFrom, LVM_GETITEMW,
@@ -5142,12 +5162,17 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                         SIZE sz;
                         GetTextExtentPoint32W(hdc, wz, lstrlenW(wz), &sz);
 
-                        int badgeH  = sz.cy + UiScale(6);
-                        int badgeW  = sz.cx + UiScale((nSt == ATTRST_SKIP) ? 20 : 16);
                         int cellCX  = rcCell.right  - rcCell.left;
                         int cellCY  = rcCell.bottom - rcCell.top;
+                        int badgeH  = sz.cy + UiScale(4);
+                        int badgeW  = sz.cx + UiScale((nSt == ATTRST_SKIP) ? 20 : 16);
+                        if (badgeH > cellCY) badgeH = cellCY;
+                        if (badgeW > cellCX - 2) badgeW = cellCX - 2;
+                        if (badgeW < 4) badgeW = 4;
                         int bx      = rcCell.left + (cellCX - badgeW) / 2;
                         int by      = rcCell.top  + (cellCY - badgeH) / 2;
+                        if (bx < rcCell.left) bx = rcCell.left;
+                        if (by < rcCell.top) by = rcCell.top;
                         RECT rcBadge = { bx, by, bx + badgeW, by + badgeH };
 
                         HBRUSH hbrBadge = CreateSolidBrush(clrBadgeBg);

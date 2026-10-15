@@ -1753,18 +1753,22 @@ BOOL SafeEjectPhysicalDrive(int nDrive, char* szErr, int nErrLen)
 
     if (szErr && nErrLen > 0) szErr[0] = '\0';
     if (!OpenDrive(nDrive, &hDisk)) {
-        if (szErr) safe_snprintf_n(szErr, nErrLen, "Не удалось открыть диск.");
+        if (szErr) safe_snprintf_n(szErr, nErrLen,
+            TN("Не удалось открыть диск.", "Could not open the drive."));
         return FALSE;
     }
     if (!GetDiskNumber(hDisk, &nDisk)) {
         CloseHandle(hDisk);
-        if (szErr) safe_snprintf_n(szErr, nErrLen, "Не удалось определить номер диска.");
+        if (szErr) safe_snprintf_n(szErr, nErrLen,
+            TN("Не удалось определить номер диска.",
+               "Could not determine the disk number."));
         return FALSE;
     }
     if (DiskNumberIsSystem(nDisk)) {
         CloseHandle(hDisk);
         if (szErr) safe_snprintf_n(szErr, nErrLen,
-            "Это системный диск Windows. Его нельзя извлечь.");
+            TN("Это системный диск Windows. Его нельзя извлечь.",
+               "This is the Windows system disk. It cannot be ejected."));
         return FALSE;
     }
     DismountDiskVolumes(nDisk);
@@ -1777,7 +1781,8 @@ BOOL SafeEjectPhysicalDrive(int nDrive, char* szErr, int nErrLen)
 
     if (!FindDiskDevInst(nDisk, &inst) || inst == 0) {
         if (szErr) safe_snprintf_n(szErr, nErrLen,
-            "Тома размонтированы, но устройство в дереве PnP не найдено.");
+            TN("Тома размонтированы, но устройство в дереве PnP не найдено.",
+               "Volumes were dismounted, but the device was not found in the PnP tree."));
         return FALSE;
     }
     for (walk = 0; walk < 16 && inst; walk++) {
@@ -1792,7 +1797,8 @@ BOOL SafeEjectPhysicalDrive(int nDrive, char* szErr, int nErrLen)
     }
     if (!ejected) {
         if (szErr) safe_snprintf_n(szErr, nErrLen,
-            "Windows не отключил устройство. Закройте файлы на диске и повторите.");
+            TN("Windows не отключил устройство. Закройте файлы на диске и повторите.",
+               "Windows did not disconnect the device. Close files on the drive and try again."));
         return FALSE;
     }
     return TRUE;

@@ -462,7 +462,7 @@ static void PadUtf8(char* dst, int nDst, const char* s, int width)
 static void FmtIntOrNA(char* buf, int nBuf, int v)
 {
     if (v < 0)
-        safe_snprintf_n(buf, nBuf, "нет данных");
+        safe_snprintf_n(buf, nBuf, "%s", Tr(STR_POH_NONE));
     else
         safe_snprintf_n(buf, nBuf, "%d", v);
 }
@@ -1419,12 +1419,13 @@ void AssessDriveHealth(DRIVE_INFO* pInfo)
         pInfo->nHealthPercent = -1;
     }
 
-    /* One-line Russian evidence. Full words; lecture has the matrix. */
+    /* One-line evidence in the UI language at assessment time. */
     if (pInfo->bIsNVMe) {
         char szCW[128];
         FormatNvmeCritWarnBits(cw, szCW, (int)sizeof(szCW));
         safe_snprintf(pInfo->szEvidence,
-            "Критическое предупреждение: %s. Ошибки носителя: %llu.",
+            TN("Критическое предупреждение: %s. Ошибки носителя: %llu.",
+               "Critical warning: %s. Media errors: %llu."),
             szCW,
             (unsigned long long)pInfo->qwNVMeMediaErrors);
     } else {
@@ -1433,10 +1434,11 @@ void AssessDriveHealth(DRIVE_INFO* pInfo)
         FmtIntOrNA(szPend, (int)sizeof(szPend), pInfo->nPendingSectors);
         FmtIntOrNA(szU,    (int)sizeof(szU),    pInfo->nUncorrectable);
         safe_snprintf(pInfo->szEvidence,
-            "Переназначенные сектора: %s  Ожидающие сектора: %s  Неисправимые сектора: %s  Нарушение порога: %s  Прогноз отказа: %s",
+            TN("Переназначенные сектора: %s  Ожидающие сектора: %s  Неисправимые сектора: %s  Нарушение порога: %s  Прогноз отказа: %s",
+               "Reallocated sectors: %s  Pending sectors: %s  Uncorrectable sectors: %s  Threshold exceeded: %s  Failure prediction: %s"),
             szR, szPend, szU,
-            pInfo->bThresholdViolation ? "да" : "нет",
-            pInfo->bPredictFailure     ? "да" : "нет");
+            pInfo->bThresholdViolation ? TN("да", "yes") : TN("нет", "no"),
+            pInfo->bPredictFailure     ? TN("да", "yes") : TN("нет", "no"));
     }
 }
 
@@ -1501,7 +1503,7 @@ static void LectureProfileRow(char* buf, int nBuf, const DRIVE_INFO* p)
 static void LectureFmtInt(char* buf, int nBuf, int v)
 {
     if (v < 0)
-        safe_snprintf_n(buf, nBuf, "нет данных");
+        safe_snprintf_n(buf, nBuf, "%s", Tr(STR_POH_NONE));
     else
         safe_snprintf_n(buf, nBuf, "%d", v);
 }
@@ -1528,10 +1530,13 @@ static void LectureAddUnknownIdList(char* buf, int nBuf, const DRIVE_INFO* pInfo
         nUnk++;
     }
     if (nUnk > 0) {
-        LectureAddF(buf, nBuf,
+        LectureAddF(buf, nBuf, TN(
             "Атрибуты %s не оцениваются: нет доверенного профиля RAW-кодировки "
             "для этого контроллера/прошивки. Большое RAW-значение не доказывает сбои. "
             "Unknown ≠ Bad.\r\n",
+            "Attributes %s are not scored: there is no trusted RAW encoding profile "
+            "for this controller or firmware. A large RAW value does not prove failures. "
+            "Unknown is not Bad.\r\n"),
             szIds);
     }
 }
@@ -1589,9 +1594,11 @@ static void LectureAddDualStatus(char* szBuf, int nBufLen, const DRIVE_INFO* pIn
                 GetHealthStatusName(pInfo->eHealthStatus));
     if (pInfo->bIsUSB && pInfo->bSMART_Supported &&
         !pInfo->bGotReturnStatus && !pInfo->bIsNVMe)
-        LectureAdd(szBuf, nBufLen,
+        LectureAdd(szBuf, nBufLen, TN(
             "USB-мост не отдаёт SMART RETURN STATUS — это не отказ диска. "
-            "Оценка ниже по таблице SMART.\r\n\r\n");
+            "Оценка ниже по таблице SMART.\r\n\r\n",
+            "The USB bridge does not return SMART RETURN STATUS — that is not a drive failure. "
+            "The assessment below comes from the SMART table.\r\n\r\n"));
     if (pInfo->bIsUSB) {
         char cap[160];
         FormatUsbCapability(pInfo, cap, (int)sizeof(cap));
@@ -2530,9 +2537,11 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
                                       "Vendor RAW quality: %s\r\n"),
                     QualityNameRu(pInfo->eRawQuality, TRUE));
         if (pInfo->eNormQuality == NORM_QUALITY_LOW)
-            LectureAdd(szBuf, nBufLen,
+            LectureAdd(szBuf, nBufLen, TN(
                 "Одинаковые Value/Worst/Threshold (100/100/50) не означают, что всё идеально — "
-                "у этой прошивки нормализованные числа слабо различают состояние.\r\n");
+                "у этой прошивки нормализованные числа слабо различают состояние.\r\n",
+                "Identical Value/Worst/Threshold (100/100/50) does not mean everything is fine — "
+                "this firmware's normalized numbers barely separate conditions.\r\n"));
         LectureAdd(szBuf, nBufLen, "\r\n");
     }
 
@@ -3047,7 +3056,8 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
             char szCtl[64];
             const char* ctl = GetControllerName(pInfo->eController);
             if (pInfo->eController == CONTROLLER_PHISON && nUnknown > 0)
-                safe_snprintf(szCtl, "Phison (RAW частично)");
+                safe_snprintf(szCtl, "%s",
+                    TN("Phison (RAW частично)", "Phison (RAW partial)"));
             else
                 safe_snprintf(szCtl, "%s", ctl);
             LectureMatrixRow(szBuf, nBufLen, TN("Контроллер", "Controller"), szCtl,
@@ -3095,9 +3105,11 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
             "a normalized scale of 100 versus 200 is not \"twice as healthy\". "
             "Raw counters are facts, not a 0–100 score.\r\n"));
         if (pInfo->nEndurancePercent >= 0)
-            LectureAdd(szBuf, nBufLen,
+            LectureAdd(szBuf, nBufLen, TN(
                 "Заявленный остаток ресурса — цифра контроллера про износ NAND, "
-                "это не здоровье диска и не означает, что диск новый.\r\n");
+                "это не здоровье диска и не означает, что диск новый.\r\n",
+                "Reported life remaining is the controller's NAND-wear figure. "
+                "It is not disk health and does not mean the disk is new.\r\n"));
         else
             LectureAdd(szBuf, nBufLen, TN(
                 "Для этого диска заявленный остаток ресурса (износ) не задан — "
