@@ -2797,6 +2797,14 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
     {
         ATTR_DECODE dec;
         GetAttrDecode(bID, pDrv, &dec);
+        /* PACKED and PAIR are not one counter. A known -v layout prints
+         * its fields. Any other composite says the RAW is not decoded.
+         * The id switch below does not choose that text. */
+        if (FormatAttrRawText(pDrv, bID, pRaw, (unsigned)bVal, (unsigned)bWorst,
+                              szMain, (int)sizeof(szMain))) {
+            safe_snprintf_n(szBuf, nBufLen, "%s", szMain);
+            return;
+        }
         if (dec.eState == ATTR_DECODE_UNKNOWN) {
             if (bID == 0xBB) {
                 safe_snprintf(szMain, "(vendor-specific)");
@@ -2832,15 +2840,16 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
             nLife = (int)w16;
 
         if (E7IsLifePercent(pDrv)) {
-            /* Non-Samsung life is the low 16 bits of RAW, the same figure
-             * the lecture stores. Value can stay at 100 after RAW steps
-             * (Apacer AS350: Value 100, RAW 99). Samsung RAW is an erase
-             * count, so Value stays. When Value and RAW disagree and the
+            /* PERCENT is the low 16 bits of RAW, the same figure the
+             * lecture stores. Value can stay at 100 after RAW steps
+             * (Apacer AS350: Value 100, RAW 99). VALUE keeps the
+             * normalized byte: Samsung RAW is an erase count, Maxio RAW
+             * is percent used. When Value and RAW disagree and the
              * headline did not take this RAW, keep Value: Phison then
              * reports life from A9. */
-            /* Maxio 231: Value is life remaining, RAW is percent used.
-             * Samsung RAW is an erase count. Both stay on Value. */
-            if (pDrv && !(pDrv->nProfileFlags & PROF_F_E7_VALUE) && w16 <= 100) {
+            int enc7 = PROF_ENC_NONE;
+            AttrEncOf(pDrv, bID, NULL, &enc7);
+            if (pDrv && enc7 != PROF_ENC_VALUE && w16 <= 100) {
                 int raw16 = (int)w16;
                 int endurance = pDrv->nEndurancePercent;
                 BOOL disagree = (bVal <= 100 && (int)bVal != raw16);
@@ -3215,12 +3224,7 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
     {
         int enc9 = PROF_ENC_NONE;
         BOOL have9 = AttrEncOf(pDrv, bID, NULL, &enc9);
-        if (have9 && enc9 == PROF_ENC_PAIR) {
-            unsigned lo = (unsigned)(dw32 & 0xFFFFu);
-            unsigned hi = (unsigned)((dw32 >> 16) & 0xFFFFu);
-            safe_snprintf(szMain, "%u / %u", lo, hi);
-            break;
-        }
+        /* A pair is already printed by FormatAttrRawText. */
         /* A9 is life remaining only on Phison or a profile that says so. */
         if (pDrv && IsPhisonFamily(pDrv)) {
             /* Summary picked another counter (E7). Do not also call this RAW life. */
@@ -3248,7 +3252,11 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
     }
 
     case 0xB1:
-        if (pDrv && (pDrv->nProfileFlags & PROF_F_B1_LIFE) && bVal <= 100) {
+    {
+        int semB = PROF_SEM_NONE, encB = PROF_ENC_NONE;
+        if (AttrEncOf(pDrv, bID, &semB, &encB) &&
+            semB == PROF_SEM_ENDURANCE && encB == PROF_ENC_VALUE &&
+            bVal <= 100) {
             safe_snprintf(szMain, TN("износ/остаток %u%%", "wear/life %u%%"),
                           (unsigned)bVal);
             break;
@@ -3258,16 +3266,23 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
         else
             safe_snprintf(szMain, "%lu", (unsigned long)dw32);
         break;
+    }
 
     case 0xCA:
     {
         int semCa = PROF_SEM_NONE, encCa = PROF_ENC_NONE;
         if (AttrEncOf(pDrv, bID, &semCa, &encCa) &&
-            semCa == PROF_SEM_ENDURANCE && encCa == PROF_ENC_PERCENT &&
-            bVal <= 100) {
-            safe_snprintf(szMain, TN("%u%% ресурса", "%u%% life remaining"),
-                          (unsigned)bVal);
-            break;
+            semCa == PROF_SEM_ENDURANCE) {
+            if (encCa == PROF_ENC_VALUE && bVal <= 100) {
+                safe_snprintf(szMain, TN("%u%% ресурса", "%u%% life remaining"),
+                              (unsigned)bVal);
+                break;
+            }
+            if (encCa == PROF_ENC_PERCENT && dw32 <= 100) {
+                safe_snprintf(szMain, TN("%lu%% ресурса", "%lu%% life remaining"),
+                              (unsigned long)dw32);
+                break;
+            }
         }
         if (qw48 > 0xFFFFFFFFULL)
             safe_snprintf(szMain, "%llu", (unsigned long long)qw48);
@@ -3326,14 +3341,6 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
         if (encA == PROF_ENC_PERCENT && bVal <= 100) {
             safe_snprintf(szMain, TN("%u%%  резервное пространство",
                                      "%u%%  reserved space"), (unsigned)bVal);
-        } else if (encA == PROF_ENC_PAIR) {
-            /* MKP-521 / z54z10: bytes [1:0] early, bytes [5:4] later.
-             * A low/high 24-bit split labels the factory count as later. */
-            unsigned early = (unsigned)pRaw[0] | ((unsigned)pRaw[1] << 8);
-            unsigned later = (unsigned)pRaw[4] | ((unsigned)pRaw[5] << 8);
-            safe_snprintf(szMain, TN("%u поздних / %u ранних",
-                                     "%u later / %u early"),
-                          later, early);
         } else {
             safe_snprintf(szMain, "%lu", (unsigned long)dw32);
         }
@@ -3498,15 +3505,14 @@ static const char* AtaRowStatus(const DRIVE_INFO* p, const SMART_ATTRIBUTE* a,
     if (ev == ATTR_EV_RANK) return RankToken(rank);
     if (ev == ATTR_EV_SKIP) return "Не оценивается";
 
-    if (ssd && (id == 0xE7 || id == 0xA9)) {
-        int nLeft = p->nEndurancePercent;
-        int semLife = PROF_SEM_NONE;
-        BOOL lifeId = (id == 0xE7 && E7IsLifePercent(p)) ||
-                      (id == 0xA9 &&
-                       ProfileLookup(p, 0xA9, &semLife, NULL) &&
-                       semLife == PROF_SEM_ENDURANCE);
-        if (!lifeId || nLeft < 0) return "Не оценивается";
-        return RankToken(WearBadgeStatus(nLeft));
+    if (ssd) {
+        int semLife = PROF_SEM_NONE, encLife = PROF_ENC_NONE;
+        if (ProfileLookup(p, id, &semLife, &encLife) &&
+            semLife == PROF_SEM_ENDURANCE &&
+            (encLife == PROF_ENC_PERCENT || encLife == PROF_ENC_VALUE)) {
+            if (p->nEndurancePercent < 0) return "Не оценивается";
+            return RankToken(WearBadgeStatus(p->nEndurancePercent));
+        }
     }
 
     if (id == 0xC3) {

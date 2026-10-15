@@ -15,6 +15,8 @@
  * nHealthPercent is SECONDARY estimated remaining life only (endurance),
  * never a fake % from worst/thresh or raw*N penalties.
  * nConfidence is completeness of evidence, not "how healthy".
+ * An HDD has no wear scale, so nHealthPercent stays -1.
+ * That absence does not zero nConfidence.
  * ============================================================ */
 
 /* Find threshold value for a given attribute ID */
@@ -834,8 +836,8 @@ static void AssessHddHealth(DRIVE_INFO* pInfo)
     if (SelfTestFailed(pInfo))
         pInfo->eHealthStatus = HEALTH_STATUS_CRITICAL;
 
+    /* No endurance scale. Confidence is the blend in AssessDriveHealth. */
     pInfo->nHealthPercent = -1;
-    pInfo->nConfidence = 0;
 }
 
 
@@ -1414,10 +1416,9 @@ void AssessDriveHealth(DRIVE_INFO* pInfo)
     FillTempExtrema(pInfo);
     if (pInfo->nGSenseEvents > 0 && pInfo->nGSenseDelta < 0)
         pInfo->nConfidence = Clamp100(pInfo->nConfidence - 2);
-    if (pInfo->eType == DRIVE_TYPE_HDD && !pInfo->bIsNVMe) {
-        pInfo->nConfidence = 0;
+    /* No wear scale. The evidence blend above stays. */
+    if (pInfo->eType == DRIVE_TYPE_HDD && !pInfo->bIsNVMe)
         pInfo->nHealthPercent = -1;
-    }
 
     /* One-line evidence in the UI language at assessment time. */
     if (pInfo->bIsNVMe) {
@@ -3145,18 +3146,84 @@ static int WriteVolumeGiB(const DRIVE_INFO* p, BYTE id,
     return *nGiB > 0;
 }
 
+/* One endurance reading. figure is 0..100.
+ * agrees is 1 only for a RAW percent that equals its normalized Value. */
+struct SsdLife {
+    int id;
+    int figure;
+    int value;
+    int agrees;
+    int pref;
+};
+
+/* Higher preference wins. The same preference keeps the lower id. */
+static int LifeBeats(const struct SsdLife* a, const struct SsdLife* b)
+{
+    if (a->pref != b->pref) return a->pref > b->pref;
+    return a->id < b->id;
+}
+
+/* PERCENT: the low 16 bits of RAW, when they are 0..100.
+ * RAW 0 with Value still at 90 or above is the dummy 100/100/50 scale,
+ * not a report of 0% life. A RAW outside 0..100 is not a percent:
+ * there is no fallback to Value. That fallback was a per-id rule. */
+static int RawPercent(const SMART_ATTRIBUTE* a, int* agrees)
+{
+    int raw16 = (int)GetRawValue16Lo(a->bRawValue);
+    int val = (int)a->bAttrValue;
+    if (agrees) *agrees = 0;
+    if (raw16 < 0 || raw16 > 100) return -1;
+    if (raw16 == 0 && val >= 90) return -1;
+    if (agrees) *agrees = (val == raw16) ? 1 : 0;
+    return raw16;
+}
+
+/* AVG, MAX, and MIN store the raw count, including 0.
+ * MAXAVG splits the two halves and keeps each only inside 1..99999.
+ * A bare COUNTER is an erase count with no role, so it is not stored. */
+static void StoreEraseRole(DRIVE_INFO* p, int enc, DWORD raw)
+{
+    if (enc == PROF_ENC_MAXAVG) {
+        unsigned avg = 0, mx = 0;
+        PhisonMaxAvgHalves((unsigned)raw, &mx, &avg);
+        if (p->nSSDAvgEraseCount < 0 && avg > 0 && avg < 100000u)
+            p->nSSDAvgEraseCount = (int)avg;
+        if (p->nSSDMaxEraseCount < 0 && mx > 0 && mx < 100000u)
+            p->nSSDMaxEraseCount = (int)mx;
+        return;
+    }
+    if (raw > 0x7FFFFFFFu) return;
+    if (enc == PROF_ENC_AVG && p->nSSDAvgEraseCount < 0)
+        p->nSSDAvgEraseCount = (int)raw;
+    else if (enc == PROF_ENC_MAX && p->nSSDMaxEraseCount < 0)
+        p->nSSDMaxEraseCount = (int)raw;
+    else if (enc == PROF_ENC_MIN && p->nSSDMinEraseCount < 0)
+        p->nSSDMinEraseCount = (int)raw;
+}
+
+/* Wear-leveling counter. A wear percent is not this field and not life. */
+static void StoreWearCount(DRIVE_INFO* p, DWORD raw)
+{
+    if (p->nSSDWearLevelingCount >= 0) return;
+    if (raw > 0 && raw < 100000u)
+        p->nSSDWearLevelingCount = (int)raw;
+}
+
 /* ============================================================
- * SSD-specific indicator extraction
- * Extracts vendor-specific SSD health info
+ * SSD indicators from profile semantics.
+ * Every attribute is visited. The id is not a case label.
+ * PERCENT reads RAW. VALUE reads the normalized byte.
+ * Erase roles are AVG, MAX, MIN, and MAXAVG.
+ * Writes run after erase counts so a SCALE volume can see them.
  * ============================================================ */
 void ExtractSSDIndicators(DRIVE_INFO* pInfo)
 {
+    struct SsdLife life[30];
+    int nLife = 0;
+    int best = -1;
     int i;
-    int nA9 = -1;
-    int nA9Val = -1;
-    int nE7 = -1;
-    int nE7Agrees = 0;
-    int nB1 = -1;
+
+    if (!pInfo) return;
     IdentifyDriveParts(pInfo);
     pInfo->nSSDLifeLeft     = -1;
     pInfo->nSSDTotalWritesGB = -1;
@@ -3166,178 +3233,66 @@ void ExtractSSDIndicators(DRIVE_INFO* pInfo)
     pInfo->nSSDWearLevelingCount = -1;
 
     for (i = 0; i < 30; i++) {
-        SMART_ATTRIBUTE* pA = &pInfo->attrData.stAttributes[i];
-        if (pA->bAttrID == 0) continue;
+        SMART_ATTRIBUTE* a = &pInfo->attrData.stAttributes[i];
+        int sem = PROF_SEM_NONE, enc = PROF_ENC_NONE;
+        int figure = -1;
+        int agrees = 0;
+        if (a->bAttrID == 0) continue;
+        if (!ProfileLookup(pInfo, a->bAttrID, &sem, &enc)) continue;
 
-        switch (pA->bAttrID) {
-        /* Collected here. Assigned only when the controller profile says
-         * this ID is life remaining — not because the RAW looks like 1..100. */
-        case 0xA9:
-            if (nA9 < 0) {
-                int raw = (int)GetRawValue(pA->bRawValue);
-                nA9Val = (int)pA->bAttrValue;
-                /* Phison A9 RAW 1–100 is remaining %. RAW 0 with Value 100
-                 * is the dummy 100/100/50 scale, not 0% worn. */
-                if (raw >= 1 && raw <= 100)
-                    nA9 = raw;
-                else if (raw == 0 && pA->bAttrValue < 90)
-                    nA9 = 0;
+        if (sem == PROF_SEM_ENDURANCE &&
+            (enc == PROF_ENC_PERCENT || enc == PROF_ENC_VALUE)) {
+            if (enc == PROF_ENC_VALUE) {
+                if (a->bAttrValue <= 100)
+                    figure = (int)a->bAttrValue;
+            } else {
+                figure = RawPercent(a, &agrees);
             }
-            break;
-        case 0xB1:
-            /* Samsung 177: normalized Value is remaining life. RAW is the
-             * erase count (26 on this 870 EVO), not the percent. */
-            if (nB1 < 0 && (pInfo->nProfileFlags & PROF_F_B1_LIFE) &&
-                pA->bAttrValue <= 100)
-                nB1 = (int)pA->bAttrValue;
-            break;
-        case 0xE7:
-            if (nE7 < 0) {
-                /* Samsung RAW is an erase count. Maxio RAW is percent used
-                 * (100 - Value). Both profiles set PROF_F_E7_VALUE. */
-                if (pInfo->nProfileFlags & PROF_F_E7_VALUE) {
-                    if (pA->bAttrValue <= 100)
-                        nE7 = (int)pA->bAttrValue;
-                } else {
-                    int v = (int)GetRawValue16Lo(pA->bRawValue);
-                    if (v >= 0 && v <= 100 && (int)pA->bAttrValue == v)
-                        nE7Agrees = 1;
-                    if (v >= 0 && v <= 100)
-                        nE7 = v;
-                    else if (pA->bAttrValue <= 100)
-                        nE7 = (int)pA->bAttrValue;
-                }
+            if (figure >= 0 && nLife < 30) {
+                life[nLife].id = (int)a->bAttrID;
+                life[nLife].figure = figure;
+                life[nLife].value = (int)a->bAttrValue;
+                life[nLife].agrees = agrees;
+                life[nLife].pref = ProfileAttrPref(pInfo, a->bAttrID);
+                nLife++;
             }
-            break;
-
-        /* Total writes. A wear percent (Intel 233) is not GiB. */
-        case 0xE9:
-        case 0xF9:
-            if (pInfo->nSSDTotalWritesGB < 0) {
-                unsigned __int64 nGiB = 0;
-                if (!WriteVolumeGiB(pInfo, pA->bAttrID,
-                                    GetRawValue48(pA->bRawValue), &nGiB))
-                    break;
-                if (nGiB > 4000000ULL) break;
-                pInfo->nSSDTotalWritesGB = (int)nGiB;
-            }
-            break;
-        /* Host writes. Phison 241/242 is GB or 32 MiB (scaler).
-         * SM2258/SM2259 production firmware is fixed 32 MiB blocks.
-         * Other SATA SSDs store LBAs; a sub-GiB count is not a GB total. */
-        case 0xF1:
-        case 0xF3: {
-            unsigned __int64 nGiB = 0;
-            if (pInfo->nSSDTotalWritesGB >= 0) break;
-            if (!WriteVolumeGiB(pInfo, pA->bAttrID,
-                                GetRawValue48(pA->bRawValue), &nGiB))
-                break;
-            if (nGiB > 4000000ULL) nGiB = 4000000ULL;
-            pInfo->nSSDTotalWritesGB = (int)nGiB;
-            break;
-        }
-
-        /* Average erase count */
-        case 0xA7: {
-            int semA7 = PROF_SEM_NONE;
-            if (pInfo->nSSDAvgEraseCount < 0 &&
-                ProfileLookup(pInfo, 0xA7, &semA7, NULL) &&
-                semA7 == PROF_SEM_ERASE)
-                pInfo->nSSDAvgEraseCount = (int)GetRawValue(pA->bRawValue);
-            break;
-        }
-        case 0xAD: {
-            /* 0xAD follows the profile semantic. A MAXAVG row, or a Phison
-             * erase counter that does not fit in 16 bits, is two halves.
-             * kPhison does not list 0xAD, so a small Phison RAW is not split.
-             * A sem-NONE counter (Maxio 173) is not stored as wear and erase. */
-            int nAd, semAd = PROF_SEM_NONE, encAd = PROF_ENC_NONE;
-            if (!ProfileLookup(pInfo, 0xAD, &semAd, &encAd))
-                break;
-            nAd = (int)GetRawValue(pA->bRawValue);
-            if (encAd == PROF_ENC_MAXAVG ||
-                       (pInfo->eController == CONTROLLER_PHISON &&
-                        semAd == PROF_SEM_ERASE && nAd > 0xFFFF)) {
-                /* Joined 32-bit value is not one erase count. */
-                unsigned avg, mx;
-                PhisonMaxAvgHalves((unsigned)nAd, &mx, &avg);
-                if (pInfo->nSSDAvgEraseCount < 0 && avg > 0 && avg < 100000u)
-                    pInfo->nSSDAvgEraseCount = (int)avg;
-                if (pInfo->nSSDMaxEraseCount < 0 && mx > 0 && mx < 100000u)
-                    pInfo->nSSDMaxEraseCount = (int)mx;
-            } else if (semAd == PROF_SEM_ERASE) {
-                if (pInfo->nSSDAvgEraseCount < 0)
-                    pInfo->nSSDAvgEraseCount = nAd;
-            } else if (semAd == PROF_SEM_WEAR) {
-                if (pInfo->nSSDWearLevelingCount < 0)
-                    pInfo->nSSDWearLevelingCount = nAd;
-            } else if (pInfo->eController != CONTROLLER_MAXIO &&
-                       nAd >= 0 && nAd < 100000) {
-                if (pInfo->nSSDWearLevelingCount < 0)
-                    pInfo->nSSDWearLevelingCount = nAd;
-                if (pInfo->nSSDAvgEraseCount < 0)
-                    pInfo->nSSDAvgEraseCount = nAd;
-            }
-            break;
-        }
-        case 0xEA: {
-            int semEa = PROF_SEM_NONE, encEa = PROF_ENC_NONE;
-            unsigned rawEa;
-            if (pInfo->nSSDAvgEraseCount >= 0) break;
-            if (!ProfileLookup(pInfo, 0xEA, &semEa, &encEa) ||
-                !ProfileEraseCount(semEa, encEa))
-                break;
-            rawEa = GetRawValue(pA->bRawValue);
-            if (encEa == PROF_ENC_MAXAVG) {
-                unsigned avg, mx;
-                PhisonMaxAvgHalves(rawEa, &mx, &avg);
-                if (avg < 100000u)
-                    pInfo->nSSDAvgEraseCount = (int)avg;
-                if (pInfo->nSSDMaxEraseCount < 0 && mx > 0 && mx < 100000u)
-                    pInfo->nSSDMaxEraseCount = (int)mx;
-            } else if (rawEa <= 0x7FFFFFFFu) {
-                pInfo->nSSDAvgEraseCount = (int)rawEa;
-            }
-            break;
-        }
-
-        /* Max erase count */
-        case 0xA5:
-            if (pInfo->nSSDMaxEraseCount < 0 &&
-                ProfileLookup(pInfo, 0xA5, NULL, NULL))
-                pInfo->nSSDMaxEraseCount = (int)GetRawValue(pA->bRawValue);
-            break;
-
-        /* Min erase count */
-        case 0xA6:
-            if (pInfo->nSSDMinEraseCount < 0 &&
-                ProfileLookup(pInfo, 0xA6, NULL, NULL))
-                pInfo->nSSDMinEraseCount = (int)GetRawValue(pA->bRawValue);
-            break;
+        } else if (sem == PROF_SEM_ERASE) {
+            StoreEraseRole(pInfo, enc, GetRawValue(a->bRawValue));
+        } else if (sem == PROF_SEM_WEAR && enc == PROF_ENC_COUNTER) {
+            StoreWearCount(pInfo, GetRawValue(a->bRawValue));
         }
     }
 
-    /* Endurance comes from the profile semantics. No profile entry means
-     * the ID is not a life percent, for every vendor. */
-    {
-        int semA9 = PROF_SEM_NONE, semE7 = PROF_SEM_NONE, semB1 = PROF_SEM_NONE;
-        ProfileLookup(pInfo, 0xA9, &semA9, NULL);
-        ProfileLookup(pInfo, 0xE7, &semE7, NULL);
-        ProfileLookup(pInfo, 0xB1, &semB1, NULL);
-        if (semA9 == PROF_SEM_ENDURANCE) {
-            if ((pInfo->nProfileFlags & PROF_F_A9_PREFER_E7) && nE7Agrees &&
-                nE7 >= 0 && nA9 >= 0 && nA9 != nE7 && nA9Val >= 90)
-                pInfo->nSSDLifeLeft = nE7;
-            else if (nA9 >= 0)
-                pInfo->nSSDLifeLeft = nA9;
-            else if (nE7 >= 0 && semE7 == PROF_SEM_ENDURANCE)
-                pInfo->nSSDLifeLeft = nE7;
-        } else if (semE7 == PROF_SEM_ENDURANCE) {
-            if (nE7 >= 0)
-                pInfo->nSSDLifeLeft = nE7;
-            else if (nB1 >= 0 && semB1 == PROF_SEM_WEAR)
-                pInfo->nSSDLifeLeft = nB1;
+    for (i = 0; i < nLife; i++) {
+        if (best < 0 || LifeBeats(&life[i], &life[best]))
+            best = i;
+    }
+    /* A RAW percent that matches its Value wins over another reading
+     * whose Value is still at 90 or above and whose figure differs. */
+    if (best >= 0 && (pInfo->nProfileFlags & PROF_F_PREFER_AGREEING) &&
+        life[best].value >= 90) {
+        int alt = -1;
+        for (i = 0; i < nLife; i++) {
+            if (i == best || !life[i].agrees) continue;
+            if (life[i].figure == life[best].figure) continue;
+            if (alt < 0 || LifeBeats(&life[i], &life[alt]))
+                alt = i;
         }
+        if (alt >= 0) best = alt;
+    }
+    if (best >= 0)
+        pInfo->nSSDLifeLeft = life[best].figure;
+
+    for (i = 0; i < 30; i++) {
+        SMART_ATTRIBUTE* a = &pInfo->attrData.stAttributes[i];
+        unsigned __int64 nGiB = 0;
+        if (a->bAttrID == 0) continue;
+        if (pInfo->nSSDTotalWritesGB >= 0) break;
+        if (!WriteVolumeGiB(pInfo, a->bAttrID,
+                            GetRawValue48(a->bRawValue), &nGiB))
+            continue;
+        if (nGiB > 4000000ULL) nGiB = 4000000ULL;
+        pInfo->nSSDTotalWritesGB = (int)nGiB;
     }
 }
 

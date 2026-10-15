@@ -393,10 +393,49 @@ struct AttrBag {
     int cap;
 };
 
-static void StoreAttr(AttrBag* b, unsigned id, int sem, int enc, const char* name)
+/* Split "raw24/raw32:210zr54" into the format name and the byte order.
+ * The view is how the cell prints. It is not the health encoding. */
+static void ClassifyFormat(const char* fmt, int* view, char* order, int nOrder)
+{
+    char base[48];
+    const char* colon;
+    int n = 0;
+    int k = 0;
+    if (view) *view = PROF_VIEW_NUMBER;
+    if (order && nOrder > 0) order[0] = '\0';
+    if (!fmt || !fmt[0] || !view) return;
+    colon = strchr(fmt, ':');
+    while (fmt[n] && fmt + n != colon && n < (int)sizeof(base) - 1) {
+        base[n] = fmt[n];
+        n++;
+    }
+    base[n] = '\0';
+    if (colon && order && nOrder > 1) {
+        const char* p = colon + 1;
+        while (*p && k < nOrder - 1 && strchr("012345rvwz", *p) != NULL) {
+            order[k++] = *p++;
+        }
+        order[k] = '\0';
+    }
+    if (strcmp(base, "raw16(raw16)") == 0)
+        *view = PROF_VIEW_RAW16_OPT;
+    else if (strcmp(base, "raw16(avg16)") == 0)
+        *view = PROF_VIEW_AVG16;
+    else if (strcmp(base, "raw24(raw8)") == 0)
+        *view = PROF_VIEW_RAW24_OPT8;
+    else if (strcmp(base, "raw24/raw24") == 0)
+        *view = PROF_VIEW_RAW24_24;
+    else if (strcmp(base, "raw24/raw32") == 0)
+        *view = PROF_VIEW_RAW24_32;
+    else if (strchr(base, '(') != NULL || strchr(base, '/') != NULL)
+        *view = PROF_VIEW_UNDECODED;
+}
+
+static void StoreAttr(AttrBag* b, unsigned id, int sem, int enc,
+                      int view, const char* order, const char* name)
 {
     DRIVEDB_ATTR* a;
-    int i, n;
+    int i, n, k;
     if (!b || !b->attr || !b->n) return;
     if (!name || !name[0] || id == 0 || id > 255) return;
     if (*b->n >= b->cap || *b->n >= DRIVEDB_ATTR_MAX) return;
@@ -412,6 +451,16 @@ fill:
     a->id = (BYTE)id;
     a->sem = (BYTE)sem;
     a->enc = (BYTE)enc;
+    a->view = (BYTE)view;
+    a->order[0] = '\0';
+    if (order) {
+        k = 0;
+        while (order[k] && k < (int)sizeof(a->order) - 1) {
+            a->order[k] = order[k];
+            k++;
+        }
+        a->order[k] = '\0';
+    }
     n = 0;
     while (name[n] && n < (int)sizeof(a->name) - 1) {
         char c = name[n];
@@ -429,8 +478,8 @@ static void ParsePresets(AttrBag* b, const char* presets, BOOL hdd)
     while ((s = strstr(s, "-v")) != NULL) {
         unsigned long id;
         char* end;
-        char fmt[48], name[44], flag[8];
-        int sem, enc, n;
+        char fmt[48], name[44], flag[8], order[9];
+        int sem, enc, view, n;
         const char* fmtStart;
         if (s != presets && s[-1] != ' ' && s[-1] != '\t') {
             s += 2;
@@ -480,7 +529,8 @@ static void ParsePresets(AttrBag* b, const char* presets, BOOL hdd)
         if (strcmp(flag, "HDD") == 0 && !hdd) continue;
         if (strcmp(flag, "SSD") == 0 && hdd) continue;
         MapAttr(fmt, name, &sem, &enc);
-        StoreAttr(b, (unsigned)id, sem, enc, name);
+        ClassifyFormat(fmt, &view, order, (int)sizeof(order));
+        StoreAttr(b, (unsigned)id, sem, enc, view, order, name);
     }
 }
 

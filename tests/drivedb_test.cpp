@@ -31,6 +31,24 @@ static void ExpectInt(int got, int want, const char* msg)
     }
 }
 
+/* Same weights as AssessDriveHealth. withGap subtracts 2 when a shock
+ * count has no earlier sample. */
+static int EvidenceBlend(const DRIVE_INFO* p, int withGap)
+{
+    int n;
+    if (!p) return 0;
+    n = (20 * p->nConfCompleteness + 10 * p->nConfTransport +
+         15 * p->nConfModelId + 20 * p->nConfVendorDecoder +
+         35 * p->nConfHealthAssess + 50) / 100;
+    if (n < 0) n = 0;
+    if (n > 100) n = 100;
+    if (withGap && p->nGSenseEvents > 0 && p->nGSenseDelta < 0) {
+        n -= 2;
+        if (n < 0) n = 0;
+    }
+    return n;
+}
+
 static void ExpectStr(const char* got, const char* want, const char* msg)
 {
     g_check++;
@@ -334,6 +352,10 @@ static void TestA400Smi(void)
 {
     int before = g_fail;
     Base(DRIVE_TYPE_SSD_SATA, "KINGSTON SA400S37240G", "U0524A0");
+    /* 164 is the total. It is listed before the average, so a bare
+     * counter stored as the average would hide attribute 167. */
+    Expect(AddAttr(0xA4, 100, 9000), "a400smi slot A4");
+    Expect(AddAttr(0xA7, 100, 5), "a400smi slot A7");
     Expect(AddAttr(0xA9, 80, 80), "a400smi slot A9");
     Expect(AddAttr(0xF1, 100, 2048), "a400smi slot F1");
     Run();
@@ -345,6 +367,9 @@ static void TestA400Smi(void)
     ExpectDecoded(PROF_ENC_BLOCK32, 2048, 64, "a400smi F1 value");
     ExpectInt(g.nSSDTotalWritesGB, 64, "a400smi writes");
     ExpectInt(g.nSSDLifeLeft, 80, "a400smi life");
+    ExpectSem(0xA7, PROF_SEM_ERASE, PROF_ENC_AVG, "a400smi A7");
+    ExpectInt(g.nSSDAvgEraseCount, 5, "a400smi average erase");
+    ExpectSem(0xA4, PROF_SEM_ERASE, PROF_ENC_COUNTER, "a400smi A4");
     ExpectInt((int)g.eWear, (int)HEALTH_STATUS_GOOD, "a400smi wear");
     ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_GOOD, "a400smi headline");
     CaseEnd("a400-smi", before);
@@ -391,10 +416,11 @@ static void TestSamsung870(void)
     ExpectInt((int)g.eController, (int)CONTROLLER_SAMSUNG, "870 controller");
     ExpectStr(g.szModelFamily, "Samsung based SSDs", "870 family");
     ExpectStr(g.szDriveDbTie, "", "870 no drivedb tie");
-    ExpectSem(0xE7, PROF_SEM_ENDURANCE, PROF_ENC_PERCENT, "870 E7");
+    ExpectSem(0xE7, PROF_SEM_ENDURANCE, PROF_ENC_VALUE, "870 E7");
+    ExpectInt(ProfileAttrPref(&g, 0xE7), 1, "870 E7 pref");
     ExpectInt(g.nSSDLifeLeft, 98, "870 life from value");
     ExpectInt(g.nEndurancePercent, 98, "870 endurance");
-    Expect(g.nProfileFlags & PROF_F_E7_VALUE, "870 E7 value flag");
+    Expect((g.nProfileFlags & PROF_F_PREFER_AGREEING) == 0, "870 no agreeing flag");
     ExpectNoLookup(252, "870 252 not health");
     ExpectName(252, 1, "Added Bad Flash Blk Ct", "870 252 label");
     ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_GOOD, "870 media");
@@ -422,6 +448,9 @@ static void TestBarracuda(void)
     ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_CAUTION, "barra headline");
     Expect(g.eHealthStatus != HEALTH_STATUS_BAD, "barra not bad");
     ExpectInt(g.nHealthPercent, -1, "barra no health percent");
+    Expect(g.nConfCompleteness > 0, "barra completeness stored");
+    Expect(EvidenceBlend(&g, 1) > 0, "barra blend above zero");
+    ExpectInt(g.nConfidence, EvidenceBlend(&g, 1), "barra confidence is the blend");
     CaseEnd("barra-1ch", before);
 
     before = g_fail;
@@ -447,6 +476,30 @@ static void TestBarracuda(void)
     ExpectStr(g.szModelFamily, "Seagate Barracuda 7200.14 (AF)", "barra new family");
     ExpectStr(g.szDriveDbWarn, "", "barra new warning empty");
     CaseEnd("barra-cc4h", before);
+}
+
+/* HDD confidence is the evidence blend. No wear scale means
+ * nHealthPercent stays -1. A shock count with no prior sample
+ * still subtracts 2 and does not wipe the blend. */
+static void TestHddConfidence(void)
+{
+    int before = g_fail;
+    int blend;
+    Base(DRIVE_TYPE_HDD, "ST1000DM003-1CH162", "CC47");
+    Expect(AddAttr(5, 100, 0), "hdd conf realloc");
+    Expect(AddAttr(197, 100, 0), "hdd conf pending");
+    Expect(AddAttr(198, 100, 0), "hdd conf uncorr");
+    Expect(AddAttr(191, 100, 10), "hdd conf gsense");
+    Run();
+    blend = EvidenceBlend(&g, 0);
+    ExpectInt(g.nHealthPercent, -1, "hdd conf no health percent");
+    ExpectInt(g.nGSenseEvents, 10, "hdd conf gsense count");
+    ExpectInt(g.nGSenseDelta, -1, "hdd conf no gsense trend");
+    Expect(g.nConfCompleteness > 0, "hdd conf completeness stored");
+    Expect(blend > 2, "hdd conf blend above the gap");
+    ExpectInt(g.nConfidence, blend - 2, "hdd conf gsense gap");
+    ExpectInt(g.nConfidence, EvidenceBlend(&g, 1), "hdd conf keeps the blend");
+    CaseEnd("hdd-confidence", before);
 }
 
 /* USB bridge rows are skipped. The model string is not a disk family
@@ -755,8 +808,13 @@ static void TestSmartModular(void)
     CaseEnd("smartmod-199", before);
 }
 
+static void ExpectCell(BYTE id, const char* want, const char* msg);
+static int CellKind(BYTE id);
+static int PlainCell(BYTE id);
+
 /* Packed presets are not one 48-bit count. A huge raw24/raw32 value
- * stays unscored. A plain raw48 name on the same family is only Risk. */
+ * stays unscored. A plain raw48 name on the same family is only Risk.
+ * The value cell prints the -v fields, not the 48-bit integer. */
 static void TestPackedName(void)
 {
     int before = g_fail;
@@ -777,6 +835,14 @@ static void TestPackedName(void)
     ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_GOOD, "pack media");
     ExpectInt((int)g.eInterface, (int)HEALTH_STATUS_GOOD, "pack iface");
     ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_GOOD, "pack headline");
+    /* The value cell is this text. FormatSmartValue returns it before
+     * any id switch, so the 48-bit integer is not the cell. */
+    ExpectCell(160, "1/5", "pack 160 fields");
+    ExpectCell(161, "42 (0 5)", "pack 161 fields");
+    ExpectCell(218, "1/120", "pack 218 fields");
+    ExpectInt(CellKind(160), (int)RAW_ENC_PACKED, "pack 160 kind");
+    ExpectInt(CellKind(161), (int)RAW_ENC_PACKED, "pack 161 kind");
+    ExpectInt(CellKind(218), (int)RAW_ENC_PACKED, "pack 218 kind");
     CaseEnd("pack", before);
 
     before = g_fail;
@@ -788,7 +854,109 @@ static void TestPackedName(void)
     ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_GOOD, "pack170 media");
     ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_GOOD, "pack170 headline");
     Expect(g.eReliability != HEALTH_STATUS_CAUTION, "pack170 not caution");
+    ExpectInt(PlainCell(170), 0, "pack 170 stays a counter");
+    ExpectInt(CellKind(170), (int)RAW_ENC_COUNTER48, "pack 170 kind");
     CaseEnd("pack-170", before);
+}
+
+/* Representation of one value cell. 1 means the text replaced a counter. */
+static int PlainCell(BYTE id)
+{
+    const SMART_ATTRIBUTE* a = Attr(id);
+    char buf[80];
+    if (!a) return -1;
+    buf[0] = '\0';
+    return FormatAttrRawText(&g, id, a->bRawValue,
+                             (unsigned)a->bAttrValue, (unsigned)a->bWorstValue,
+                             buf, (int)sizeof(buf));
+}
+
+static void ExpectCell(BYTE id, const char* want, const char* msg)
+{
+    const SMART_ATTRIBUTE* a = Attr(id);
+    char buf[80];
+    int rc;
+    Expect(a != NULL, msg);
+    if (!a) return;
+    buf[0] = '\0';
+    rc = FormatAttrRawText(&g, id, a->bRawValue,
+                           (unsigned)a->bAttrValue, (unsigned)a->bWorstValue,
+                           buf, (int)sizeof(buf));
+    ExpectInt(rc, 1, msg);
+    ExpectStr(buf, want, msg);
+    Expect(strstr(buf, "4294967") == NULL, msg);
+}
+
+static int CellKind(BYTE id)
+{
+    ATTR_DECODE d;
+    memset(&d, 0, sizeof(d));
+    GetAttrDecode(id, &g, &d);
+    return (int)d.eEnc;
+}
+
+/* A local packed row has no field widths, so the cell says so.
+ * A local pair is bytes [1:0] and [3:2]. A drivedb byte order is not
+ * an id: z54z10 prints the two 24-bit fields of that order. */
+static const PROF_ATTR kWidgetPack[] = {
+    { 0x42, PROF_SEM_NONE, PROF_ENC_PACKED, 0, "Packed", "Packed",
+      NULL, NULL, 0, 0, 0, 0, 0, 0, 0 },
+    { 0x43, PROF_SEM_NONE, PROF_ENC_PAIR, 0, "Pair", "Pair",
+      NULL, NULL, 0, 0, 0, 0, 0, 0, 0 },
+    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0 }
+};
+
+static void TestPackedCell(void)
+{
+    PROFILE_DEF d;
+    BYTE raw[6];
+    char buf[80];
+    int before = g_fail;
+    int rc;
+    ProfileClearRegistered();
+    Base(DRIVE_TYPE_SSD_SATA, "WIDGETPACK", "");
+    Expect(AddAttr(0x42, 100, 0x0100000005ULL), "local pack slot");
+    Expect(AddAttr(0x43, 100, 0x0005002AULL), "local pair slot");
+    memset(&d, 0, sizeof(d));
+    d.id = "widget-pack";
+    d.kind = PROF_KIND_EXACT;
+    d.model = "WIDGETPACK";
+    d.fwMode = PROF_FW_NONE;
+    d.vendor = VENDOR_UNKNOWN;
+    d.ctl = CONTROLLER_UNKNOWN;
+    d.attrs = kWidgetPack;
+    d.source = "test";
+    Expect(ProfileRegister(&d), "pack register");
+    Run();
+    ExpectStr(g.szProfileId, "widget-pack", "pack profile");
+    ExpectCell(0x42, "не декодирован", "local packed text");
+    ExpectInt(CellKind(0x42), (int)RAW_ENC_PACKED, "local packed kind");
+    ExpectCell(0x43, "42 / 5", "local pair text");
+    ExpectInt(CellKind(0x43), (int)RAW_ENC_PAIR, "local pair kind");
+    ExpectInt(g.nSSDLifeLeft, -1, "local packed is not life");
+    ProfileClearRegistered();
+    CaseEnd("pack-local", before);
+
+    before = g_fail;
+    memset(raw, 0, sizeof(raw));
+    raw[0] = 7;
+    raw[4] = 9;
+    buf[0] = '\0';
+    rc = FormatRawFields(PROF_VIEW_RAW24_24, "z54z10", raw, 100, 100,
+                         buf, (int)sizeof(buf));
+    ExpectInt(rc, 1, "z54z10 rc");
+    ExpectStr(buf, "9/7", "z54z10 fields");
+    buf[0] = '\0';
+    rc = FormatRawFields(PROF_VIEW_UNDECODED, "", raw, 0, 0,
+                         buf, (int)sizeof(buf));
+    ExpectInt(rc, 1, "undecoded rc");
+    ExpectStr(buf, "не декодирован", "undecoded text");
+    buf[0] = '\0';
+    rc = FormatRawFields(PROF_VIEW_NUMBER, "", raw, 0, 0,
+                         buf, (int)sizeof(buf));
+    ExpectInt(rc, 0, "number view is not fields");
+    ExpectStr(buf, "", "number view writes nothing");
+    CaseEnd("pack-order", before);
 }
 
 /* A 44-character -v name is stored as 43. The HDD/SSD flag after the
@@ -830,6 +998,219 @@ struct OnceJob {
     const char* model;
     const char* fw;
 };
+
+/* PCI VID is bytes 0-1 of NVMe Identify. The drive stays a SATA SSD:
+ * bIsNVMe is clear, so life is not Percentage Used. */
+static void SetPciVid(unsigned vid)
+{
+    g.bGotNVMeIdent = TRUE;
+    g.nvmeIdent.Reserved0[0] = (BYTE)(vid & 0xFFu);
+    g.nvmeIdent.Reserved0[1] = (BYTE)((vid >> 8) & 0xFFu);
+}
+
+/* Micron 202 is endurance on the controller profile. RAW 9999 is not the
+ * percent. The normalized Value is. 173 is the average erase count. */
+static void TestMicronCa(void)
+{
+    int before = g_fail;
+    Base(DRIVE_TYPE_SSD_SATA, "Micron_1100_MTFD", "M0MU031");
+    SetPciVid(0x1344);
+    Expect(AddAttr(0xCA, 73, 9999), "micron slot CA");
+    Expect(AddAttr(0xAD, 100, 42), "micron slot AD");
+    Run();
+    ExpectStr(g.szProfileId, "micron-ssd", "micron profile");
+    ExpectInt((int)g.eController, (int)CONTROLLER_MICRON, "micron controller");
+    ExpectSem(0xCA, PROF_SEM_ENDURANCE, PROF_ENC_VALUE, "micron CA");
+    ExpectInt(g.nSSDLifeLeft, 73, "micron life");
+    ExpectInt(g.nEndurancePercent, 73, "micron endurance");
+    ExpectInt(g.nHealthPercent, 73, "micron health percent");
+    ExpectInt((int)g.eWear, (int)HEALTH_STATUS_GOOD, "micron wear");
+    ExpectInt(g.nSSDAvgEraseCount, 42, "micron average erase");
+    ExpectInt(g.nSSDTotalWritesGB, -1, "micron writes unset");
+    CaseEnd("micron-ca", before);
+}
+
+/* Intel 233 is a wear percent, not life and not GiB. 225 is host writes
+ * in 32 MiB blocks. 233 is stored first so a mistaken volume would hide 225. */
+static void TestIntelIndicators(void)
+{
+    int before = g_fail;
+    Base(DRIVE_TYPE_SSD_SATA, "INTEL SSDSC2KB480G8", "");
+    SetPciVid(0x8086);
+    Expect(AddAttr(0xE9, 30, 30), "intel slot E9");
+    Expect(AddAttr(0xE1, 100, 2048), "intel slot E1");
+    Run();
+    ExpectStr(g.szProfileId, "intel-ssd", "intel profile");
+    ExpectInt((int)g.eController, (int)CONTROLLER_INTEL, "intel controller");
+    ExpectSem(0xE9, PROF_SEM_WEAR, PROF_ENC_PERCENT, "intel E9");
+    ExpectInt(g.nSSDLifeLeft, -1, "intel wear percent is not life");
+    ExpectInt(g.nEndurancePercent, -1, "intel endurance unset");
+    ExpectInt((int)g.eWear, (int)HEALTH_STATUS_UNKNOWN, "intel wear");
+    ExpectInt(g.nSSDTotalWritesGB, 64, "intel E1 writes");
+    CaseEnd("intel", before);
+}
+
+/* An id the builtin tables do not name becomes life only after a profile
+ * says so. No new case in ExtractSSDIndicators. */
+static const PROF_ATTR kWidgetLife[] = {
+    { 0x42, PROF_SEM_ENDURANCE, PROF_ENC_VALUE, 0, "Widget life", "Widget life",
+      NULL, NULL, 0, 0, 0, 0, 0, 0, 0 },
+    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0 }
+};
+
+static void TestWidgetLife(void)
+{
+    PROFILE_DEF d;
+    int before = g_fail;
+    ProfileClearRegistered();
+    Base(DRIVE_TYPE_SSD_SATA, "WIDGETLIFE", "");
+    Expect(AddAttr(0x42, 4, 1), "widget slot");
+    Run();
+    ExpectInt(g.nSSDLifeLeft, -1, "unknown id is not life");
+    ExpectInt(g.nEndurancePercent, -1, "unknown id endurance");
+    memset(&d, 0, sizeof(d));
+    d.id = "widget-life";
+    d.kind = PROF_KIND_EXACT;
+    d.model = "WIDGETLIFE";
+    d.fwMode = PROF_FW_NONE;
+    d.vendor = VENDOR_UNKNOWN;
+    d.ctl = CONTROLLER_UNKNOWN;
+    d.nvme = 0;
+    d.hdd = 0;
+    d.attrs = kWidgetLife;
+    d.source = "test";
+    Expect(ProfileRegister(&d), "widget register");
+    Run();
+    ExpectStr(g.szProfileId, "widget-life", "widget profile");
+    ExpectSem(0x42, PROF_SEM_ENDURANCE, PROF_ENC_VALUE, "widget 0x42");
+    ExpectInt(g.nSSDLifeLeft, 4, "widget life");
+    ExpectInt(g.nEndurancePercent, 4, "widget endurance");
+    ExpectInt((int)g.eWear, (int)HEALTH_STATUS_BAD, "widget wear");
+    ExpectInt(WearBadgeStatus(g.nEndurancePercent), (int)HEALTH_STATUS_CAUTION,
+              "widget badge");
+    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_CAUTION, "widget headline");
+    ProfileClearRegistered();
+    CaseEnd("widget-life", before);
+}
+
+/* Phison: 169 wins unless its Value is still >= 90 and 231's RAW matches
+ * 231's Value. The total erase counter is not the average. */
+static void TestPhisonReadings(void)
+{
+    int before = g_fail;
+    Base(DRIVE_TYPE_SSD_SATA, "KINGSTON SA400S37240G", "SBFKB1H5");
+    Expect(AddAttr(0xA9, 100, 40), "phison dummy A9");
+    Expect(AddAttr(0xE7, 78, 78), "phison agreeing E7");
+    Run();
+    Expect((g.nProfileFlags & PROF_F_PREFER_AGREEING) != 0, "phison agreeing flag");
+    ExpectInt(g.nSSDLifeLeft, 78, "phison life from agreeing E7");
+    ExpectInt(g.nEndurancePercent, 78, "phison endurance 78");
+    CaseEnd("phison-agree", before);
+
+    before = g_fail;
+    Base(DRIVE_TYPE_SSD_SATA, "KINGSTON SA400S37240G", "SBFKB1H5");
+    Expect(AddAttr(0xA9, 47, 26), "phison A9 26");
+    Expect(AddAttr(0xE7, 47, 53), "phison E7 disagrees");
+    Run();
+    ExpectInt(g.nSSDLifeLeft, 26, "phison life stays A9");
+    ExpectInt(g.nEndurancePercent, 26, "phison endurance 26");
+    CaseEnd("phison-a9", before);
+
+    before = g_fail;
+    Base(DRIVE_TYPE_SSD_SATA, "KINGSTON SA400S37240G", "SBFKB1H5");
+    Expect(AddAttr(0xA9, 100, 0), "phison A9 dummy zero");
+    Expect(AddAttr(0xE7, 78, 78), "phison E7 only figure");
+    Run();
+    ExpectInt(g.nSSDLifeLeft, 78, "phison dummy A9 yields to E7");
+    CaseEnd("phison-dummy", before);
+
+    before = g_fail;
+    Base(DRIVE_TYPE_SSD_SATA, "KINGSTON SA400S37240G", "SBFKB1H5");
+    Expect(AddAttr(0xE7, 100, 0), "phison E7 dummy zero");
+    Run();
+    ExpectInt(g.nSSDLifeLeft, -1, "phison dummy percent is not 0% life");
+    CaseEnd("phison-e7-dummy", before);
+
+    before = g_fail;
+    Base(DRIVE_TYPE_SSD_SATA, "KINGSTON SA400S37240G", "SBFKB1H5");
+    Expect(AddAttr(0xA4, 100, 80000), "phison total first");
+    Expect(AddAttr(0xA7, 100, 5), "phison average");
+    Expect(AddAttr(0xA5, 100, 9), "phison max");
+    Expect(AddAttr(0xA6, 100, 1), "phison min");
+    Expect(AddAttr(0xB1, 100, 12), "phison wear count");
+    Expect(AddAttr(0xA9, 90, 90), "phison life 90");
+    Run();
+    ExpectInt(g.nSSDAvgEraseCount, 5, "phison average not the total");
+    ExpectInt(g.nSSDMaxEraseCount, 9, "phison max erase");
+    ExpectInt(g.nSSDMinEraseCount, 1, "phison min erase");
+    ExpectInt(g.nSSDWearLevelingCount, 12, "phison wear-leveling count");
+    ExpectInt(g.nSSDLifeLeft, 90, "phison life 90");
+    ExpectInt((int)g.eWear, (int)HEALTH_STATUS_GOOD, "phison wear axis");
+    CaseEnd("phison-erase", before);
+}
+
+/* 231 Value wins over 177. 177 alone is the fallback. RAW of 231 is not
+ * the percent. 245/246/247 are the erase roles. 177 is not a wear count. */
+static void TestSamsungLife(void)
+{
+    int before = g_fail;
+    Base(DRIVE_TYPE_SSD_SATA, "Samsung SSD 870 EVO 1TB", "SVT02B6Q");
+    Expect(AddAttr(0xB1, 40, 12), "870 slot B1");
+    Expect(AddAttr(0xF5, 100, 3), "870 slot F5");
+    Expect(AddAttr(0xF6, 100, 11), "870 slot F6");
+    Expect(AddAttr(0xF7, 100, 7), "870 slot F7");
+    Expect(AddAttr(0xE7, 98, 26), "870 slot E7 again");
+    Run();
+    ExpectInt(g.nSSDLifeLeft, 98, "870 E7 beats B1");
+    ExpectInt(g.nEndurancePercent, 98, "870 endurance still 98");
+    ExpectInt(g.nSSDMinEraseCount, 3, "870 min erase");
+    ExpectInt(g.nSSDMaxEraseCount, 11, "870 max erase");
+    ExpectInt(g.nSSDAvgEraseCount, 7, "870 average erase");
+    ExpectInt(g.nSSDWearLevelingCount, -1, "870 B1 is not a wear count");
+    CaseEnd("870-pref", before);
+
+    before = g_fail;
+    Base(DRIVE_TYPE_SSD_SATA, "Samsung SSD 870 EVO 1TB", "SVT02B6Q");
+    Expect(AddAttr(0xB1, 40, 99), "870 B1 alone");
+    Run();
+    ExpectSem(0xB1, PROF_SEM_ENDURANCE, PROF_ENC_VALUE, "870 B1 value");
+    ExpectInt(g.nSSDLifeLeft, 40, "870 B1 fallback");
+    ExpectInt(g.nEndurancePercent, 40, "870 B1 endurance");
+    ExpectInt((int)g.eWear, (int)HEALTH_STATUS_GOOD, "870 B1 wear");
+    ExpectInt(g.nSSDAvgEraseCount, -1, "870 B1 raw is not erase");
+    CaseEnd("870-b1", before);
+}
+
+/* Maxio 231 Value is life. RAW 6 is percent used. 173 has no role. */
+static void TestMaxioLife(void)
+{
+    int before = g_fail;
+    Base(DRIVE_TYPE_SSD_SATA, "P3-512", "SN123456");
+    Expect(AddAttr(0xE7, 94, 6), "maxio slot E7");
+    Expect(AddAttr(0xAD, 100, 173), "maxio slot AD");
+    Run();
+    ExpectStr(g.szProfileId, "p3-maxio-sn", "maxio profile");
+    ExpectSem(0xE7, PROF_SEM_ENDURANCE, PROF_ENC_VALUE, "maxio E7");
+    ExpectInt(g.nSSDLifeLeft, 94, "maxio life from value");
+    ExpectInt(g.nEndurancePercent, 94, "maxio endurance");
+    ExpectInt(g.nSSDAvgEraseCount, -1, "maxio 173 not erase");
+    ExpectInt(g.nSSDWearLevelingCount, -1, "maxio 173 not wear");
+    CaseEnd("maxio", before);
+}
+
+/* Apacer 231 stays on the RAW percent when Value is still 100. */
+static void TestAs350Raw(void)
+{
+    int before = g_fail;
+    Base(DRIVE_TYPE_SSD_SATA, "Apacer AS350 512GB", "VE1R9008");
+    Expect(AddAttr(231, 100, 99), "as350 raw slot");
+    Run();
+    ExpectSem(231, PROF_SEM_ENDURANCE, PROF_ENC_PERCENT, "as350 raw encoding");
+    ExpectInt(g.nSSDLifeLeft, 99, "as350 life from raw");
+    ExpectInt(g.nEndurancePercent, 99, "as350 raw endurance");
+    ExpectInt((int)g.eWear, (int)HEALTH_STATUS_GOOD, "as350 raw wear");
+    CaseEnd("as350-raw", before);
+}
 
 static DWORD WINAPI OnceThread(LPVOID p)
 {
@@ -880,13 +1261,22 @@ int main(void)
     TestA400Smi();
     TestSpcc();
     TestSamsung870();
+    TestSamsungLife();
+    TestAs350Raw();
+    TestPhisonReadings();
+    TestMaxioLife();
+    TestMicronCa();
+    TestIntelIndicators();
+    TestWidgetLife();
     TestBarracuda();
+    TestHddConfidence();
     TestUsbSkip();
     TestDriveDbTie();
     TestDriveDbTieUnnamed();
     TestRowRank();
     TestSmartModular();
     TestPackedName();
+    TestPackedCell();
     TestLongPresetName();
     if (g_fail) {
         fprintf(stderr, "FAILED %d of %d checks\n", g_fail, g_check);

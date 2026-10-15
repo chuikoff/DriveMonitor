@@ -691,10 +691,10 @@ static RAW_ENC RawEncFromProf(int enc)
     switch (enc) {
     case PROF_ENC_PERCENT: return RAW_ENC_PERCENT;
     case PROF_ENC_LBA:     return RAW_ENC_LBA;
+    case PROF_ENC_PACKED:  return RAW_ENC_PACKED;
+    case PROF_ENC_PAIR:    return RAW_ENC_PAIR;
     case PROF_ENC_COUNTER:
     case PROF_ENC_MAXAVG:
-    case PROF_ENC_PAIR:
-    case PROF_ENC_PACKED:
     case PROF_ENC_GIB:
     case PROF_ENC_BLOCK32:
     case PROF_ENC_SCALE:
@@ -705,6 +705,158 @@ static RAW_ENC RawEncFromProf(int enc)
     default:
         return RAW_ENC_UNKNOWN;
     }
+}
+
+/* smartmontools default. raw24/raw32 includes the reserved byte as the
+ * top zero. This program does not store that byte, so 'r' reads as 0. */
+static const char* DefaultRawOrder(int view)
+{
+    if (view == PROF_VIEW_RAW24_32)
+        return "r543210";
+    return "543210";
+}
+
+static unsigned RawOrderByte(char c, const BYTE* raw, unsigned val, unsigned worst)
+{
+    switch (c) {
+    case '0': return raw ? (unsigned)raw[0] : 0u;
+    case '1': return raw ? (unsigned)raw[1] : 0u;
+    case '2': return raw ? (unsigned)raw[2] : 0u;
+    case '3': return raw ? (unsigned)raw[3] : 0u;
+    case '4': return raw ? (unsigned)raw[4] : 0u;
+    case '5': return raw ? (unsigned)raw[5] : 0u;
+    case 'v': return val & 0xFFu;
+    case 'w': return worst & 0xFFu;
+    case 'r':
+    case 'z':
+    default:  return 0u;
+    }
+}
+
+/* First character of the order becomes the most significant byte. */
+static unsigned __int64 AssembleRawOrder(const char* order, const BYTE* raw,
+                                        unsigned val, unsigned worst)
+{
+    unsigned __int64 v = 0;
+    int i;
+    if (!order) return 0;
+    for (i = 0; order[i] && i < 8; i++) {
+        v = (v << 8) | (unsigned __int64)RawOrderByte(order[i], raw, val, worst);
+    }
+    return v;
+}
+
+static int RawViewHasFields(int view)
+{
+    return view == PROF_VIEW_RAW16_OPT ||
+           view == PROF_VIEW_RAW24_OPT8 ||
+           view == PROF_VIEW_RAW24_24 ||
+           view == PROF_VIEW_RAW24_32 ||
+           view == PROF_VIEW_UNDECODED;
+}
+
+static void WriteNotDecoded(char* buf, int nBuf)
+{
+    safe_snprintf_n(buf, nBuf, "%s", TN("не декодирован", "not decoded"));
+}
+
+int FormatRawFields(int view, const char* order, const BYTE* raw,
+                    unsigned val, unsigned worst, char* buf, int nBuf)
+{
+    unsigned __int64 rawvalue;
+    unsigned char b[6];
+    unsigned word[3];
+    const char* ord;
+    int i;
+    if (!buf || nBuf <= 0) return 0;
+    buf[0] = '\0';
+    if (!RawViewHasFields(view) || !raw) return 0;
+    if (view == PROF_VIEW_UNDECODED) {
+        WriteNotDecoded(buf, nBuf);
+        return 1;
+    }
+    ord = (order && order[0]) ? order : DefaultRawOrder(view);
+    rawvalue = AssembleRawOrder(ord, raw, val, worst);
+    for (i = 0; i < 6; i++)
+        b[i] = (unsigned char)((rawvalue >> (8 * i)) & 0xFFu);
+    word[0] = (unsigned)b[0] | ((unsigned)b[1] << 8);
+    word[1] = (unsigned)b[2] | ((unsigned)b[3] << 8);
+    word[2] = (unsigned)b[4] | ((unsigned)b[5] << 8);
+    if (view == PROF_VIEW_RAW16_OPT) {
+        if (word[1] || word[2])
+            safe_snprintf_n(buf, nBuf, "%u (%u %u)", word[0], word[2], word[1]);
+        else
+            safe_snprintf_n(buf, nBuf, "%u", word[0]);
+        return 1;
+    }
+    if (view == PROF_VIEW_RAW24_OPT8) {
+        unsigned low = (unsigned)(rawvalue & 0x00ffffffULL);
+        if (b[3] || b[4] || b[5])
+            safe_snprintf_n(buf, nBuf, "%u (%u %u %u)",
+                            low, (unsigned)b[5], (unsigned)b[4], (unsigned)b[3]);
+        else
+            safe_snprintf_n(buf, nBuf, "%u", low);
+        return 1;
+    }
+    if (view == PROF_VIEW_RAW24_24) {
+        safe_snprintf_n(buf, nBuf, "%u/%u",
+                        (unsigned)(rawvalue >> 24),
+                        (unsigned)(rawvalue & 0x00ffffffULL));
+        return 1;
+    }
+    if (view == PROF_VIEW_RAW24_32) {
+        safe_snprintf_n(buf, nBuf, "%u/%u",
+                        (unsigned)(rawvalue >> 32),
+                        (unsigned)(rawvalue & 0xffffffffULL));
+        return 1;
+    }
+    WriteNotDecoded(buf, nBuf);
+    return 1;
+}
+
+static const DRIVEDB_ATTR* FindStoredDbAttr(const DRIVE_INFO* p, BYTE id)
+{
+    int i;
+    if (!p || id == 0) return NULL;
+    for (i = 0; i < p->nDriveDbAttrs && i < DRIVEDB_ATTR_MAX; i++) {
+        if (p->driveDbAttr[i].id == id) return &p->driveDbAttr[i];
+    }
+    return NULL;
+}
+
+/* Local PAIR is bytes [1:0] / [3:2]. A drivedb row uses its own -v view.
+ * A local single-value encoding keeps the caller's number printer. */
+int FormatAttrRawText(const DRIVE_INFO* p, BYTE id, const BYTE* raw,
+                      unsigned val, unsigned worst, char* buf, int nBuf)
+{
+    int sem = PROF_SEM_NONE, enc = PROF_ENC_NONE;
+    const DRIVEDB_ATTR* db;
+    if (!buf || nBuf <= 0) return 0;
+    buf[0] = '\0';
+    if (!p || !raw || id == 0) return 0;
+    if (ProfileListsAttr(p, id)) {
+        if (!ProfileLookup(p, id, &sem, &enc)) return 0;
+        if (enc == PROF_ENC_PACKED) {
+            WriteNotDecoded(buf, nBuf);
+            return 1;
+        }
+        if (enc == PROF_ENC_PAIR) {
+            unsigned lo = (unsigned)raw[0] | ((unsigned)raw[1] << 8);
+            unsigned hi = (unsigned)raw[2] | ((unsigned)raw[3] << 8);
+            safe_snprintf_n(buf, nBuf, "%u / %u", lo, hi);
+            return 1;
+        }
+        return 0;
+    }
+    db = FindStoredDbAttr(p, id);
+    if (db && RawViewHasFields((int)db->view))
+        return FormatRawFields((int)db->view, db->order, raw, val, worst, buf, nBuf);
+    if (DriveDbAttrEnc(p, id, &sem, &enc) &&
+        (enc == PROF_ENC_PACKED || enc == PROF_ENC_PAIR)) {
+        WriteNotDecoded(buf, nBuf);
+        return 1;
+    }
+    return 0;
 }
 
 

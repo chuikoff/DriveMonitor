@@ -132,6 +132,16 @@ static const PROF_ATTR kCoverSame[] = {
       0, 0, 0, 0, 2, 0, 0 },
     { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0 }
 };
+static const PROF_ATTR kPrefHi[] = {
+    { 0x42, PROF_SEM_ENDURANCE, PROF_ENC_VALUE, 0, "Hi", "Hi", NULL, NULL,
+      0, 0, 0, 0, 0, 0, 0, 1 },
+    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0 }
+};
+static const PROF_ATTR kPrefLo[] = {
+    { 0x42, PROF_SEM_ENDURANCE, PROF_ENC_VALUE, 0, "Lo", "Lo", NULL, NULL,
+      0, 0, 0, 0, 0, 0, 0, 0 },
+    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0 }
+};
 
 static void DefExact(PROFILE_DEF* d, const char* id, const char* model,
                      const PROF_ATTR* attrs, const char* source)
@@ -159,18 +169,22 @@ static void TestPriority(void)
     ExpectId("samsung-870-svt", 100, "870 EVO + SVT");
     Expect(g.eController == CONTROLLER_SAMSUNG, "870 SVT controller");
     Expect(strcmp(g.szControllerChip, "Samsung MKX") == 0, "870 SVT chip");
-    Expect((g.nProfileFlags & PROF_F_E7_VALUE) != 0, "870 SVT E7 value");
-    Expect((g.nProfileFlags & PROF_F_B1_LIFE) != 0, "870 SVT B1 life");
-    Expect(!g.bProfileAmbiguous, "870 SVT unique");
     Expect(Lookup(0xE7, &sem, &enc) && sem == PROF_SEM_ENDURANCE &&
-           enc == PROF_ENC_PERCENT, "870 E7 endurance");
+           enc == PROF_ENC_VALUE, "870 E7 value");
+    Expect(Lookup(0xB1, &sem, &enc) && sem == PROF_SEM_ENDURANCE &&
+           enc == PROF_ENC_VALUE, "870 B1 value");
+    Expect(ProfileAttrPref(&g, 0xE7) > ProfileAttrPref(&g, 0xB1),
+           "870 E7 preferred over B1");
+    Expect((g.nProfileFlags & PROF_F_PREFER_AGREEING) == 0,
+           "870 does not prefer an agreeing raw");
+    Expect(!g.bProfileAmbiguous, "870 SVT unique");
 
     Blank(DRIVE_TYPE_SSD_SATA, FALSE);
     Name("Samsung SSD 870 EVO 1TB", "RVT02B6Q");
     Go();
     ExpectId("samsung-870-evo", 98, "870 EVO model");
     Expect(strcmp(g.szControllerChip, "Samsung MKX") == 0, "870 EVO chip");
-    Expect((g.nProfileFlags & PROF_F_E7_VALUE) != 0, "870 EVO flags");
+    Expect(Lookup(0xE7, &sem, &enc) && enc == PROF_ENC_VALUE, "870 EVO E7 value");
 
     Blank(DRIVE_TYPE_SSD_SATA, FALSE);
     Name("Samsung SSD 870 QVO 1TB", "SVQ01B6Q");
@@ -178,7 +192,9 @@ static void TestPriority(void)
     ExpectId("samsung-870", 90, "870 family");
     Expect(g.eController == CONTROLLER_SAMSUNG, "870 family controller");
     Expect(g.szControllerChip[0] == '\0', "870 family has no chip");
-    Expect((g.nProfileFlags & PROF_F_B1_LIFE) != 0, "870 family inherits flags");
+    Expect(Lookup(0xB1, &sem, &enc) && sem == PROF_SEM_ENDURANCE &&
+           enc == PROF_ENC_VALUE, "870 family inherits B1 value");
+    Expect(ProfileAttrPref(&g, 0xE7) == 1, "870 family keeps E7 pref");
 
     Blank(DRIVE_TYPE_SSD_SATA, FALSE);
     Name("MYSTERYSSD", "");
@@ -212,7 +228,7 @@ static void TestSameIdDifferentMeaning(void)
     Go();
     ExpectId("a400-sbfk", 100, "A400 SBFK");
     Expect(g.eController == CONTROLLER_PHISON, "A400 SBFK Phison");
-    Expect((g.nProfileFlags & PROF_F_A9_PREFER_E7) != 0, "A400 prefer E7");
+    Expect((g.nProfileFlags & PROF_F_PREFER_AGREEING) != 0, "A400 prefer agreeing");
     Expect(Lookup(0xA9, &sem, &enc) && sem == PROF_SEM_ENDURANCE &&
            enc == PROF_ENC_PERCENT, "Phison A9 endurance");
     Expect(Lookup(0xE7, &sem, &enc) && sem == PROF_SEM_ENDURANCE, "Phison E7 endurance");
@@ -233,12 +249,12 @@ static void TestSameIdDifferentMeaning(void)
     Go();
     ExpectId("p3-maxio-sn", 100, "P3 SN");
     Expect(g.eController == CONTROLLER_MAXIO, "P3 Maxio");
-    Expect((g.nProfileFlags & PROF_F_E7_VALUE) != 0, "P3 E7 value");
-    Expect((g.nProfileFlags & PROF_F_B1_LIFE) == 0, "P3 has no B1 life");
+    Expect((g.nProfileFlags & PROF_F_PREFER_AGREEING) == 0, "P3 has no agreeing flag");
+    Expect(!Lookup(0xB1, &sem, &enc), "P3 has no B1");
     Expect(Lookup(0xA9, &sem, &enc) && sem == PROF_SEM_NONE &&
            enc == PROF_ENC_PAIR, "Maxio A9 is a pair");
     Expect(Lookup(0xE7, &sem, &enc) && sem == PROF_SEM_ENDURANCE &&
-           enc == PROF_ENC_PERCENT, "Maxio E7 endurance");
+           enc == PROF_ENC_VALUE, "Maxio E7 value");
     Expect(Lookup(0xF1, &sem, &enc) && enc == PROF_ENC_GIB, "Maxio F1 GiB");
 }
 
@@ -252,9 +268,10 @@ static void TestFirmwareShape(void)
     ExpectId("a400-smi225", 100, "A400 SM2258 firmware");
     Expect(g.eController == CONTROLLER_SMI, "A400 SMI");
     Expect(strstr(g.szControllerChip, "SM2258") != NULL, "A400 chip");
-    Expect((g.nProfileFlags & PROF_F_E7_VALUE) == 0, "A400 SMI has no E7-from-value");
+    Expect(Lookup(0xA9, &sem, &enc) && sem == PROF_SEM_ENDURANCE &&
+           enc == PROF_ENC_PERCENT, "A400 SMI A9 raw percent");
+    Expect(!Lookup(0xE7, &sem, &enc), "A400 SMI has no E7");
     Expect(Lookup(0xF1, &sem, &enc) && enc == PROF_ENC_BLOCK32, "A400 F1 32 MiB");
-    Expect(Lookup(0xA9, &sem, &enc) && sem == PROF_SEM_ENDURANCE, "A400 SMI A9");
 
     Blank(DRIVE_TYPE_SSD_SATA, FALSE);
     Name("", "U0524A0");
@@ -276,7 +293,8 @@ static void TestFirmwareShape(void)
     ExpectId("as350", 98, "AS350 model");
     Expect(g.eController == CONTROLLER_SMI, "AS350 SMI");
     Expect(strcmp(g.szControllerChip, "Silicon Motion SM2258") == 0, "AS350 chip");
-    Expect((g.nProfileFlags & PROF_F_E7_VALUE) == 0, "AS350 life is not E7-from-value");
+    Expect((g.nProfileFlags & PROF_F_PREFER_AGREEING) == 0,
+           "AS350 does not prefer an agreeing raw");
     Expect(!Lookup(0xE7, &sem, &enc), "AS350 231 is not in the local profile");
 
     Blank(DRIVE_TYPE_SSD_SATA, FALSE);
@@ -458,7 +476,7 @@ static void TestRegister(void)
     Go();
     g_dbE7 = 1;
     Expect(Lookup(0xE7, &sem, &enc) && sem == PROF_SEM_ENDURANCE &&
-           enc == PROF_ENC_PERCENT, "local 231 beats drivedb");
+           enc == PROF_ENC_VALUE, "local 231 beats drivedb");
     g_dbE7 = 0;
 }
 
@@ -475,6 +493,9 @@ static void TestWriteVolume(void)
     Expect(ProfileWriteVolume(PROF_SEM_HOST_WRITE, PROF_ENC_SCALE), "host scale");
     Expect(ProfileEraseCount(PROF_SEM_ERASE, PROF_ENC_COUNTER), "erase counter");
     Expect(ProfileEraseCount(PROF_SEM_ERASE, PROF_ENC_MAXAVG), "erase max/avg");
+    Expect(ProfileEraseCount(PROF_SEM_ERASE, PROF_ENC_AVG), "erase average");
+    Expect(ProfileEraseCount(PROF_SEM_ERASE, PROF_ENC_MAX), "erase maximum");
+    Expect(ProfileEraseCount(PROF_SEM_ERASE, PROF_ENC_MIN), "erase minimum");
     Expect(!ProfileEraseCount(PROF_SEM_ERASE, PROF_ENC_PERCENT), "erase percent is not a count");
     Expect(!ProfileEraseCount(PROF_SEM_WEAR, PROF_ENC_COUNTER), "wear counter is not erase");
     Expect(!ProfileEraseCount(PROF_SEM_NONE, PROF_ENC_COUNTER), "unnamed counter is not erase");
@@ -496,7 +517,25 @@ static void TestWriteVolume(void)
     Name("PHISON-EA", "");
     Go();
     Expect(!Lookup(0xEA, &sem, &enc), "Phison EA is not listed");
-    Expect(Lookup(0xA7, &sem, &enc) && ProfileEraseCount(sem, enc), "Phison A7 erase");
+    Expect(Lookup(0xA7, &sem, &enc) && enc == PROF_ENC_AVG &&
+           ProfileEraseCount(sem, enc), "Phison A7 average");
+    Expect(Lookup(0xA5, &sem, &enc) && enc == PROF_ENC_MAX &&
+           ProfileEraseCount(sem, enc), "Phison A5 max");
+    Expect(Lookup(0xA6, &sem, &enc) && enc == PROF_ENC_MIN &&
+           ProfileEraseCount(sem, enc), "Phison A6 min");
+    Expect(Lookup(0xA4, &sem, &enc) && enc == PROF_ENC_COUNTER &&
+           ProfileEraseCount(sem, enc), "Phison A4 total stays a counter");
+
+    Blank(DRIVE_TYPE_SSD_SATA, FALSE);
+    g.eController = CONTROLLER_MICRON;
+    Name("Micron_1100_MTFD", "");
+    Go();
+    Expect(strcmp(g.szProfileId, "micron-ssd") == 0, "Micron controller profile");
+    Expect(Lookup(0xCA, &sem, &enc) && sem == PROF_SEM_ENDURANCE &&
+           enc == PROF_ENC_VALUE, "Micron CA is normalized Value");
+    Expect(ProfileAttrPref(&g, 0xCA) == 0, "Micron CA pref");
+    Expect(Lookup(0xAD, &sem, &enc) && sem == PROF_SEM_ERASE &&
+           enc == PROF_ENC_AVG && ProfileEraseCount(sem, enc), "Micron AD average");
 }
 
 static void TestDecodeAndUsb(void)
@@ -528,6 +567,10 @@ static void TestDecodeAndUsb(void)
     Expect(ProfileDecodeRaw(PROF_ENC_MAXAVG, 0x100000000ULL, &out) == 0, "maxavg wide");
     Expect(ProfileDecodeRaw(PROF_ENC_PAIR, 0x100000000ULL, &out) == 0, "pair wide");
     Expect(ProfileDecodeRaw(PROF_ENC_PACKED, 5, &out) == 0, "packed unsafe");
+    Expect(ProfileDecodeRaw(PROF_ENC_AVG, 42, &out) == 1 && out == 42, "avg count");
+    Expect(ProfileDecodeRaw(PROF_ENC_MAX, 9, &out) == 1 && out == 9, "max count");
+    Expect(ProfileDecodeRaw(PROF_ENC_MIN, 1, &out) == 1 && out == 1, "min count");
+    Expect(ProfileDecodeRaw(PROF_ENC_VALUE, 98, &out) == 0, "value is not raw");
     Expect(ProfileDecodeRaw(PROF_ENC_PERCENT, 1, NULL) == 0, "decode NULL out");
 
     Expect(ProfileRawDelta(10, 15, &delta) == 1 && delta == 5, "raw delta");
@@ -795,6 +838,19 @@ static void TestAttrTier(void)
     memset(&h, 0, sizeof(h));
     Expect(ProfileHealthRule(&g, 0x11, &h) && h.sem == PROF_SEM_MEDIA &&
            h.caution == 2 && h.bad == 0, "agreed rule fields are kept");
+    ProfileClearRegistered();
+
+    DefExact(&exact, "pref-hi", "ZZPREF", kPrefHi, "test-register");
+    DefExact(&media, "pref-lo", "ZZPREF", kPrefLo, "test-register");
+    Expect(ProfileRegister(&exact), "higher pref");
+    Expect(ProfileRegister(&media), "lower pref");
+    Blank(DRIVE_TYPE_SSD_SATA, FALSE);
+    Name("ZZPREF", "");
+    Go();
+    Expect(g.bProfileAmbiguous, "equal rows stay an identity tie");
+    Expect(!Lookup(0x42, &sem, &enc), "different pref refuses the attribute");
+    Expect(ProfileListsAttr(&g, 0x42), "refused pref stays listed");
+    Expect(ProfileAttrPref(&g, 0x42) == 0, "refused pref is not a number");
     ProfileClearRegistered();
 }
 

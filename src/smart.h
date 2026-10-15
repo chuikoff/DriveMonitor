@@ -398,6 +398,8 @@ typedef struct _DRIVEDB_ATTR {
     BYTE id;
     BYTE sem;
     BYTE enc;
+    BYTE view;       /* PROF_VIEW_*. How -v prints RAW. Not a health encoding. */
+    char order[9];   /* smartmontools byte order, or empty for the view default */
     char name[44];
 } DRIVEDB_ATTR;
 
@@ -448,7 +450,7 @@ typedef struct _DRIVE_INFO {
     /* ---- New fields  ---- */
     DRIVE_HEALTH_STATUS eHealthStatus;   /* our assessment */
     DRIVE_HEALTH_STATUS eDiskStatus;     /* drive's own SMART: RETURN STATUS / NVMe Critical Warning */
-    int         nConfidence;          /* 0-100 overall weighted blend, 0 if no SMART */
+    int         nConfidence;          /* 0-100 evidence blend; 0 if SMART was not assessed */
     int         nConfCompleteness;    /* SMART + thresh + temp + media counters */
     int         nConfTransport;       /* native 100, USB SMART-ok 90, USB-no-SMART 40 */
     int         nConfModelId;         /* controller known 99, firmware-family 90, unknown 70 */
@@ -611,7 +613,9 @@ typedef enum _RAW_ENC {
     RAW_ENC_LBA,
     RAW_ENC_SECTORS_LO16,
     RAW_ENC_EVENTS,
-    RAW_ENC_CYCLES
+    RAW_ENC_CYCLES,
+    RAW_ENC_PACKED,        /* several fields, not one counter */
+    RAW_ENC_PAIR           /* two raw16 halves, not one counter */
 } RAW_ENC;
 
 typedef struct _ATTR_DECODE {
@@ -791,11 +795,25 @@ BOOL IsSmi225xFamily(const DRIVE_INFO* p);
 #define PROF_ENC_COUNTER 5
 #define PROF_ENC_GIB     6   /* raw value is already GiB */
 #define PROF_ENC_MAXAVG  7   /* raw16(avg16): max in the low half, average in the next */
-#define PROF_ENC_PAIR    8   /* two raw halves: later/early, or a raw16(raw16) pair */
+#define PROF_ENC_PAIR    8   /* local pair: bytes [1:0] and [3:2], not one counter */
 #define PROF_ENC_LO16    9   /* low 16 bits of RAW */
 #define PROF_ENC_REPORTED 10 /* reported-uncorrectable packing */
 #define PROF_ENC_REMAP   11  /* remap count; flying-hours copy is not a count */
-#define PROF_ENC_PACKED  12  /* raw24/raw32 or raw16(raw16): not one counter */
+#define PROF_ENC_PACKED  12  /* several fields with no single layout: not one counter */
+
+/* How a drivedb -v format is printed. Health still uses PROF_ENC_*.
+ * A named row keeps this even when the name forces PROF_ENC_PACKED. */
+#define PROF_VIEW_NUMBER     0   /* one counter: raw48, raw16, hex* */
+#define PROF_VIEW_RAW16_OPT  1   /* raw16(raw16) */
+#define PROF_VIEW_AVG16      2   /* raw16(avg16); the 173 cell has its own split */
+#define PROF_VIEW_RAW24_OPT8 3   /* raw24(raw8) */
+#define PROF_VIEW_RAW24_24   4   /* raw24/raw24 */
+#define PROF_VIEW_RAW24_32   5   /* raw24/raw32 */
+#define PROF_VIEW_UNDECODED  6   /* composite format this program does not print */
+#define PROF_ENC_VALUE   13  /* the percent is the normalized Value, not RAW */
+#define PROF_ENC_AVG     14  /* raw counter is the average erase count */
+#define PROF_ENC_MAX     15  /* raw counter is the maximum erase count */
+#define PROF_ENC_MIN     16  /* raw counter is the minimum erase count */
 
 /* How a decoded count moves a channel. The profile stores the rule.
  * The health engine does not keep a private threshold for an attribute id. */
@@ -815,10 +833,10 @@ BOOL IsSmi225xFamily(const DRIVE_INFO* p);
 #define PROF_SCOPE_HDD 1
 #define PROF_SCOPE_SSD 2
 
-/* How a matched profile reads life counters. Inherited along extends. */
-#define PROF_F_E7_VALUE      1  /* 231 life is normalized Value, not RAW */
-#define PROF_F_A9_PREFER_E7  2  /* dummy A9 Value: use E7 when it agrees */
-#define PROF_F_B1_LIFE       4  /* 177 Value is remaining life */
+/* How several endurance readings on one drive are combined.
+ * Inherited along extends. Which field is the percent is PROF_ENC_*. */
+#define PROF_F_PREFER_AGREEING 2 /* a RAW percent that matches its Value wins
+                                  * over another reading whose Value is still >= 90 */
 
 #define PROF_KIND_EXACT       1
 #define PROF_KIND_FAMILY      2
@@ -849,6 +867,7 @@ typedef struct _PROF_ATTR {
     unsigned short caution;
     unsigned short bad;       /* both HDD and SSD; 0 = off */
     unsigned short badHdd;    /* HDD only; 0 = off */
+    unsigned char pref = 0;  /* higher wins among one semantic; 0 is normal */
 } PROF_ATTR;
 
 /* Normalized channel rule for one attribute. rule is OFF or WORSE. */
@@ -908,12 +927,15 @@ int  DriveProfileScore(const DRIVE_INFO* p);
 /* Registers one extra profile. FALSE if the id is empty, already known, or the table is full. */
 BOOL ProfileRegister(const PROFILE_DEF* def);
 void ProfileClearRegistered(void);
-/* 1 when RAW can be decoded with this encoding. SCALE and NONE are not safe. */
+/* 1 when RAW can be decoded with this encoding.
+ * SCALE, NONE, and VALUE are not a RAW decode. VALUE is the normalized byte. */
 int  ProfileDecodeRaw(int enc, unsigned __int64 raw, unsigned __int64* out);
 /* 1 when sem is host or NAND writes and enc names the unit.
  * PERCENT and a bare COUNTER are not a volume. */
 int  ProfileWriteVolume(int sem, int enc);
-/* 1 when sem is ERASE and enc is a count or a max/avg pair. */
+/* 1 when sem is ERASE and enc is a count, a max/avg pair, or an
+ * explicit average, maximum, or minimum. A bare COUNTER is still an
+ * erase count here. Extraction does not treat that COUNTER as the average. */
 int  ProfileEraseCount(int sem, int enc);
 /* Channel rule for id. FALSE when the attribute is unknown or contested.
  * A local MEDIA/INTERFACE rule with PROF_RULE_DEFAULT becomes caution at 1.
@@ -949,6 +971,8 @@ BOOL ProfileAttrLabel(const DRIVE_INFO* p, BYTE id,
 BOOL ProfileListsAttr(const DRIVE_INFO* p, BYTE id);
 /* Local profile, then a drivedb -v row, then the generic profile. */
 BOOL ProfileLookup(const DRIVE_INFO* p, BYTE id, int* sem, int* enc);
+/* Preference of the local or generic row. A drivedb row is 0. */
+int  ProfileAttrPref(const DRIVE_INFO* p, BYTE id);
 /* Fills szModelFamily from drivedb.h. Does not send USB commands. */
 void DriveDbApply(DRIVE_INFO* p);
 const char* DriveDbAttrName(const DRIVE_INFO* p, BYTE id);
@@ -956,6 +980,16 @@ const char* DriveDbAttrName(const DRIVE_INFO* p, BYTE id);
 BOOL DriveDbLookup(const DRIVE_INFO* p, BYTE id, int* sem, int* enc);
 /* Stored -v row, including names that are not a health semantic. */
 BOOL DriveDbAttrEnc(const DRIVE_INFO* p, BYTE id, int* sem, int* enc);
+/* 1 when buf holds the value-cell text for a multi-field RAW.
+ * A single counter returns 0 and does not write a number.
+ * A known -v layout prints its fields. Anything else composite
+ * says the RAW is not decoded. The attribute id is not a case label. */
+int FormatAttrRawText(const DRIVE_INFO* p, BYTE id, const BYTE* raw,
+                      unsigned val, unsigned worst, char* buf, int nBuf);
+/* Same printer for one view and byte order. An empty order uses the
+ * smartmontools default for that view. NUMBER and AVG16 return 0. */
+int FormatRawFields(int view, const char* order, const BYTE* raw,
+                    unsigned val, unsigned worst, char* buf, int nBuf);
 void FormatUsbCapability(const DRIVE_INFO* p, char* buf, int nBuf);
 
 #ifdef __cplusplus

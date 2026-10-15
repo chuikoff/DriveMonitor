@@ -9,7 +9,7 @@
  * are both equal, the identity match is ambiguous: the lexically first id
  * is recorded and the other id is the conflict. An attribute on a tier is
  * used only when every profile on that tier states the same semantic,
- * encoding, and health-rule fields. If they disagree, or the attribute is
+ * encoding, preference, and health-rule fields. If they disagree, or the attribute is
  * missing from some of them, lookup refuses. If none of them name it, the
  * next worse tier is tried. A lower-tier conflict does not mark the
  * identity ambiguous. Registration order is not a tie-break. A firmware
@@ -23,27 +23,32 @@
 #define PA(id, sem, enc) \
     { (unsigned char)(id), (unsigned char)(sem), (unsigned char)(enc), \
       0, NULL, NULL, NULL, NULL, \
-      0, 0, 0, 0, 0, 0, 0 }
+      0, 0, 0, 0, 0, 0, 0, 0 }
 #define PN(id, sem, enc, ru, en) \
     { (unsigned char)(id), (unsigned char)(sem), (unsigned char)(enc), \
       0, ru, en, NULL, NULL, \
-      0, 0, 0, 0, 0, 0, 0 }
+      0, 0, 0, 0, 0, 0, 0, 0 }
 #define PNA(id, sem, enc, ru, en, unless, aru, aen) \
     { (unsigned char)(id), (unsigned char)(sem), (unsigned char)(enc), \
       (unsigned char)(unless), ru, en, aru, aen, \
-      0, 0, 0, 0, 0, 0, 0 }
+      0, 0, 0, 0, 0, 0, 0, 0 }
 #define PH(id, sem, enc, rule, slot, scope, obs, cau, bad, badHdd) \
     { (unsigned char)(id), (unsigned char)(sem), (unsigned char)(enc), \
       0, NULL, NULL, NULL, NULL, \
       (unsigned char)(rule), (unsigned char)(slot), (unsigned char)(scope), \
       (unsigned short)(obs), (unsigned short)(cau), \
-      (unsigned short)(bad), (unsigned short)(badHdd) }
+      (unsigned short)(bad), (unsigned short)(badHdd), 0 }
 #define PHN(id, sem, enc, ru, en, rule, slot, scope, obs, cau, bad, badHdd) \
     { (unsigned char)(id), (unsigned char)(sem), (unsigned char)(enc), \
       0, ru, en, NULL, NULL, \
       (unsigned char)(rule), (unsigned char)(slot), (unsigned char)(scope), \
       (unsigned short)(obs), (unsigned short)(cau), \
-      (unsigned short)(bad), (unsigned short)(badHdd) }
+      (unsigned short)(bad), (unsigned short)(badHdd), 0 }
+/* Same as PN, with an explicit preference among one semantic. */
+#define PNY(id, sem, enc, ru, en, pref) \
+    { (unsigned char)(id), (unsigned char)(sem), (unsigned char)(enc), \
+      0, ru, en, NULL, NULL, \
+      0, 0, 0, 0, 0, 0, 0, (unsigned char)(pref) }
 
 typedef struct _DRIVE_PROFILE {
     const char* id;
@@ -101,9 +106,9 @@ static const PROF_ATTR kPhison[] = {
         PROF_RULE_OFF, PROF_SLOT_NONE, PROF_SCOPE_ANY, 0, 0, 0, 0),
     PN(0xA3, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Начальные плохие блоки", "Initial bad blocks"),
     PN(0xA4, PROF_SEM_ERASE,      PROF_ENC_COUNTER, "Всего стираний", "Total erase count"),
-    PN(0xA5, PROF_SEM_ERASE,      PROF_ENC_COUNTER, "Макс. стираний", "Max erase count"),
-    PN(0xA6, PROF_SEM_ERASE,      PROF_ENC_COUNTER, "Мин. стираний", "Min erase count"),
-    PN(0xA7, PROF_SEM_ERASE,      PROF_ENC_COUNTER, "Среднее стираний", "Average erase count"),
+    PN(0xA5, PROF_SEM_ERASE,      PROF_ENC_MAX,     "Макс. стираний", "Max erase count"),
+    PN(0xA6, PROF_SEM_ERASE,      PROF_ENC_MIN,     "Мин. стираний", "Min erase count"),
+    PN(0xA7, PROF_SEM_ERASE,      PROF_ENC_AVG,     "Среднее стираний", "Average erase count"),
     PN(0xA8, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Макс. стираний по спецификации", "Specified max erase count"),
     PN(0xA9, PROF_SEM_ENDURANCE,  PROF_ENC_PERCENT, "Заявленный остаток ресурса", "Reported life remaining"),
     PN(0xAF, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Сбой защиты питания", "Power-loss protection fail"),
@@ -127,7 +132,9 @@ static const PROF_ATTR kPhison[] = {
 };
 
 static const PROF_ATTR kSamsungSsd[] = {
-    PN(0xB1, PROF_SEM_WEAR,       PROF_ENC_COUNTER, "Выравнивание износа", "Wear leveling"),
+    /* Value is remaining life when 231 is absent. RAW is not the percent.
+     * Preference 0 loses to 231. */
+    PN(0xB1, PROF_SEM_ENDURANCE,  PROF_ENC_VALUE, "Выравнивание износа", "Wear leveling"),
     PN(0xB3, PROF_SEM_MEDIA,      PROF_ENC_COUNTER, "Использовано резервных блоков", "Used reserved blocks"),
     PA(0xB5, PROF_SEM_NONE,       PROF_ENC_COUNTER),
     PN(0xB6, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Ошибки стирания", "Erase fail count"),
@@ -137,13 +144,14 @@ static const PROF_ATTR kSamsungSsd[] = {
     PHN(0xBB, PROF_SEM_MEDIA, PROF_ENC_COUNTER,
         "Неисправимые ошибки", "Uncorrectable errors",
         PROF_RULE_WORSE, PROF_SLOT_NONE, PROF_SCOPE_ANY, 0, 0, 1, 0),
-    PN(0xE7, PROF_SEM_ENDURANCE,  PROF_ENC_PERCENT, "Остаток ресурса SSD", "SSD life remaining"),
+    /* Higher preference than 177. RAW is an erase count, not the percent. */
+    PNY(0xE7, PROF_SEM_ENDURANCE, PROF_ENC_VALUE, "Остаток ресурса SSD", "SSD life remaining", 1),
     PN(0xEB, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Защита от потери питания", "Power-loss protection"),
     PN(0xF1, PROF_SEM_HOST_WRITE, PROF_ENC_LBA,     "Записано хостом (ГБ)", "Host written (GB)"),
     PN(0xF2, PROF_SEM_HOST_READ,  PROF_ENC_LBA,     "Прочитано хостом (ГБ)", "Host read (GB)"),
-    PN(0xF5, PROF_SEM_ERASE,      PROF_ENC_COUNTER, "Мин. стираний (Samsung)", "Min erase count (Samsung)"),
-    PN(0xF6, PROF_SEM_ERASE,      PROF_ENC_COUNTER, "Макс. стираний (Samsung)", "Max erase count (Samsung)"),
-    PN(0xF7, PROF_SEM_ERASE,      PROF_ENC_COUNTER, "Среднее стираний (Samsung)", "Average erase count (Samsung)"),
+    PN(0xF5, PROF_SEM_ERASE,      PROF_ENC_MIN,     "Мин. стираний (Samsung)", "Min erase count (Samsung)"),
+    PN(0xF6, PROF_SEM_ERASE,      PROF_ENC_MAX,     "Макс. стираний (Samsung)", "Max erase count (Samsung)"),
+    PN(0xF7, PROF_SEM_ERASE,      PROF_ENC_AVG,     "Среднее стираний (Samsung)", "Average erase count (Samsung)"),
     PN(0xF8, PROF_SEM_WEAR,       PROF_ENC_COUNTER, "Выравнивание износа (Samsung)", "Wear leveling (Samsung)"),
     PA(0, 0, 0)
 };
@@ -158,9 +166,9 @@ static const PROF_ATTR kSmi225[] = {
     PN(0xA1, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Годные резервные блоки", "Valid spare blocks"),
     PN(0xA3, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Начальные плохие блоки", "Initial bad blocks"),
     PN(0xA4, PROF_SEM_ERASE,      PROF_ENC_COUNTER, "Всего стираний", "Total erase count"),
-    PN(0xA5, PROF_SEM_ERASE,      PROF_ENC_COUNTER, "Макс. стираний", "Max erase count"),
-    PN(0xA6, PROF_SEM_ERASE,      PROF_ENC_COUNTER, "Мин. стираний", "Min erase count"),
-    PN(0xA7, PROF_SEM_ERASE,      PROF_ENC_COUNTER, "Среднее стираний", "Average erase count"),
+    PN(0xA5, PROF_SEM_ERASE,      PROF_ENC_MAX,     "Макс. стираний", "Max erase count"),
+    PN(0xA6, PROF_SEM_ERASE,      PROF_ENC_MIN,     "Мин. стираний", "Min erase count"),
+    PN(0xA7, PROF_SEM_ERASE,      PROF_ENC_AVG,     "Среднее стираний", "Average erase count"),
     PN(0xA8, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Макс. стираний по спецификации", "Specified max erase count"),
     PN(0xA9, PROF_SEM_ENDURANCE,  PROF_ENC_PERCENT, "Остаток ресурса", "Life remaining"),
     PN(0xAF, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Ошибки программирования (чип)", "Program fail count (chip)"),
@@ -186,7 +194,8 @@ static const PROF_ATTR kMaxioSata[] = {
     PN(0xAD, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Стирания", "Erase count"),
     PN(0xAF, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Плохие кластеры", "Bad clusters"),
     PN(0xB4, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Резервные блоки", "Spare blocks left"),
-    PN(0xE7, PROF_SEM_ENDURANCE,  PROF_ENC_PERCENT, "Остаток ресурса SSD", "SSD life remaining"),
+    /* Value is life remaining. RAW is percent used, not the percent left. */
+    PN(0xE7, PROF_SEM_ENDURANCE,  PROF_ENC_VALUE,   "Остаток ресурса SSD", "SSD life remaining"),
     PN(0xF1, PROF_SEM_HOST_WRITE, PROF_ENC_GIB,     "Записано хостом (ГиБ)", "Host written (GiB)"),
     PN(0xF2, PROF_SEM_HOST_READ,  PROF_ENC_GIB,     "Прочитано хостом (ГиБ)", "Host read (GiB)"),
     PA(0, 0, 0)
@@ -202,8 +211,9 @@ static const PROF_ATTR kIntel[] = {
 };
 
 static const PROF_ATTR kMicron[] = {
-    PN(0xAD, PROF_SEM_ERASE,      PROF_ENC_COUNTER, "Среднее стираний", "Average erase count"),
-    PN(0xCA, PROF_SEM_ENDURANCE,  PROF_ENC_PERCENT, "Остаток ресурса %", "Percent lifetime remaining"),
+    PN(0xAD, PROF_SEM_ERASE,      PROF_ENC_AVG,     "Среднее стираний", "Average erase count"),
+    /* Normalized Value is remaining life. RAW is not the percent. */
+    PN(0xCA, PROF_SEM_ENDURANCE,  PROF_ENC_VALUE,   "Остаток ресурса %", "Percent lifetime remaining"),
     PN(0xF6, PROF_SEM_HOST_WRITE, PROF_ENC_LBA,     "Записано секторов хоста", "Host sectors written"),
     PA(0, 0, 0)
 };
@@ -246,10 +256,10 @@ static const DRIVE_PROFILE kProfiles[] = {
 
     { "phison", NULL, PROF_KIND_CONTROLLER, NULL, NULL, PROF_FW_NONE,
       VENDOR_UNKNOWN, CONTROLLER_PHISON, -1, 0, NULL, NULL, kPhison,
-      PROF_F_A9_PREFER_E7, NULL },
+      PROF_F_PREFER_AGREEING, NULL },
     { "samsung-ssd", NULL, PROF_KIND_CONTROLLER, NULL, NULL, PROF_FW_NONE,
       VENDOR_UNKNOWN, CONTROLLER_SAMSUNG, 0, 0, NULL, NULL, kSamsungSsd,
-      PROF_F_E7_VALUE | PROF_F_B1_LIFE, NULL },
+      0, NULL },
     /* NVMe life is Percentage Used. kSamsungSsd stays on ATA. */
     { "samsung-nvme", NULL, PROF_KIND_CONTROLLER, NULL, NULL, PROF_FW_NONE,
       VENDOR_UNKNOWN, CONTROLLER_SAMSUNG, 1, 0, NULL, NULL, NULL, 0, NULL },
@@ -281,10 +291,10 @@ static const DRIVE_PROFILE kProfiles[] = {
       VENDOR_UNKNOWN, CONTROLLER_SAMSUNG, 0, 0, NULL, NULL, NULL, 0, NULL },
     { "p3-maxio-sn", NULL, PROF_KIND_EXACT, "P3-", "SN", PROF_FW_SUBSTR,
       VENDOR_UNKNOWN, CONTROLLER_MAXIO, 0, 0, "Maxio", NULL, kMaxioSata,
-      PROF_F_E7_VALUE, NULL },
+      0, NULL },
     { "maxio-sata", NULL, PROF_KIND_CONTROLLER, NULL, NULL, PROF_FW_NONE,
       VENDOR_UNKNOWN, CONTROLLER_MAXIO, 0, 0, NULL, NULL, NULL,
-      PROF_F_E7_VALUE, NULL },
+      0, NULL },
 
     { "crucial-micron", NULL, PROF_KIND_VENDOR, NULL, NULL, PROF_FW_NONE,
       VENDOR_MICRON, CONTROLLER_UNKNOWN, 0, 0, NULL, NULL, kCrucialMicron, 0, NULL },
@@ -602,6 +612,7 @@ static const PROF_ATTR* AgreedAttr(const DRIVE_PROFILE** top, int nStored,
         if (!a) return NULL;
         if (!first) first = a;
         else if (a->sem != first->sem || a->enc != first->enc ||
+                 a->pref != first->pref ||
                  a->rule != first->rule || a->slot != first->slot ||
                  a->scope != first->scope || a->observe != first->observe ||
                  a->caution != first->caution || a->bad != first->bad ||
@@ -814,6 +825,24 @@ BOOL ProfileLookup(const DRIVE_INFO* p, BYTE id, int* sem, int* enc)
     return TRUE;
 }
 
+int ProfileAttrPref(const DRIVE_INFO* p, BYTE id)
+{
+    const PROF_ATTR* a = NULL;
+    int c;
+    if (!p || id == 0) return 0;
+    c = ConfirmLocal(p, id, &a);
+    if (c == CONF_REFUSE) return 0;
+    if (c == CONF_FOUND && a) return (int)a->pref;
+    /* A drivedb row has no preference. */
+    if (DriveDbLookup(p, id, NULL, NULL)) return 0;
+    {
+        const DRIVE_PROFILE* g = GenericFor(p);
+        a = g ? FindProfAttr(g->attrs, id) : NULL;
+    }
+    if (!a) return 0;
+    return (int)a->pref;
+}
+
 BOOL ProfileAttrLabel(const DRIVE_INFO* p, BYTE id,
                       int* sem, int* enc,
                       const char** nameRu, const char** nameEn,
@@ -851,7 +880,10 @@ int ProfileWriteVolume(int sem, int enc)
 int ProfileEraseCount(int sem, int enc)
 {
     if (sem != PROF_SEM_ERASE) return 0;
-    return enc == PROF_ENC_COUNTER || enc == PROF_ENC_MAXAVG;
+    /* COUNTER means "this is an erase count". It does not name the
+     * average. AVG, MAX, and MIN do. */
+    return enc == PROF_ENC_COUNTER || enc == PROF_ENC_MAXAVG ||
+           enc == PROF_ENC_AVG || enc == PROF_ENC_MAX || enc == PROF_ENC_MIN;
 }
 
 static int StatusRank(int e)
@@ -969,6 +1001,9 @@ int ProfileDecodeRaw(int enc, unsigned __int64 raw, unsigned __int64* out)
         *out = raw;
         return 1;
     case PROF_ENC_COUNTER:
+    case PROF_ENC_AVG:
+    case PROF_ENC_MAX:
+    case PROF_ENC_MIN:
         *out = raw;
         return 1;
     case PROF_ENC_LO16:
@@ -992,6 +1027,7 @@ int ProfileDecodeRaw(int enc, unsigned __int64 raw, unsigned __int64* out)
         if (raw > 0xFFFFFFFFULL) return 0;
         *out = raw;
         return 1;
+    case PROF_ENC_VALUE:
     case PROF_ENC_PACKED:
     case PROF_ENC_SCALE:
     case PROF_ENC_NONE:
