@@ -7,9 +7,9 @@
 #define IDR_VERSION     1
 
 #define DRIVEMONITOR_VERSION         "2.0"
-#define DRIVEMONITOR_BUILD           4
-#define DRIVEMONITOR_BUILD_STR       "4"
-#define DRIVEMONITOR_FILEVERSION     2,0,0,4
+#define DRIVEMONITOR_BUILD           21
+#define DRIVEMONITOR_BUILD_STR       "21"
+#define DRIVEMONITOR_FILEVERSION     2,0,0,21
 #define DRIVEMONITOR_FILEVERSION_STR "2.0 beta 4"
 
 /* Tag that holds the source of the published GPL exe.
