@@ -29,7 +29,7 @@ using namespace Gdiplus;
 
 #define DONATE_URL "https://boosty.to/chuikoff"
 
-/* SMART list: ID, name, value, worst, threshold, raw, decode, status. */
+/* ID, parameter, value, worst, threshold, RAW hex, decode, status. */
 #define ATTR_NCOLS       8
 #define ATTR_COL_RAW     5
 #define ATTR_COL_DECODE  6
@@ -236,9 +236,6 @@ static HMENU g_hViewMenu = NULL;
 static HMENU g_hLangMenu = NULL;
 
 static void LayoutMainWindow(HWND hWnd);
-static void UiDeleteV2Fonts(void);
-extern HFONT g_hFontH1, g_hFontVerdict, g_hFontBody, g_hFontBodySb,
-             g_hFontLabel, g_hFontLabelSb, g_hFontPill, g_hFontPillN;
 static void RecreateUiFonts(void);
 static void UiApplyFonts(HWND hWnd);
 static void UiSyncZoomMenu(void);
@@ -249,6 +246,131 @@ int UiScale(int px)
     if (px <= 0) return px;
     v = MulDiv(px, g_nDpi * g_nZoom, 96 * 100);
     return v < 1 ? 1 : v;
+}
+
+/* Logical (96 DPI, 100% zoom) SMART-list column widths and visual order.
+ * Layout used to force these on every WM_SIZE, so a drag was lost at once
+ * and nothing was written to the registry. */
+static const int kAttrColDef[ATTR_NCOLS] = { 72, 200, 70, 50, 50, 108, 180, 116 };
+static int g_attrColLogical[ATTR_NCOLS] = { 72, 200, 70, 50, 50, 108, 180, 116 };
+static int g_attrColOrder[ATTR_NCOLS] = { 0, 1, 2, 3, 4, 5, 6, 7 };
+
+static int AttrColOrderValid(const int* order)
+{
+    unsigned seen = 0;
+    int i;
+    for (i = 0; i < ATTR_NCOLS; i++) {
+        if (order[i] < 0 || order[i] >= ATTR_NCOLS) return 0;
+        if (seen & (1u << order[i])) return 0;
+        seen |= 1u << order[i];
+    }
+    return seen == ((1u << ATTR_NCOLS) - 1);
+}
+
+static void AttrColsResetDefault(void)
+{
+    int i;
+    for (i = 0; i < ATTR_NCOLS; i++) {
+        g_attrColLogical[i] = kAttrColDef[i];
+        g_attrColOrder[i] = i;
+    }
+}
+
+static int AttrColsLogicalFromPx(int px, int dpi, int zoom)
+{
+    int v;
+    if (dpi < 1) dpi = 96;
+    if (zoom < 1) zoom = 100;
+    if (px < 1) px = 1;
+    v = MulDiv(px, 96 * 100, dpi * zoom);
+    if (v < 12) v = 12;
+    if (v > 2000) v = 2000;
+    return v;
+}
+
+static void AttrColsCapture(HWND hList, int dpi, int zoom)
+{
+    int i;
+    int order[ATTR_NCOLS];
+    if (!hList) return;
+    for (i = 0; i < ATTR_NCOLS; i++) {
+        int px = ListView_GetColumnWidth(hList, i);
+        g_attrColLogical[i] = AttrColsLogicalFromPx(px, dpi, zoom);
+    }
+    if (ListView_GetColumnOrderArray(hList, ATTR_NCOLS, order) &&
+        AttrColOrderValid(order)) {
+        for (i = 0; i < ATTR_NCOLS; i++)
+            g_attrColOrder[i] = order[i];
+    }
+}
+
+static void AttrColsApply(HWND hList)
+{
+    int i;
+    if (!hList) return;
+    for (i = 0; i < ATTR_NCOLS; i++) {
+        int px = UiScale(g_attrColLogical[i]);
+        if (px < 8) px = 8;
+        ListView_SetColumnWidth(hList, i, px);
+    }
+    if (AttrColOrderValid(g_attrColOrder))
+        ListView_SetColumnOrderArray(hList, ATTR_NCOLS, g_attrColOrder);
+}
+
+static void AttrColsLoad(void)
+{
+    HKEY k;
+    DWORD w[ATTR_NCOLS], o[ATTR_NCOLS], sz, t;
+    int i;
+    AttrColsResetDefault();
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\chuikoff\\DriveMonitor",
+                      0, KEY_READ, &k) != ERROR_SUCCESS)
+        return;
+    sz = sizeof(w);
+    t = 0;
+    if (RegQueryValueExA(k, "AttrColW", NULL, &t, (LPBYTE)w, &sz) == ERROR_SUCCESS &&
+        t == REG_BINARY && sz == sizeof(w)) {
+        int ok = 1;
+        for (i = 0; i < ATTR_NCOLS; i++)
+            if (w[i] < 12 || w[i] > 2000) ok = 0;
+        if (ok) {
+            for (i = 0; i < ATTR_NCOLS; i++)
+                g_attrColLogical[i] = (int)w[i];
+        }
+    }
+    sz = sizeof(o);
+    if (RegQueryValueExA(k, "AttrColOrder", NULL, &t, (LPBYTE)o, &sz) == ERROR_SUCCESS &&
+        t == REG_BINARY && sz == sizeof(o)) {
+        int tmp[ATTR_NCOLS];
+        for (i = 0; i < ATTR_NCOLS; i++)
+            tmp[i] = (int)o[i];
+        if (AttrColOrderValid(tmp)) {
+            for (i = 0; i < ATTR_NCOLS; i++)
+                g_attrColOrder[i] = tmp[i];
+        }
+    }
+    RegCloseKey(k);
+}
+
+static void AttrColsSave(HWND hWnd)
+{
+    HWND hList;
+    HKEY k;
+    DWORD w[ATTR_NCOLS], o[ATTR_NCOLS];
+    int i;
+    hList = hWnd ? GetDlgItem(hWnd, IDC_ATTR_LIST) : NULL;
+    if (hList)
+        AttrColsCapture(hList, g_nDpi, g_nZoom);
+    if (RegCreateKeyExA(HKEY_CURRENT_USER, "Software\\chuikoff\\DriveMonitor",
+                        0, NULL, 0, KEY_WRITE, NULL, &k, NULL) != ERROR_SUCCESS)
+        return;
+    for (i = 0; i < ATTR_NCOLS; i++) {
+        w[i] = (DWORD)g_attrColLogical[i];
+        o[i] = (DWORD)g_attrColOrder[i];
+    }
+    RegSetValueExA(k, "AttrColW", 0, REG_BINARY, (const BYTE*)w, sizeof(w));
+    RegSetValueExA(k, "AttrColOrder", 0, REG_BINARY, (const BYTE*)o, sizeof(o));
+    RegCloseKey(k);
 }
 
 static UINT QueryDpiForMonitor(HMONITOR hMon)
@@ -429,7 +551,6 @@ HACCEL UiCreateAccelTable(void)
         { (BYTE)(FVIRTKEY | FCONTROL),           (WORD)'0',           IDM_ZOOM_100 },
         { (BYTE)(FVIRTKEY | FCONTROL),           (WORD)VK_NUMPAD0,    IDM_ZOOM_100 },
         { (BYTE)(FVIRTKEY | FCONTROL),           (WORD)'M',           IDM_MONITOR },
-        { (BYTE)(FVIRTKEY),                      (WORD)VK_F5,         IDC_REREAD_BTN },
     };
     return CreateAcceleratorTable(a, (int)(sizeof(a) / sizeof(a[0])));
 }
@@ -451,15 +572,6 @@ static void RecreateUiFonts(void)
     g_hFontNormal = UiMakeFont(12, FW_NORMAL, FALSE);
     g_hFontSmall  = UiMakeFont(11, FW_NORMAL, FALSE);
     g_hFontBig    = UiMakeFont(32, FW_BOLD,   FALSE);
-    UiDeleteV2Fonts();
-    g_hFontH1      = UiMakeFont(20, FW_SEMIBOLD, FALSE);
-    g_hFontVerdict = UiMakeFont(24, FW_SEMIBOLD, FALSE);
-    g_hFontBody    = UiMakeFont(13, FW_NORMAL,   FALSE);
-    g_hFontBodySb  = UiMakeFont(13, FW_SEMIBOLD, FALSE);
-    g_hFontLabel   = UiMakeFont(12, FW_NORMAL,   FALSE);
-    g_hFontLabelSb = UiMakeFont(12, FW_SEMIBOLD, FALSE);
-    g_hFontPill    = UiMakeFont(11, FW_SEMIBOLD, FALSE);
-    g_hFontPillN   = UiMakeFont(11, FW_MEDIUM,   FALSE);
 }
 
 static void UiApplyFonts(HWND hWnd)
@@ -476,14 +588,10 @@ static void UiApplyFonts(HWND hWnd)
             id == IDC_STATUS_STATIC || id == IDC_PROTOCOL_STATIC ||
             id == IDC_ADAPTER_STATIC)
             f = g_hFontNormal;
-        if (id == IDC_ATTR_LIST) f = g_hFontBody;
-        else if (id == IDC_REREAD_BTN || id == IDC_REPORT_BTN || id == IDC_EJECT_BTN ||
-                 id == IDC_MONITOR_STATIC || id == IDC_DRIVE_BTN_BASE)
-            f = g_hFontLabel;
         SendMessage(h, WM_SETFONT, (WPARAM)f, TRUE);
         if (id == IDC_ATTR_LIST) {
             HWND hHdr = ListView_GetHeader(h);
-            if (hHdr) SendMessage(hHdr, WM_SETFONT, (WPARAM)g_hFontLabelSb, TRUE);
+            if (hHdr) SendMessage(hHdr, WM_SETFONT, (WPARAM)g_hFontSmall, TRUE);
         }
     }
 }
@@ -509,6 +617,7 @@ static void UiChangeZoom(HWND hWnd, int z)
 
     z = SnapZoom(z);
     if (z == old) return;
+    AttrColsCapture(GetDlgItem(hWnd, IDC_ATTR_LIST), g_nDpi, old);
     g_nZoom = z;
     SaveZoomReg(z);
     RecreateUiFonts();
@@ -540,12 +649,15 @@ static void UiChangeZoom(HWND hWnd, int z)
 
     SetWindowPos(hWnd, NULL, rc.left, rc.top, nw, nh, SWP_NOZORDER | SWP_NOACTIVATE);
     LayoutMainWindow(hWnd);
+    AttrColsApply(GetDlgItem(hWnd, IDC_ATTR_LIST));
     InvalidateRect(hWnd, NULL, TRUE);
 }
 
 static void UiOnDpiChanged(HWND hWnd, UINT dpi, const RECT* prc)
 {
+    int oldDpi = g_nDpi;
     if (dpi < 96) dpi = 96;
+    AttrColsCapture(GetDlgItem(hWnd, IDC_ATTR_LIST), oldDpi, g_nZoom);
     g_nDpi = (int)dpi;
     RecreateUiFonts();
     UiApplyFonts(hWnd);
@@ -554,375 +666,14 @@ static void UiOnDpiChanged(HWND hWnd, UINT dpi, const RECT* prc)
                      prc->right - prc->left, prc->bottom - prc->top,
                      SWP_NOZORDER | SWP_NOACTIVATE);
     LayoutMainWindow(hWnd);
+    AttrColsApply(GetDlgItem(hWnd, IDC_ATTR_LIST));
     InvalidateRect(hWnd, NULL, TRUE);
-}
-
-static void UiSyncThemeMenu(void);
-static HMENU g_hThemeMenu = NULL;
-void ExtractTemperatureFromATA(DRIVE_INFO* pInfo);
-void ExtractCommonATACounters(DRIVE_INFO* pInfo);
-static int  DemoFill(DRIVE_INFO* d);
-static void SubclassAttrHeader(HWND hList);
-#define GET_Y_LPARAM_DM(lp) ((int)(short)HIWORD(lp))
-
-/* ===================================================================
- * v2 design: palette, theme, fonts and GDI drawing helpers.
- * Flat fills, 1px borders, rounded rects and text only.
- * =================================================================== */
-UI_PALETTE g_Pal;
-int        g_bUiDark        = 0;
-int        g_bDemoMode      = 0;
-int        g_nThemeOverride = 0;
-static int g_nThemePref     = 0;   /* 0 system, 1 light, 2 dark (UiTheme) */
-static HBRUSH g_hbrSide     = NULL;
-
-HFONT g_hFontH1      = NULL;   /* 20 semibold: model */
-HFONT g_hFontVerdict = NULL;   /* 24 semibold: verdict word */
-HFONT g_hFontBody    = NULL;   /* 13 regular: reason, table cells */
-HFONT g_hFontBodySb  = NULL;   /* 13 semibold: card titles, axis values */
-HFONT g_hFontLabel   = NULL;   /* 12 regular: secondary lines, axis labels */
-HFONT g_hFontLabelSb = NULL;   /* 12 semibold: table header */
-HFONT g_hFontPill    = NULL;   /* 11 semibold: status pills, caption */
-HFONT g_hFontPillN   = NULL;   /* 11 medium: neutral chips */
-
-static const UI_PALETTE kPalLight = {
-    RGB(0xF3,0xF4,0xF6), RGB(0xEB,0xED,0xF0), RGB(0xFF,0xFF,0xFF),
-    RGB(0xFF,0xFF,0xFF), RGB(0xE4,0xE7,0xEB), RGB(0xE1,0xE4,0xE8),
-    RGB(0xD0,0xD5,0xDB),
-    RGB(0x1B,0x1F,0x24), RGB(0x5B,0x64,0x70), RGB(0x8A,0x92,0x9C),
-    RGB(0x0F,0x62,0xC9), RGB(0xFA,0xFB,0xFC), RGB(0xFF,0xF8,0xEC),
-    RGB(0xE8,0xF0,0xFB), RGB(0xFF,0xFF,0xFF),
-    RGB(0xE6,0xF4,0xEA), RGB(0x1E,0x6B,0x34), RGB(0xFD,0xF4,0xD9), RGB(0x7A,0x53,0x00),
-    RGB(0xFD,0xEB,0xDD), RGB(0x9A,0x3D,0x0A), RGB(0xFB,0xE4,0xE4), RGB(0xA1,0x1B,0x1B),
-    RGB(0x1F,0x29,0x37), RGB(0xFF,0xFF,0xFF), RGB(0x1F,0x29,0x37),
-    RGB(0xC9,0xCE,0xD5), RGB(0x54,0x5D,0x69)
-};
-static const UI_PALETTE kPalDark = {
-    RGB(0x1E,0x1E,0x1E), RGB(0x1A,0x1A,0x1A), RGB(0x26,0x26,0x26),
-    RGB(0x2E,0x2E,0x2E), RGB(0x24,0x24,0x24), RGB(0x35,0x35,0x35),
-    RGB(0x44,0x44,0x44),
-    RGB(0xEC,0xEC,0xEC), RGB(0xA9,0xAD,0xB3), RGB(0x7C,0x80,0x87),
-    RGB(0x5A,0xA9,0xF5), RGB(0x2A,0x2A,0x2A), RGB(0x33,0x29,0x1F),
-    RGB(0x24,0x33,0x46), RGB(0x2E,0x2E,0x2E),
-    RGB(0x1D,0x33,0x24), RGB(0x7F,0xD6,0x9A), RGB(0x3A,0x30,0x15), RGB(0xF2,0xCC,0x6B),
-    RGB(0x40,0x28,0x1A), RGB(0xFF,0xAD,0x7A), RGB(0x43,0x20,0x1F), RGB(0xFF,0x9C,0x97),
-    RGB(0xF2,0xF2,0xF2), RGB(0x11,0x11,0x11), RGB(0xF2,0xF2,0xF2),
-    RGB(0x4E,0x53,0x5A), RGB(0xB4,0xB9,0xC0)
-};
-
-static int SystemPrefersDark(void)
-{
-    HKEY k;
-    DWORD v = 1, sz = sizeof(v), t = 0;
-    if (RegOpenKeyExA(HKEY_CURRENT_USER,
-            "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
-            0, KEY_READ, &k) == ERROR_SUCCESS) {
-        if (RegQueryValueExA(k, "AppsUseLightTheme", NULL, &t, (LPBYTE)&v, &sz) != ERROR_SUCCESS ||
-            t != REG_DWORD)
-            v = 1;
-        RegCloseKey(k);
-    }
-    return v == 0;
-}
-
-static void LoadThemePref(void)
-{
-    HKEY k;
-    DWORD v = 0, sz = sizeof(v), t = 0;
-    if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\chuikoff\\DriveMonitor",
-                      0, KEY_READ, &k) == ERROR_SUCCESS) {
-        if (RegQueryValueExA(k, "UiTheme", NULL, &t, (LPBYTE)&v, &sz) != ERROR_SUCCESS ||
-            t != REG_DWORD || v > 2)
-            v = 0;
-        RegCloseKey(k);
-    }
-    g_nThemePref = (int)v;
-}
-
-static void SaveThemePref(int v)
-{
-    HKEY k;
-    DWORD d = (DWORD)v;
-    if (RegCreateKeyExA(HKEY_CURRENT_USER, "Software\\chuikoff\\DriveMonitor",
-                        0, NULL, 0, KEY_WRITE, NULL, &k, NULL) == ERROR_SUCCESS) {
-        RegSetValueExA(k, "UiTheme", 0, REG_DWORD, (const BYTE*)&d, sizeof(d));
-        RegCloseKey(k);
-    }
-}
-
-static void UiApplyPalette(void)
-{
-    int pref = g_nThemeOverride ? g_nThemeOverride : g_nThemePref;
-    g_bUiDark = (pref == 2) || (pref == 0 && SystemPrefersDark());
-    g_Pal = g_bUiDark ? kPalDark : kPalLight;
-    if (g_hbrBG)    { DeleteObject(g_hbrBG);    g_hbrBG    = NULL; }
-    if (g_hbrPanel) { DeleteObject(g_hbrPanel); g_hbrPanel = NULL; }
-    if (g_hbrSide)  { DeleteObject(g_hbrSide);  g_hbrSide  = NULL; }
-    g_hbrBG    = CreateSolidBrush(CLR_BG);
-    g_hbrPanel = CreateSolidBrush(CLR_PANEL);
-    g_hbrSide  = CreateSolidBrush(CLR_SIDE);
-}
-
-/* Dark title bar through DWM (attribute 20, 19 on old Win10 builds).
- * Flat color only; no Mica or backdrop. Missing dwmapi is fine. */
-static void UiApplyTitleBar(HWND hWnd)
-{
-    typedef HRESULT (WINAPI *PFN)(HWND, DWORD, LPCVOID, DWORD);
-    static PFN pSet = NULL;
-    static int once = 0;
-    DWORD on = g_bUiDark ? 1u : 0u;
-    if (!once) {
-        HMODULE h = LoadLibraryW(L"dwmapi.dll");
-        if (h) pSet = (PFN)(void*)GetProcAddress(h, "DwmSetWindowAttribute");
-        once = 1;
-    }
-    if (!pSet || !hWnd) return;
-    if (pSet(hWnd, 20, &on, sizeof(on)) != S_OK)
-        pSet(hWnd, 19, &on, sizeof(on));
-}
-
-static void UiDeleteV2Fonts(void)
-{
-    HFONT* f[] = { &g_hFontH1, &g_hFontVerdict, &g_hFontBody, &g_hFontBodySb,
-                   &g_hFontLabel, &g_hFontLabelSb, &g_hFontPill, &g_hFontPillN };
-    size_t i;
-    for (i = 0; i < sizeof(f) / sizeof(f[0]); i++)
-        if (*f[i]) { DeleteObject(*f[i]); *f[i] = NULL; }
-}
-
-static void FillRectColor(HDC hdc, const RECT* r, COLORREF c)
-{
-    COLORREF old = SetBkColor(hdc, c);
-    ExtTextOutW(hdc, 0, 0, ETO_OPAQUE, r, NULL, 0, NULL);
-    SetBkColor(hdc, old);
-}
-
-/* Rounded card: fill, optional left stripe, 1px border. Region-based so
- * the stripe follows the corner radius. */
-static void DrawCard(HDC hdc, const RECT* r, int radius, COLORREF fill,
-                     COLORREF border, BOOL bStripe, COLORREF stripe, int stripeW)
-{
-    HRGN rgn = CreateRoundRectRgn(r->left, r->top, r->right + 1, r->bottom + 1,
-                                  radius * 2, radius * 2);
-    HBRUSH hb = CreateSolidBrush(fill);
-    FillRgn(hdc, rgn, hb);
-    DeleteObject(hb);
-    if (bStripe) {
-        RECT s = { r->left, r->top, r->left + stripeW, r->bottom };
-        HBRUSH hs = CreateSolidBrush(stripe);
-        SelectClipRgn(hdc, rgn);
-        FillRect(hdc, &s, hs);
-        SelectClipRgn(hdc, NULL);
-        DeleteObject(hs);
-    }
-    if (border != fill) {
-        HBRUSH hbd = CreateSolidBrush(border);
-        FrameRgn(hdc, rgn, hbd, 1, 1);
-        DeleteObject(hbd);
-    }
-    DeleteObject(rgn);
-}
-
-static void FillRound(HDC hdc, const RECT* r, int radius, COLORREF fill)
-{
-    HRGN rgn = CreateRoundRectRgn(r->left, r->top, r->right + 1, r->bottom + 1,
-                                  radius * 2, radius * 2);
-    HBRUSH hb = CreateSolidBrush(fill);
-    FillRgn(hdc, rgn, hb);
-    DeleteObject(hb);
-    DeleteObject(rgn);
-}
-
-typedef enum {
-    PILL_NONE = 0, PILL_OK, PILL_RISK, PILL_WARN, PILL_BAD, PILL_CRIT,
-    PILL_NEUTRAL, PILL_SKIP
-} PILL_KIND;
-
-static PILL_KIND PillFromHealth(DRIVE_HEALTH_STATUS e)
-{
-    switch (e) {
-    case HEALTH_STATUS_GOOD:     return PILL_OK;
-    case HEALTH_STATUS_OBSERVE:  return PILL_RISK;
-    case HEALTH_STATUS_CAUTION:  return PILL_WARN;
-    case HEALTH_STATUS_BAD:
-    case HEALTH_STATUS_WARNING:  return PILL_BAD;
-    case HEALTH_STATUS_CRITICAL: return PILL_CRIT;
-    default:                     return PILL_SKIP;
-    }
-}
-
-static void PillColors(PILL_KIND k, COLORREF* bg, COLORREF* fg)
-{
-    switch (k) {
-    case PILL_OK:   *bg = g_Pal.okBg;   *fg = g_Pal.ok;   break;
-    case PILL_RISK: *bg = g_Pal.riskBg; *fg = g_Pal.risk; break;
-    case PILL_WARN: *bg = g_Pal.warnBg; *fg = g_Pal.warn; break;
-    case PILL_BAD:  *bg = g_Pal.badBg;  *fg = g_Pal.bad;  break;
-    case PILL_CRIT: *bg = g_Pal.critBg; *fg = g_Pal.critFg; break;
-    default:        *bg = g_Pal.panel;  *fg = g_Pal.neu;  break;
-    }
-}
-
-/* Foreground (text/dot/stripe) color of a status; GOOD is green. */
-static COLORREF StatusFg(DRIVE_HEALTH_STATUS e)
-{
-    COLORREF bg, fg;
-    if (e == HEALTH_STATUS_UNKNOWN) return g_Pal.textFaint;
-    PillColors(PillFromHealth(e), &bg, &fg);
-    if (e == HEALTH_STATUS_CRITICAL) return g_Pal.critText;
-    return fg;
-}
-
-/* Status glyph as vector strokes: check, !, cross, diamond, dash.
- * Fonts are not trusted to carry U+2713 on every Windows build. */
-static void DrawGlyph(HDC hdc, PILL_KIND k, int x, int yc, int sz, COLORREF c)
-{
-    int pw = UiScale(3) / 2; if (pw < 1) pw = 1;
-    HPEN hp = CreatePen(PS_SOLID, pw, c);
-    HPEN hpo = (HPEN)SelectObject(hdc, hp);
-    HBRUSH hb = CreateSolidBrush(c);
-    HBRUSH hbo = (HBRUSH)SelectObject(hdc, hb);
-    int h = sz / 2;
-    switch (k) {
-    case PILL_OK: {
-        POINT p[3] = { { x, yc }, { x + sz * 3 / 8, yc + h * 3 / 4 }, { x + sz, yc - h * 3 / 4 } };
-        Polyline(hdc, p, 3);
-        break; }
-    case PILL_WARN: {
-        RECT r1 = { x + h - pw / 2 - (pw > 1 ? 0 : 0), yc - h, x + h - pw / 2 + pw + (pw < 2 ? 1 : 0), yc + h / 3 };
-        RECT r2 = { r1.left, yc + h * 2 / 3, r1.right, yc + h + 1 };
-        FillRect(hdc, &r1, hb);
-        FillRect(hdc, &r2, hb);
-        break; }
-    case PILL_BAD:
-    case PILL_CRIT:
-        MoveToEx(hdc, x + 1, yc - h + 1, NULL); LineTo(hdc, x + sz - 1, yc + h - 1);
-        MoveToEx(hdc, x + sz - 1, yc - h + 1, NULL); LineTo(hdc, x + 1, yc + h - 1);
-        break;
-    case PILL_RISK: {
-        POINT p[4] = { { x + h, yc - h }, { x + sz, yc }, { x + h, yc + h }, { x, yc } };
-        Polygon(hdc, p, 4);
-        break; }
-    case PILL_SKIP:
-        MoveToEx(hdc, x + 1, yc, NULL); LineTo(hdc, x + sz - 1, yc);
-        break;
-    default:
-        break;
-    }
-    SelectObject(hdc, hbo); DeleteObject(hb);
-    SelectObject(hdc, hpo); DeleteObject(hp);
-}
-
-/* Pill: h20 r10, 11px semibold, glyph + gap 5 + text, padding 8.
- * Neutral / skip chips are outlined and transparent so they never read as
- * a verdict. Returns the pill width. bMeasure skips drawing. */
-static int DrawPillW(HDC hdc, int x, int yc, const WCHAR* wz, PILL_KIND k, BOOL bMeasure)
-{
-    SIZE sz;
-    int h = UiScale(20), pad = UiScale(8), gsz = UiScale(8), gap = UiScale(5);
-    BOOL bGlyph = (k != PILL_NEUTRAL);
-    BOOL bOutline = (k == PILL_NEUTRAL || k == PILL_SKIP);
-    HFONT fo = (HFONT)SelectObject(hdc, bOutline ? g_hFontPillN : g_hFontPill);
-    int w;
-    COLORREF bg, fg;
-    GetTextExtentPoint32W(hdc, wz, lstrlenW(wz), &sz);
-    w = pad * 2 + sz.cx + (bGlyph ? gsz + gap : 0);
-    if (!bMeasure) {
-        RECT r = { x, yc - h / 2, x + w, yc - h / 2 + h };
-        RECT rt;
-        PillColors(k, &bg, &fg);
-        if (bOutline) {
-            HRGN rgn = CreateRoundRectRgn(r.left, r.top, r.right + 1, r.bottom + 1, h, h);
-            HBRUSH hbd = CreateSolidBrush(g_Pal.neuBd);
-            FrameRgn(hdc, rgn, hbd, 1, 1);
-            DeleteObject(hbd);
-            DeleteObject(rgn);
-        } else {
-            FillRound(hdc, &r, h / 2, bg);
-        }
-        if (bGlyph)
-            DrawGlyph(hdc, k, x + pad, yc, gsz, fg);
-        rt = r;
-        rt.left = x + pad + (bGlyph ? gsz + gap : 0);
-        SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, fg);
-        DrawTextW(hdc, wz, -1, &rt, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-    }
-    SelectObject(hdc, fo);
-    return w;
-}
-
-static int DrawPillU8(HDC hdc, int x, int yc, const char* s, PILL_KIND k, BOOL bUpper, BOOL bMeasure)
-{
-    WCHAR wz[96];
-    U8ToW(s ? s : "", wz, 96);
-    if (bUpper) CharUpperW(wz);
-    return DrawPillW(hdc, x, yc, wz, k, bMeasure);
-}
-
-static void DrawTextColor(HDC hdc, const char* s, RECT* r, HFONT f, COLORREF c, UINT fmt)
-{
-    HFONT fo = (HFONT)SelectObject(hdc, f);
-    SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, c);
-    DrawTextU8(hdc, s, r, fmt | DT_NOPREFIX);
-    SelectObject(hdc, fo);
-}
-
-static int TextWidthU8(HDC hdc, const char* s, HFONT f)
-{
-    WCHAR wz[256];
-    SIZE sz;
-    HFONT fo = (HFONT)SelectObject(hdc, f);
-    U8ToW(s ? s : "", wz, 256);
-    GetTextExtentPoint32W(hdc, wz, lstrlenW(wz), &sz);
-    SelectObject(hdc, fo);
-    return sz.cx;
-}
-
-static const char* RuYears(unsigned long long c)
-{
-    unsigned long long y = c / 100, m10 = y % 10, m100 = y % 100;
-    if (c % 100) return "года";
-    if (m10 == 1 && m100 != 11) return "год";
-    if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return "года";
-    return "лет";
-}
-
-/* Power-on time in years only, two decimals ("1,96 года" / "1.96 years"). */
-static void FormatPohYears(DWORD dwHours, char* buf, int n)
-{
-    unsigned long long c;
-    if (dwHours == 0) { safe_snprintf_n(buf, n, "%s", Tr(STR_POH_NONE)); return; }
-    c = ((unsigned long long)dwHours * 100ull + 4380ull) / 8760ull;
-    if (c == 0) c = 1;
-    if (UiLangIsEn())
-        safe_snprintf_n(buf, n, "%llu.%02llu %s", c / 100, c % 100, c == 100 ? "year" : "years");
-    else
-        safe_snprintf_n(buf, n, "%llu,%02llu %s", c / 100, c % 100,
-                        RuYears(c));
-}
-
-/* 3412 -> "3 412" (thin grouping, no locale dependency). */
-static void FormatGrouped(unsigned long v, char* buf, int n)
-{
-    char t[32];
-    int len, i, o = 0;
-    safe_snprintf(t, "%lu", v);
-    len = (int)strlen(t);
-    for (i = 0; i < len && o < n - 4; i++) {
-        if (i > 0 && (len - i) % 3 == 0) {
-            buf[o++] = '\xC2'; buf[o++] = '\xA0';
-        }
-        buf[o++] = t[i];
-    }
-    buf[o] = '\0';
 }
 
 void CreateGDIObjects(void)
 {
-    LoadThemePref();
-    UiApplyPalette();
+    if (!g_hbrBG)     g_hbrBG     = CreateSolidBrush(CLR_BG);
+    if (!g_hbrPanel)  g_hbrPanel  = CreateSolidBrush(CLR_PANEL);
     if (!g_hbrGreen)  g_hbrGreen  = CreateSolidBrush(CLR_GREEN);
     if (!g_hbrYellow) g_hbrYellow = CreateSolidBrush(CLR_YELLOW);
     if (!g_hbrRed)    g_hbrRed    = CreateSolidBrush(CLR_RED);
@@ -2123,14 +1874,19 @@ void DestroyGDIObjects(void){
     if (g_hFontNormal) { DeleteObject(g_hFontNormal); g_hFontNormal = NULL; }
     if (g_hFontSmall)  { DeleteObject(g_hFontSmall);  g_hFontSmall  = NULL; }
     if (g_hFontBig)    { DeleteObject(g_hFontBig);    g_hFontBig    = NULL; }
-    if (g_hbrSide)     { DeleteObject(g_hbrSide);     g_hbrSide     = NULL; }
-    UiDeleteV2Fonts();
 }
 
 COLORREF GetHealthStatusColor(DRIVE_HEALTH_STATUS eStatus)
 {
-    if (eStatus == HEALTH_STATUS_UNKNOWN) return CLR_ACCENT;
-    return StatusFg(eStatus);
+    switch (eStatus) {
+    case HEALTH_STATUS_GOOD:     return CLR_GREEN;
+    case HEALTH_STATUS_OBSERVE:  return CLR_YELLOW;
+    case HEALTH_STATUS_CAUTION:  return CLR_ORANGE;
+    case HEALTH_STATUS_BAD:
+    case HEALTH_STATUS_WARNING:  return CLR_RED;
+    case HEALTH_STATUS_CRITICAL: return CLR_CRITICAL;
+    default:                     return CLR_ACCENT;
+    }
 }
 
 static const char* GetAxisStatusName(DRIVE_HEALTH_STATUS eStatus, BOOL bTemp)
@@ -2145,245 +1901,6 @@ static const char* GetAxisStatusName(DRIVE_HEALTH_STATUS eStatus, BOOL bTemp)
     return GetHealthStatusName(eStatus);
 }
 
-#define DASH_CARD_H   116
-#define DASH_TILE_H    52
-#define DASH_GAP       12
-#define DASH_H        (DASH_CARD_H + DASH_GAP + DASH_TILE_H)
-#define DASH_RIGHT_W  290
-
-/* Axis tile wording: GOOD reads as "Норма", others use the short name. */
-static const char* GetAxisStatusNameShort(DRIVE_HEALTH_STATUS e)
-{
-    if (e == HEALTH_STATUS_GOOD) return Tr(STR_AXIS_OK);
-    return GetHealthStatusNameShort(e);
-}
-
-static const DRIVE_INFO* SelDrive(void)
-{
-    if (g_nDriveCount > 0 && g_nSelectedDrive >= 0 && g_nSelectedDrive < g_nDriveCount)
-        return &g_Drives[g_nSelectedDrive];
-    return NULL;
-}
-
-static void DashKv(HDC hdc, int x, int r, int yc, const char* k, const char* v,
-                   PILL_KIND pill, BOOL bUpper)
-{
-    RECT rk = { x, yc - UiScale(10), r, yc + UiScale(10) };
-    DrawTextColor(hdc, k, &rk, g_hFontLabel, CLR_TEXT_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    if (pill != PILL_NONE) {
-        int w = DrawPillU8(hdc, 0, yc, v, pill, bUpper, TRUE);
-        DrawPillU8(hdc, r - w, yc, v, pill, bUpper, FALSE);
-    } else {
-        RECT rv = rk;
-        DrawTextColor(hdc, v, &rv, g_hFontBodySb, CLR_TEXT, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-    }
-}
-
-static void DashTile(HDC hdc, const RECT* r, const char* label, const char* value,
-                     DRIVE_HEALTH_STATUS e, BOOL bNeutral)
-{
-    RECT rl, rv;
-    COLORREF dot, txt;
-    int pad = UiScale(12), d = UiScale(8);
-    DrawCard(hdc, r, UiScale(8), CLR_PANEL, CLR_BORDER, FALSE, 0, 0);
-    rl.left = r->left + pad; rl.right = r->right - pad;
-    rl.top = r->top + UiScale(9); rl.bottom = rl.top + UiScale(16);
-    DrawTextColor(hdc, label, &rl, g_hFontLabel, CLR_TEXT_DIM,
-                  DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
-    if (bNeutral || e == HEALTH_STATUS_UNKNOWN) { dot = g_Pal.neuBd; txt = CLR_TEXT_FAINT; }
-    else if (e == HEALTH_STATUS_GOOD) { dot = g_Pal.ok; txt = CLR_TEXT; }
-    else { dot = StatusFg(e); txt = dot; }
-    {
-        int yc = r->top + UiScale(35);
-        RECT rd = { rl.left, yc - d / 2, rl.left + d, yc - d / 2 + d };
-        HRGN rg = CreateEllipticRgn(rd.left, rd.top, rd.right + 1, rd.bottom + 1);
-        HBRUSH hb = CreateSolidBrush(dot);
-        FillRgn(hdc, rg, hb);
-        DeleteObject(hb); DeleteObject(rg);
-        rv.left = rl.left + d + UiScale(6); rv.right = rl.right;
-        rv.top = yc - UiScale(10); rv.bottom = yc + UiScale(10);
-        DrawTextColor(hdc, value, &rv, (bNeutral || e == HEALTH_STATUS_UNKNOWN) ? g_hFontBody : g_hFontBodySb,
-                      txt, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-    }
-}
-
-static void PaintDashboard(HWND hWnd, HDC hdc, int w, int h)
-{
-    const DRIVE_INFO* p = SelDrive();
-    RECT rcAll = { 0, 0, w, h };
-    RECT card = { 0, 0, w, UiScale(DASH_CARD_H) };
-    DRIVE_HEALTH_STATUS eOurs = p ? p->eHealthStatus : HEALTH_STATUS_UNKNOWN;
-    PILL_KIND kOurs = PillFromHealth(eOurs);
-    COLORREF fg = StatusFg(eOurs);
-    COLORREF bgTint, fgTint;
-    int pad = UiScale(18), rw = UiScale(DASH_RIGHT_W);
-    int splitX = w - rw;
-    char buf[160];
-
-    FillRectColor(hdc, &rcAll, CLR_BG);
-    DrawCard(hdc, &card, UiScale(8), CLR_PANEL, CLR_BORDER, TRUE, fg, UiScale(4));
-    PillColors(kOurs, &bgTint, &fgTint);
-
-    /* Verdict: glyph disc + word. */
-    {
-        int cx = UiScale(4) + pad, cy = UiScale(14), d = UiScale(28);
-        RECT rd = { cx, cy, cx + d, cy + d };
-        HRGN rg = CreateEllipticRgn(rd.left, rd.top, rd.right + 1, rd.bottom + 1);
-        HBRUSH hb = CreateSolidBrush(kOurs == PILL_SKIP ? g_Pal.row2 : bgTint);
-        RECT rw2;
-        FillRgn(hdc, rg, hb);
-        DeleteObject(hb); DeleteObject(rg);
-        DrawGlyph(hdc, kOurs == PILL_SKIP ? PILL_SKIP : kOurs, cx + d / 2 - UiScale(6),
-                  cy + d / 2, UiScale(12), kOurs == PILL_CRIT ? g_Pal.critText : fgTint);
-        rw2.left = cx + d + UiScale(10); rw2.right = splitX - pad;
-        rw2.top = cy - UiScale(4); rw2.bottom = cy + d + UiScale(4);
-        {
-            WCHAR wz[64];
-            HFONT fo = (HFONT)SelectObject(hdc, g_hFontVerdict);
-            U8ToW(p ? GetHealthStatusName(eOurs) : Tr(STR_NO_DATA), wz, 64);
-            CharUpperW(wz);
-            SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, p ? fg : CLR_TEXT_DIM);
-            DrawTextW(hdc, wz, -1, &rw2, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-            SelectObject(hdc, fo);
-        }
-    }
-
-    /* Reason (up to two lines) and the lecture link. */
-    {
-        WCHAR wz[512];
-        RECT rr = { UiScale(4) + pad, UiScale(50), splitX - pad, UiScale(50) + UiScale(36) };
-        RECT rc2 = rr;
-        HFONT fo;
-        int lineH;
-        HWND hParent = GetParent(hWnd);
-        wz[0] = 0;
-        if (hParent) GetDlgItemTextW(hParent, IDC_PREDICT_STATIC, wz, 512);
-        fo = (HFONT)SelectObject(hdc, g_hFontBody);
-        SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, CLR_TEXT);
-        DrawTextW(hdc, wz, -1, &rc2, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
-        lineH = UiScale(18);
-        if (rc2.bottom > rr.bottom) rc2.bottom = rr.bottom;
-        rc2.right = rr.right;
-        DrawTextW(hdc, wz, -1, &rc2, DT_WORDBREAK | DT_EDITCONTROL | DT_END_ELLIPSIS | DT_NOPREFIX);
-        SelectObject(hdc, fo);
-        if (p) {
-            RECT rl = { rr.left, rc2.bottom + UiScale(6), rr.right, rc2.bottom + UiScale(6) + lineH };
-            if (rl.bottom > UiScale(DASH_CARD_H) - UiScale(8)) {
-                rl.bottom = UiScale(DASH_CARD_H) - UiScale(8);
-                rl.top = rl.bottom - lineH;
-            }
-            DrawTextColor(hdc, TN("Почему такая оценка \xE2\x86\x92", "Why this assessment \xE2\x86\x92"),
-                          &rl, g_hFontLabel, CLR_ACCENT, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-            if (GetFocus() == hWnd) {
-                RECT rf = rl;
-                rf.right = rf.left + TextWidthU8(hdc, TN("Почему такая оценка \xE2\x86\x92",
-                                                         "Why this assessment \xE2\x86\x92"), g_hFontLabel);
-                InflateRect(&rf, UiScale(3), UiScale(1));
-                SetTextColor(hdc, CLR_TEXT);
-                SetBkColor(hdc, CLR_PANEL);
-                DrawFocusRect(hdc, &rf);
-            }
-        }
-    }
-
-    /* Right column: drive self-report vs our assessment, then facts. */
-    {
-        int x = splitX + pad, r = w - pad;
-        HPEN hp = CreatePen(PS_SOLID, 1, CLR_BORDER);
-        HPEN hpo = (HPEN)SelectObject(hdc, hp);
-        MoveToEx(hdc, splitX, 1, NULL); LineTo(hdc, splitX, UiScale(DASH_CARD_H) - 1);
-        MoveToEx(hdc, x, UiScale(62), NULL); LineTo(hdc, r, UiScale(62));
-        SelectObject(hdc, hpo); DeleteObject(hp);
-        if (p) {
-            const char* disk;
-            PILL_KIND kd = PillFromHealth(p->eDiskStatus);
-            if (p->eDiskStatus == HEALTH_STATUS_GOOD)
-                disk = TN("Исправен (SMART OK)", "Healthy (SMART OK)");
-            else
-                disk = GetDiskStatusName(p);
-            DashKv(hdc, x, r, UiScale(22), TN("Диск о себе", "Drive self-report"), disk, kd, FALSE);
-            DashKv(hdc, x, r, UiScale(46), TN("Наша оценка", "Our assessment"),
-                   GetHealthStatusNameShort(eOurs), kOurs, FALSE);
-            FormatPohYears(p->dwPowerOnHours, buf, (int)sizeof(buf));
-            DashKv(hdc, x, r, UiScale(80), Tr(STR_POH), buf, PILL_NONE, FALSE);
-            if (p->dwPowerCycleCount > 0)
-                FormatGrouped((unsigned long)p->dwPowerCycleCount, buf, (int)sizeof(buf));
-            else
-                safe_snprintf(buf, "\xE2\x80\x94");
-            DashKv(hdc, x, r, UiScale(100), TN("Включений", "Power cycles"), buf, PILL_NONE, FALSE);
-        }
-    }
-
-    /* Five axis tiles. */
-    {
-        int top = UiScale(DASH_CARD_H + DASH_GAP), gap = UiScale(8), i;
-        int tw = (w - gap * 4) / 5;
-        char tbuf[64], wbuf[64];
-        const char* labels[5] = { Tr(STR_MEDIA), Tr(STR_INTERFACE), Tr(STR_TEMPERATURE),
-                                  Tr(STR_MECHANICS), TN("Ресурс", "Endurance") };
-        const char* vals[5] = { "", "", "", "", "" };
-        DRIVE_HEALTH_STATUS st[5] = { HEALTH_STATUS_UNKNOWN, HEALTH_STATUS_UNKNOWN,
-            HEALTH_STATUS_UNKNOWN, HEALTH_STATUS_UNKNOWN, HEALTH_STATUS_UNKNOWN };
-        BOOL neu[5] = { FALSE, FALSE, FALSE, FALSE, FALSE };
-        BOOL caseFix[5] = { TRUE, TRUE, FALSE, TRUE, FALSE };
-        if (p) {
-            BOOL bHdd = (p->eType == DRIVE_TYPE_HDD && !p->bIsNVMe);
-            st[0] = p->eReliability; vals[0] = GetAxisStatusNameShort(p->eReliability);
-            st[1] = p->eInterface;   vals[1] = GetAxisStatusNameShort(p->eInterface);
-            if (p->nTemperatureC > 0) {
-                WCHAR wz[32]; char low[64];
-                U8ToW(GetAxisStatusName(p->eTempStatus, TRUE), wz, 32);
-                CharLowerW(wz);
-                WToU8(wz, low, (int)sizeof(low));
-                safe_snprintf(tbuf, "%d\xC2\xA0\xC2\xB0""C \xC2\xB7 %s", p->nTemperatureC, low);
-                st[2] = p->eTempStatus; vals[2] = tbuf;
-            } else { vals[2] = Tr(STR_POH_NONE); neu[2] = TRUE; }
-            if (bHdd || p->nGSenseEvents >= 0) {
-                st[3] = p->eMechanics;
-                vals[3] = (p->eMechanics == HEALTH_STATUS_GOOD) ? Tr(STR_AXIS_OK)
-                        : (p->eMechanics == HEALTH_STATUS_UNKNOWN) ? Tr(STR_POH_NONE)
-                        : GetAxisStatusNameShort(p->eMechanics);
-            } else { vals[3] = TN("н/п для SSD", "n/a for SSD"); neu[3] = TRUE; }
-            if (bHdd) { vals[4] = TN("н/п для HDD", "n/a for HDD"); neu[4] = TRUE; }
-            else {
-                /* eWear stays BAD at 5% or less; the tile stops at CAUTION
-                 * like the headline. Remaining endurance only, never Health%. */
-                DRIVE_HEALTH_STATUS sw = p->eWear;
-                if (sw == HEALTH_STATUS_BAD || sw == HEALTH_STATUS_WARNING ||
-                    sw == HEALTH_STATUS_CRITICAL) sw = HEALTH_STATUS_CAUTION;
-                st[4] = sw;
-                if (p->eWear != HEALTH_STATUS_UNKNOWN && p->nEndurancePercent >= 0)
-                    safe_snprintf(wbuf, "%s \xC2\xB7 %d%%", GetAxisStatusNameShort(sw),
-                                  p->nEndurancePercent);
-                else if (p->eWear != HEALTH_STATUS_UNKNOWN)
-                    safe_snprintf(wbuf, "%s", GetAxisStatusNameShort(sw));
-                else if (p->nEndurancePercent >= 0)
-                    safe_snprintf(wbuf, "%d%%", p->nEndurancePercent);
-                else { safe_snprintf(wbuf, "%s", TN("нет данных", "no data")); neu[4] = TRUE; }
-                vals[4] = wbuf;
-            }
-        }
-        for (i = 0; i < 5; i++) {
-            /* Sentence case for tile values: "Норма", "Внимание". */
-            char sc[96];
-            WCHAR wz[96];
-            U8ToW(vals[i], wz, 96);
-            if (wz[0] && caseFix[i] && !neu[i]) CharLowerW(wz + 1);
-            WToU8(wz, sc, (int)sizeof(sc));
-            vals[i] = NULL;
-            {
-            RECT r;
-            r.left = i * (tw + gap);
-            r.right = (i == 4) ? w : r.left + tw;
-            r.top = top; r.bottom = h;
-            DashTile(hdc, &r, labels[i], sc, st[i], neu[i] || !p);
-            }
-        }
-    }
-}
-
 LRESULT CALLBACK HealthBarWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
     switch (uMsg)
@@ -2392,20 +1909,70 @@ LRESULT CALLBACK HealthBarWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lP
         {
             PAINTSTRUCT ps;
             HDC hdcReal = BeginPaint(hWnd, &ps);
+
             RECT rc;
             GetClientRect(hWnd, &rc);
             int w = rc.right - rc.left;
             int h = rc.bottom - rc.top;
-            if (w > 0 && h > 0) {
-                HDC     hdc    = CreateCompatibleDC(hdcReal);
-                HBITMAP hbmBuf = CreateCompatibleBitmap(hdcReal, w, h);
-                HBITMAP hbmOld = (HBITMAP)SelectObject(hdc, hbmBuf);
-                PaintDashboard(hWnd, hdc, w, h);
-                BitBlt(hdcReal, 0, 0, w, h, hdc, 0, 0, SRCCOPY);
-                SelectObject(hdc, hbmOld);
-                DeleteObject(hbmBuf);
-                DeleteDC(hdc);
+
+            HDC     hdc    = CreateCompatibleDC(hdcReal);
+            HBITMAP hbmBuf = CreateCompatibleBitmap(hdcReal, w, h);
+            HBITMAP hbmOldBuf = (HBITMAP)SelectObject(hdc, hbmBuf);
+
+            DRIVE_HEALTH_STATUS eOurs = HEALTH_STATUS_UNKNOWN;
+            DRIVE_HEALTH_STATUS eDisk = HEALTH_STATUS_UNKNOWN;
+            BOOL bHaveDrive = (g_nDriveCount > 0 && g_nSelectedDrive >= 0 &&
+                               g_nSelectedDrive < g_nDriveCount);
+            if (bHaveDrive) {
+                eOurs = g_Drives[g_nSelectedDrive].eHealthStatus;
+                eDisk = g_Drives[g_nSelectedDrive].eDiskStatus;
             }
+
+            {
+                HBRUSH hbrFill = CreateSolidBrush(GetHealthStatusColor(eOurs));
+                FillRect(hdc, &rc, hbrFill);
+                DeleteObject(hbrFill);
+            }
+
+            {
+                HPEN   hpBorder = CreatePen(PS_SOLID, 1, CLR_BORDER);
+                HPEN   hpOld    = (HPEN)SelectObject(hdc, hpBorder);
+                HBRUSH hbOld    = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
+                Rectangle(hdc, 0, 0, w, h);
+                SelectObject(hdc, hpOld);
+                SelectObject(hdc, hbOld);
+                DeleteObject(hpBorder);
+            }
+
+            {
+                char szDisk[64], szOurs[64];
+                HFONT hUseFont = g_hFontTitle ? g_hFontTitle :
+                    (g_hFontNormal ? g_hFontNormal : (HFONT)GetStockObject(DEFAULT_GUI_FONT));
+                HFONT hOldFont = (HFONT)SelectObject(hdc, hUseFont);
+                SetBkMode(hdc, TRANSPARENT);
+                SetTextColor(hdc, RGB(255, 255, 255));
+                if (bHaveDrive)
+                    safe_snprintf(szDisk, Tr(STR_DISK_COLON),
+                        GetDiskStatusName(&g_Drives[g_nSelectedDrive]));
+                else
+                    safe_snprintf(szDisk, Tr(STR_DISK_COLON), GetHealthStatusNameShort(eDisk));
+                safe_snprintf(szOurs, Tr(STR_ASSESS_COLON), GetHealthStatusNameShort(eOurs));
+                {
+                    RECT rc1 = { UiScale(4), UiScale(2), w - UiScale(4), h / 2 };
+                    RECT rc2 = { UiScale(4), h / 2 - 1, w - UiScale(4), h - 2 };
+                    DrawTextU8(hdc, szDisk, &rc1, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                    DrawTextU8(hdc, szOurs, &rc2, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                }
+                SelectObject(hdc, hOldFont);
+                if (GetFocus() == hWnd)
+                    DrawFocusRect(hdc, &rc);
+            }
+
+            BitBlt(hdcReal, 0, 0, w, h, hdc, 0, 0, SRCCOPY);
+            SelectObject(hdc, hbmOldBuf);
+            DeleteObject(hbmBuf);
+            DeleteDC(hdc);
+
             EndPaint(hWnd, &ps);
         }
         return 0;
@@ -2418,7 +1985,7 @@ LRESULT CALLBACK HealthBarWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lP
         return 0;
 
     case WM_LBUTTONUP:
-        if (GET_Y_LPARAM_DM(lParam) < UiScale(DASH_CARD_H) && SelDrive()) {
+        {
             HWND hParent = GetParent(hWnd);
             if (hParent)
                 ShowHealthLectureDialog(hParent);
@@ -2439,106 +2006,15 @@ LRESULT CALLBACK HealthBarWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lP
 
     case WM_SETFOCUS:
     case WM_KILLFOCUS:
-        InvalidateRect(hWnd, NULL, FALSE);
+        InvalidateRect(hWnd, NULL, TRUE);
         return 0;
 
     case WM_SETCURSOR:
-        {
-            POINT pt;
-            GetCursorPos(&pt);
-            ScreenToClient(hWnd, &pt);
-            SetCursor(LoadCursor(NULL, (pt.y < UiScale(DASH_CARD_H) && SelDrive())
-                                       ? (LPCTSTR)IDC_HAND : (LPCTSTR)IDC_ARROW));
-        }
+        SetCursor(LoadCursor(NULL, (LPCTSTR)IDC_HAND));
         return TRUE;
     }
 
     return DefWindowProc(hWnd, uMsg, wParam, lParam);
-}
-
-/* Small drive-type icon: SSD = board with two traces, HDD = platter,
- * USB adds a plug stem. 1px strokes in the dim text color. */
-static void DrawDriveIcon(HDC hdc, const RECT* box, const DRIVE_INFO* p)
-{
-    int cx = (box->left + box->right) / 2, cy = (box->top + box->bottom) / 2;
-    int u = UiScale(1);
-    HPEN hp = CreatePen(PS_SOLID, u < 1 ? 1 : u, CLR_TEXT_DIM);
-    HPEN hpo = (HPEN)SelectObject(hdc, hp);
-    HBRUSH hbo = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
-    BOOL bHdd = (p->eType == DRIVE_TYPE_HDD && !p->bIsNVMe);
-    if (!bHdd) {
-        RoundRect(hdc, cx - UiScale(7), cy - UiScale(5), cx + UiScale(8), cy + UiScale(6), UiScale(3), UiScale(3));
-        MoveToEx(hdc, cx - UiScale(4), cy - UiScale(2), NULL); LineTo(hdc, cx - UiScale(1), cy - UiScale(2));
-        MoveToEx(hdc, cx - UiScale(4), cy + UiScale(2), NULL); LineTo(hdc, cx + UiScale(2), cy + UiScale(2));
-    } else {
-        int top = p->bIsUSB ? cy - UiScale(8) : cy - UiScale(7);
-        int bot = p->bIsUSB ? cy + UiScale(4) : cy + UiScale(8);
-        int ccy = (top + bot) / 2 - (p->bIsUSB ? 0 : UiScale(1));
-        RoundRect(hdc, cx - UiScale(6), top, cx + UiScale(7), bot, UiScale(3), UiScale(3));
-        Ellipse(hdc, cx - UiScale(3), ccy - UiScale(3), cx + UiScale(4), ccy + UiScale(4));
-        if (p->bIsUSB) {
-            Rectangle(hdc, cx - UiScale(2), bot - 1, cx + UiScale(3), cy + UiScale(8));
-        } else {
-            MoveToEx(hdc, cx - UiScale(3), bot - UiScale(3), NULL); LineTo(hdc, cx + UiScale(4), bot - UiScale(3));
-        }
-    }
-    SelectObject(hdc, hbo);
-    SelectObject(hdc, hpo);
-    DeleteObject(hp);
-}
-
-static void PaintDriveCard(HDC hdc, int w, int h, int nIdx, BOOL bSelected, BOOL bHover)
-{
-    RECT rc = { 0, 0, w, h };
-    FillRectColor(hdc, &rc, CLR_SIDE);
-    if (bSelected)
-        DrawCard(hdc, &rc, UiScale(6), g_Pal.sel, CLR_BORDER, FALSE, 0, 0);
-    else if (bHover)
-        FillRound(hdc, &rc, UiScale(6), g_Pal.hover);
-    if (nIdx < 0 || nIdx >= g_nDriveCount) return;
-    {
-        const DRIVE_INFO* pD = &g_Drives[nIdx];
-        char szName[64], szSub[96], szCap[24], szT[24];
-        const char* bus;
-        RECT bar = { UiScale(5), UiScale(12), UiScale(8), h - UiScale(12) };
-        RECT box = { UiScale(16), UiScale(10), UiScale(48), UiScale(42) };
-        int tx = UiScale(58);
-        RECT rn = { tx, UiScale(9), w - UiScale(10), UiScale(27) };
-        RECT rs = { tx, UiScale(27), w - UiScale(10), UiScale(43) };
-        int pw;
-
-        FillRound(hdc, &bar, UiScale(2) > 1 ? UiScale(2) / 2 + 1 : 1, StatusFg(pD->eHealthStatus));
-        DrawCard(hdc, &box, UiScale(6), CLR_PANEL, CLR_BORDER, FALSE, 0, 0);
-        DrawDriveIcon(hdc, &box, pD);
-
-        if (pD->szModel[0]) safe_snprintf(szName, "%s", pD->szModel);
-        else safe_snprintf(szName, TN("Диск %d", "Drive %d"), pD->nDriveIndex);
-        DrawTextColor(hdc, szName, &rn, g_hFontBodySb, CLR_TEXT,
-                      DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
-
-        FormatSize(pD->dwCapacityMB, szCap, sizeof(szCap));
-        bus = pD->bIsUSB ? "USB" : (pD->bIsNVMe ? "NVMe" : "SATA");
-        {
-            const char* t = GetDriveTypeName(pD->eType);
-            safe_snprintf(szSub, "%s \xC2\xB7 %s \xC2\xB7 %s", szCap, t ? t : "?", bus);
-        }
-        DrawTextColor(hdc, szSub, &rs, g_hFontLabel, CLR_TEXT_DIM,
-                      DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
-
-        if (pD->eHealthStatus == HEALTH_STATUS_UNKNOWN)
-            pw = DrawPillU8(hdc, tx, UiScale(60), TN("нет оценки", "no verdict"), PILL_SKIP, FALSE, FALSE);
-        else
-            pw = DrawPillU8(hdc, tx, UiScale(60), GetHealthStatusNameShort(pD->eHealthStatus),
-                            PillFromHealth(pD->eHealthStatus), TRUE, FALSE);
-        if (pD->nTemperatureC > 0) {
-            RECT rt = { tx + pw + UiScale(8), UiScale(50), w - UiScale(8), UiScale(70) };
-            COLORREF ct = CLR_TEXT_DIM;
-            if (pD->eTempBand == TEMP_BAND_HIGH || pD->eTempBand == TEMP_BAND_CRITICAL) ct = g_Pal.bad;
-            else if (pD->eTempBand == TEMP_BAND_ELEVATED) ct = g_Pal.warn;
-            safe_snprintf(szT, "%d\xC2\xA0\xC2\xB0""C", pD->nTemperatureC);
-            DrawTextColor(hdc, szT, &rt, g_hFontLabel, ct, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-        }
-    }
 }
 
 LRESULT CALLBACK DriveBtnWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
@@ -2560,8 +2036,125 @@ LRESULT CALLBACK DriveBtnWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPa
             HBITMAP hbmBuf = CreateCompatibleBitmap(hdcReal, w, h);
             HBITMAP hbmOldBuf = (HBITMAP)SelectObject(hdc, hbmBuf);
 
-            PaintDriveCard(hdc, w, h, nIdx, nIdx == g_nSelectedDrive,
-                           GetPropA(hWnd, "hover") != NULL);
+            RECT rcBuf = { 0, 0, w, h };
+
+            BOOL bSelected = (nIdx == g_nSelectedDrive);
+            BOOL bHover    = (GetPropA(hWnd, "hover") != NULL);
+
+            COLORREF clrFill, clrBorder, clrText;
+            if (bSelected) {
+                clrFill   = CLR_HEADER;
+                clrBorder = CLR_ACCENT;
+                clrText   = CLR_TEXT;
+            } else if (bHover) {
+                clrFill   = CLR_ROW2;
+                clrBorder = RGB(150, 180, 220);
+                clrText   = CLR_TEXT;
+            } else {
+                clrFill   = CLR_PANEL;
+                clrBorder = CLR_BORDER;
+                clrText   = CLR_TEXT;
+            }
+
+            {
+                HBRUSH hbrFill = CreateSolidBrush(clrFill);
+                FillRect(hdc, &rcBuf, hbrFill);
+                DeleteObject(hbrFill);
+            }
+
+            {
+                HPEN   hpBord = CreatePen(PS_SOLID, 1, clrBorder);
+                HPEN   hpOld  = (HPEN)SelectObject(hdc, hpBord);
+                HBRUSH hbOld  = (HBRUSH)SelectObject(hdc, (HBRUSH)GetStockObject(NULL_BRUSH));
+                Rectangle(hdc, rcBuf.left, rcBuf.top, rcBuf.right, rcBuf.bottom);
+                SelectObject(hdc, hpOld);
+                SelectObject(hdc, hbOld);
+                DeleteObject(hpBord);
+            }
+
+            SetBkMode(hdc, TRANSPARENT);
+
+            if (nIdx >= 0 && nIdx < g_nDriveCount) {
+                DRIVE_INFO* pD = &g_Drives[nIdx];
+
+                char szName[64];
+                if (strlen(pD->szModel) > 0)
+                    safe_snprintf(szName, "%s", pD->szModel);
+                else
+                    safe_snprintf(szName, TN("Диск %d", "Drive %d"), pD->nDriveIndex);
+
+                char szType[16];
+                const char* szT = GetDriveTypeName(pD->eType);
+                safe_snprintf(szType, "[%s]", szT ? szT : "?");
+
+                char szHealth[48];
+                if (pD->eHealthStatus == HEALTH_STATUS_UNKNOWN)
+                    safe_snprintf(szHealth, "—");
+                else
+                    safe_snprintf(szHealth, "%s", GetHealthStatusNameShort(pD->eHealthStatus));
+
+                char szCap[24];
+                FormatSize(pD->dwCapacityMB, szCap, sizeof(szCap));
+
+                char szTempStr[24];
+                if (pD->nTemperatureC > 0)
+                    safe_snprintf(szTempStr, "%d\xC2\xB0""C", pD->nTemperatureC);
+                else
+                    szTempStr[0] = '\0';
+
+                COLORREF clrH = GetHealthStatusColor(pD->eHealthStatus);
+
+                COLORREF clrTemp;
+                if (pD->nTemperatureC <= 0)
+                    clrTemp = CLR_TEXT_DIM;
+                else if (pD->eTempBand == TEMP_BAND_NORMAL)
+                    clrTemp = CLR_GREEN;
+                else if (pD->eTempBand == TEMP_BAND_ELEVATED)
+                    clrTemp = CLR_YELLOW;
+                else if (pD->eTempBand == TEMP_BAND_HIGH ||
+                         pD->eTempBand == TEMP_BAND_CRITICAL)
+                    clrTemp = CLR_RED;
+                else if (pD->nTemperatureC < 50)
+                    clrTemp = CLR_GREEN;
+                else if (pD->nTemperatureC < 60)
+                    clrTemp = CLR_YELLOW;
+                else
+                    clrTemp = CLR_RED;
+
+                HFONT hOldFont;
+
+                hOldFont = (HFONT)SelectObject(hdc, g_hFontNormal);
+                SetTextColor(hdc, clrText);
+                RECT rcName = { rcBuf.left + UiScale(8), rcBuf.top + UiScale(4),
+                                rcBuf.right - UiScale(8), rcBuf.top + UiScale(20) };
+                DrawTextU8(hdc, szName, &rcName, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+
+                SelectObject(hdc, g_hFontSmall);
+                RECT rcType = { rcBuf.left + UiScale(8), rcBuf.top + UiScale(20),
+                                (rcBuf.left + rcBuf.right) / 2, rcBuf.top + UiScale(36) };
+                SetTextColor(hdc, CLR_TEXT_DIM);
+                DrawTextU8(hdc, szType, &rcType, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+                RECT rcHealth = { (rcBuf.left + rcBuf.right) / 2, rcBuf.top + UiScale(20),
+                                  rcBuf.right - UiScale(8), rcBuf.top + UiScale(36) };
+                SetTextColor(hdc, clrH);
+                DrawTextU8(hdc, szHealth, &rcHealth,
+                    DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+
+                {
+                    RECT rcCap  = { rcBuf.left + UiScale(8), rcBuf.bottom - UiScale(17),
+                                    (rcBuf.left + rcBuf.right) / 2, rcBuf.bottom - UiScale(4) };
+                    RECT rcTmp  = { (rcBuf.left + rcBuf.right) / 2, rcBuf.bottom - UiScale(17),
+                                    rcBuf.right - UiScale(8), rcBuf.bottom - UiScale(4) };
+                    SetTextColor(hdc, clrText);
+                    DrawTextU8(hdc, szCap, &rcCap, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+                    if (szTempStr[0]) {
+                        SetTextColor(hdc, clrTemp);
+                        DrawTextU8(hdc, szTempStr, &rcTmp, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+                    }
+                }
+                SelectObject(hdc, hOldFont);
+            }
 
             BitBlt(hdcReal, 0, 0, w, h, hdc, 0, 0, SRCCOPY);
 
@@ -2644,7 +2237,7 @@ void RepaintHealthBar(void)
 void UpdateDriveButtons(HWND hWnd)
 {
     int i;
-    int nBtnW  = UiScale(DRIVE_BTN_PANEL_W - 24);
+    int nBtnW  = UiScale(DRIVE_BTN_PANEL_W - 12);
     int nBtnH  = UiScale(DRIVE_BTN_H);
     int nStartY = UiScale(40);
 
@@ -2677,7 +2270,7 @@ void UpdateDriveButtons(HWND hWnd)
         if (g_nDriveCount == 0) {
             HWND hPlaceholder = CreateWindowExU8(0, "STATIC", Tr(STR_NO_DRIVES),
                 WS_CHILD | WS_VISIBLE | SS_CENTER,
-                UiScale(12), nStartY, nBtnW, nBtnH,
+                UiScale(6), nStartY, nBtnW, nBtnH,
                 hWnd, (HMENU)(IDC_DRIVE_BTN_BASE), g_hInst, NULL);
             SendMessage(hPlaceholder, WM_SETFONT, (WPARAM)g_hFontSmall, TRUE);
             g_hDriveBtn[0] = hPlaceholder;
@@ -2688,7 +2281,7 @@ void UpdateDriveButtons(HWND hWnd)
             g_hDriveBtn[i] = CreateWindowExU8(
                 0, "LLHDDriveBtn", "",
                 WS_CHILD | WS_VISIBLE,
-                UiScale(12), nY, nBtnW, nBtnH,
+                UiScale(6), nY, nBtnW, nBtnH,
                 hWnd, (HMENU)(UINT_PTR)(IDC_DRIVE_BTN_BASE + i), g_hInst, NULL
             );
             SetWindowLongPtrA(g_hDriveBtn[i], GWLP_USERDATA, (LONG_PTR)i);
@@ -3988,7 +3581,6 @@ static const char* AtaRowStatus(const DRIVE_INFO* p, const SMART_ATTRIBUTE* a,
     return "ОК";
 }
 
-/* Six ATA raw bytes, high byte first. The reading lives in its own column. */
 static void FormatSmartRawHex(const BYTE* pRaw, char* szBuf, int nBufLen)
 {
     if (!pRaw || !szBuf || nBufLen <= 0) return;
@@ -4055,15 +3647,19 @@ void UpdateAttrList(HWND hWnd, int nDriveIdx)
         int  nCritC = NvmeIdentifyTempC(pInfo->wNVMeCritTempThreshold);
 
         #define NVME_NA TN("н/п", "n/a")
-        /* NVMe has no ATA Value. raw_ is the log field; dec_ is the reading. */
+        #define NVME_DASH Tr(STR_NONE)
+        /* NVMe has no normalized ATA value. The reading is Value.
+         * Decode stays a dash: repeating that reading there is not a
+         * second fact. RAW is the log field. Worst stays n/a.
+         * Threshold is n/a unless the log has one. */
         #define NVME_ROW_EX(id_, name_, val_, worst_, thresh_, raw_, dec_, stat_) \
         { \
             if (nDesired < MAX_ATTR_ROWS) \
                 AttrRowSet(&rows[nDesired++], (id_), (name_), (val_), \
                            (worst_), (thresh_), (raw_), (dec_), (stat_)); \
         }
-        #define NVME_ROW(id_, name_, dec_, raw_, stat_) \
-            NVME_ROW_EX(id_, name_, NVME_NA, NVME_NA, NVME_NA, raw_, dec_, stat_)
+        #define NVME_ROW(id_, name_, val_, raw_, stat_) \
+            NVME_ROW_EX(id_, name_, (val_), NVME_NA, NVME_NA, raw_, NVME_DASH, (stat_))
 
         char szCrit[64], szCritRaw[16], szVBuf[64];
         char szSpare[32], szSpareRaw[16], szSpTh[32], szSpThRaw[16];
@@ -4123,8 +3719,8 @@ void UpdateAttrList(HWND hWnd, int nDriveIdx)
                     safe_snprintf(szThrT, "%d C", nCritC);
                     thrT = szThrT;
                 }
-                NVME_ROW_EX("02h", TN("Температура", "Temperature"), NVME_NA,
-                            worstT, thrT, szRawT, szVBuf, szTstat);
+                NVME_ROW_EX("02h", TN("Температура", "Temperature"), szVBuf,
+                            worstT, thrT, szRawT, NVME_DASH, szTstat);
             }
         }
         if (nWarnC > 0) {
@@ -4159,8 +3755,8 @@ void UpdateAttrList(HWND hWnd, int nDriveIdx)
         safe_snprintf(szSpareRaw, "%u", (unsigned)pLog->AvailableSpare);
         safe_snprintf(szSpTh,"%d %%",(int)pLog->AvailableSpareThreshold);
         safe_snprintf(szSpThRaw, "%u", (unsigned)pLog->AvailableSpareThreshold);
-        NVME_ROW_EX("03h", TN("Запас блоков", "Available spare"), NVME_NA,
-            NVME_NA, szSpTh, szSpareRaw, szSpare,
+        NVME_ROW_EX("03h", TN("Запас блоков", "Available spare"), szSpare,
+            NVME_NA, szSpTh, szSpareRaw, NVME_DASH,
             (pLog->AvailableSpare<pLog->AvailableSpareThreshold?"ПЛОХО":"ОК"));
 
         NVME_ROW("04h", TN("Порог запаса блоков", "Spare threshold"), szSpTh, szSpThRaw, "ОК");
@@ -4274,6 +3870,7 @@ void UpdateAttrList(HWND hWnd, int nDriveIdx)
 
         #undef NVME_ROW
         #undef NVME_ROW_EX
+        #undef NVME_DASH
         #undef NVME_NA
     }
     else if (pInfo->bSMART_Supported) {
@@ -4431,14 +4028,6 @@ void RefreshData(HWND hWnd)
     if (InterlockedCompareExchange(&g_bScanBusy, 1, 0) != 0)
         return;
     SetActionButtonsEnabled(hWnd, FALSE);
-
-    if (g_bDemoMode) {
-        static int s_bDemoFirst = 1;
-        g_nScanBufCount = DemoFill(g_ScanBuf);
-        if (s_bDemoFirst) { g_nSelectedDrive = 1; s_bDemoFirst = 0; }
-        PostMessage(hWnd, WM_APP_REFRESH_DONE, 0, 0);
-        return;
-    }
 
     HANDLE hThread = CreateThread(NULL, 0, RefreshThreadProc, hWnd, 0, NULL);
     if (hThread)
@@ -4893,15 +4482,8 @@ static void CreateMenuBar(HWND hWnd)
     AppendMenuU8(g_hViewMenu, MF_STRING, IDM_ZOOM_150, "150%");
     AppendMenuU8(g_hViewMenu, MF_STRING, IDM_ZOOM_175, "175%");
     AppendMenuU8(g_hViewMenu, MF_STRING, IDM_ZOOM_200, "200%");
-    AppendMenuU8(g_hViewMenu, MF_SEPARATOR, 0, NULL);
-    g_hThemeMenu = CreatePopupMenu();
-    AppendMenuU8(g_hThemeMenu, MF_STRING, IDM_THEME_SYSTEM, TN("Как в системе", "Use system setting"));
-    AppendMenuU8(g_hThemeMenu, MF_STRING, IDM_THEME_LIGHT,  TN("Светлая", "Light"));
-    AppendMenuU8(g_hThemeMenu, MF_STRING, IDM_THEME_DARK,   TN("Тёмная", "Dark"));
-    AppendMenuU8(g_hViewMenu, MF_POPUP, (UINT_PTR)g_hThemeMenu, TN("Тема", "Theme"));
     AppendMenuU8(hMenuBar, MF_POPUP, (UINT_PTR)g_hViewMenu, Tr(STR_VIEW));
     UiSyncZoomMenu();
-    UiSyncThemeMenu();
 
     g_hLangMenu = CreatePopupMenu();
     AppendMenuU8(g_hLangMenu, MF_STRING, IDM_LANG_RU, "Русский");
@@ -5016,11 +4598,8 @@ void CreateControls(HWND hWnd)
     int i;
     for (i = 0; i < MAX_DRIVES; i++) g_hDriveBtn[i] = NULL;
 
-    /* v2: the caption, header facts, axes and the prompt are painted by
-     * PaintMainV2 / PaintDashboard. The statics stay as hidden data holders
-     * so SetDlgItemText callers keep working. */
     HWND hDriveLabel = CreateWindowExU8(0, "STATIC", Tr(STR_DRIVES),
-        WS_CHILD | SS_LEFT,
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
         6, 8, DRIVE_BTN_PANEL_W - 12, 16,
         hWnd, (HMENU)(IDC_DRIVE_LIST), g_hInst, NULL);
     SendMessage(hDriveLabel, WM_SETFONT, (WPARAM)g_hFontSmall, TRUE);
@@ -5029,28 +4608,28 @@ void CreateControls(HWND hWnd)
     int nBarsW  = 190;
 
     HWND hLabel = CreateWindowExU8(0, "STATIC", Tr(STR_DISK_ASSESS),
-        WS_CHILD | SS_LEFT,
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
         nRightX, 40, nBarsW, 14,
         hWnd, (HMENU)IDC_HEALTH_LABEL, g_hInst, NULL);
     SendMessage(hLabel, WM_SETFONT, (WPARAM)g_hFontSmall, TRUE);
 
-    g_hHealthBar = CreateWindowExU8(0, "LLHDHealthBar", "",
+    g_hHealthBar = CreateWindowExU8(WS_EX_CLIENTEDGE, "LLHDHealthBar", "",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP,
         nRightX, 56, nBarsW, 48,
         hWnd, (HMENU)IDC_HEALTH_BAR_FRAME, g_hInst, NULL);
 
     { HWND h = CreateWindowExU8(0, "BUTTON", Tr(STR_REREAD),
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
         nRightX, 110, 90, 24,
         hWnd, (HMENU)IDC_REREAD_BTN, g_hInst, NULL);
       SendMessage(h, WM_SETFONT, (WPARAM)g_hFontSmall, TRUE); }
     { HWND h = CreateWindowExU8(0, "BUTTON", Tr(STR_REPORT_BTN),
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
         nRightX + 100, 110, 90, 24,
         hWnd, (HMENU)IDC_REPORT_BTN, g_hInst, NULL);
       SendMessage(h, WM_SETFONT, (WPARAM)g_hFontSmall, TRUE); }
     { HWND h = CreateWindowExU8(0, "BUTTON", Tr(STR_EJECT_BTN),
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
         nRightX, 138, nBarsW, 24,
         hWnd, (HMENU)IDC_EJECT_BTN, g_hInst, NULL);
       SendMessage(h, WM_SETFONT, (WPARAM)g_hFontSmall, TRUE);
@@ -5067,11 +4646,11 @@ void CreateControls(HWND hWnd)
         for (i = 0; i < 4; i++) {
             int y = 166 + 16 * i;
             HWND hL = CreateWindowExU8(0, "STATIC", Tr(ax[i].sid),
-                WS_CHILD | SS_LEFT,
+                WS_CHILD | WS_VISIBLE | SS_LEFT,
                 nRightX, y, 78, 16,
                 hWnd, (HMENU)(UINT_PTR)ax[i].idL, g_hInst, NULL);
             HWND hV = CreateWindowExU8(0, "STATIC", "",
-                WS_CHILD | SS_LEFT,
+                WS_CHILD | WS_VISIBLE | SS_LEFT,
                 nRightX + 80, y, nBarsW - 80, 16,
                 hWnd, (HMENU)(UINT_PTR)ax[i].idV, g_hInst, NULL);
             SendMessage(hL, WM_SETFONT, (WPARAM)g_hFontSmall, TRUE);
@@ -5106,11 +4685,11 @@ void CreateControls(HWND hWnd)
             int y = nInfoY + (nInfoH + nInfoGap) * r;
             HWND hL = CreateWindowExU8(0, "STATIC",
                 rows[r].sid >= 0 ? Tr(rows[r].sid) : "S.M.A.R.T.",
-                WS_CHILD | SS_LEFT,
+                WS_CHILD | WS_VISIBLE | SS_LEFT,
                 nInfoX, y, nLblW, nInfoH,
                 hWnd, (HMENU)(UINT_PTR)rows[r].idLbl, g_hInst, NULL);
             HWND hV = CreateWindowExU8(0, "STATIC", rows[r].val,
-                WS_CHILD | SS_LEFT,
+                WS_CHILD | WS_VISIBLE | SS_LEFT,
                 nValX, y, nValW, nInfoH,
                 hWnd, (HMENU)(UINT_PTR)rows[r].idVal, g_hInst, NULL);
             SendMessage(hL, WM_SETFONT, (WPARAM)g_hFontSmall, TRUE);
@@ -5119,7 +4698,7 @@ void CreateControls(HWND hWnd)
     }
 
     HWND hPred = CreateWindowExU8(0, "STATIC", "",
-        WS_CHILD | SS_LEFT,
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
         nRightX, 258, 430, 17,
         hWnd, (HMENU)IDC_PREDICT_STATIC, g_hInst, NULL);
 
@@ -5134,14 +4713,15 @@ void CreateControls(HWND hWnd)
     }
 
     HWND hList = CreateWindowExU8(
-        0, "SysListView32", "",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER,
-        nRightX, 298, 540, 575,
+        WS_EX_CLIENTEDGE, "SysListView32", "",
+        WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER,
+        nRightX, 298, WINDOW_W - nRightX - 8, 575,
         hWnd, (HMENU)IDC_ATTR_LIST, g_hInst, NULL
     );
     SendMessage(hList, WM_SETFONT, (WPARAM)g_hFontSmall, TRUE);
     ListView_SetExtendedListViewStyle(hList,
-        LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+        LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER |
+        LVS_EX_HEADERDRAGDROP);
 
     ListView_SetBkColor(hList, CLR_PANEL);
     ListView_SetTextBkColor(hList, CLR_ROW1);
@@ -5153,31 +4733,33 @@ void CreateControls(HWND hWnd)
         ZeroMemory(&col, sizeof(col));
         col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT;
         col.fmt  = LVCFMT_LEFT;
+        AttrColsLoad();
 
         U8ToW("ID", w0, 16);
-        col.cx = 72;  col.pszText = w0;
+        col.cx = UiScale(g_attrColLogical[0]); col.pszText = w0;
         SendMessageW(hList, LVM_INSERTCOLUMNW, 0, (LPARAM)&col);
         U8ToW(Tr(STR_COL_PARAM), w1, 64);
-        col.cx = 200; col.pszText = w1;
+        col.cx = UiScale(g_attrColLogical[1]); col.pszText = w1;
         SendMessageW(hList, LVM_INSERTCOLUMNW, 1, (LPARAM)&col);
         U8ToW(Tr(STR_COL_VALUE), w2, 64);
-        col.cx = 70;  col.pszText = w2;
+        col.cx = UiScale(g_attrColLogical[2]); col.pszText = w2;
         SendMessageW(hList, LVM_INSERTCOLUMNW, 2, (LPARAM)&col);
         U8ToW(Tr(STR_COL_WORST), w3, 64);
-        col.cx = 50;  col.pszText = w3;
+        col.cx = UiScale(g_attrColLogical[3]); col.pszText = w3;
         SendMessageW(hList, LVM_INSERTCOLUMNW, 3, (LPARAM)&col);
         U8ToW(Tr(STR_COL_THRESH), w4, 64);
-        col.cx = 50;  col.pszText = w4;
+        col.cx = UiScale(g_attrColLogical[4]); col.pszText = w4;
         SendMessageW(hList, LVM_INSERTCOLUMNW, 4, (LPARAM)&col);
         U8ToW("RAW", w5, 64);
-        col.cx = 108; col.pszText = w5;
+        col.cx = UiScale(g_attrColLogical[ATTR_COL_RAW]); col.pszText = w5;
         SendMessageW(hList, LVM_INSERTCOLUMNW, ATTR_COL_RAW, (LPARAM)&col);
         U8ToW(Tr(STR_COL_DECODE), w6, 64);
-        col.cx = 180; col.pszText = w6;
+        col.cx = UiScale(g_attrColLogical[ATTR_COL_DECODE]); col.pszText = w6;
         SendMessageW(hList, LVM_INSERTCOLUMNW, ATTR_COL_DECODE, (LPARAM)&col);
         U8ToW(Tr(STR_COL_STATUS), w7, 64);
-        col.cx = 116; col.pszText = w7;
+        col.cx = UiScale(g_attrColLogical[ATTR_COL_STATUS]); col.pszText = w7;
         SendMessageW(hList, LVM_INSERTCOLUMNW, ATTR_COL_STATUS, (LPARAM)&col);
+        AttrColsApply(hList);
     }
 }
 
@@ -5259,15 +4841,15 @@ static LRESULT HandleCtlColor(HWND hWnd, WPARAM wParam)
             SetBkColor(hdc, CLR_BG);
             return (LRESULT)g_hbrBG;
         }
-        if (id == IDC_MONITOR_STATIC || id == IDC_DRIVE_BTN_BASE) {
+        if (id == IDC_MONITOR_STATIC) {
             COLORREF clr = CLR_TEXT_DIM;
-            if (id == IDC_MONITOR_STATIC && g_bMonitorAlert)
+            if (g_bMonitorAlert)
                 clr = CLR_ORANGE;
-            else if (id == IDC_MONITOR_STATIC && g_bMonitorOn)
+            else if (g_bMonitorOn)
                 clr = CLR_GREEN;
             SetTextColor(hdc, clr);
-            SetBkColor(hdc, CLR_SIDE);
-            return (LRESULT)g_hbrSide;
+            SetBkColor(hdc, CLR_BG);
+            return (LRESULT)g_hbrBG;
         }
     }
     SetTextColor(hdc, CLR_TEXT);
@@ -5275,612 +4857,104 @@ static LRESULT HandleCtlColor(HWND hWnd, WPARAM wParam)
     return (LRESULT)g_hbrBG;
 }
 
-/* ---- v2 layout geometry (unscaled px at 96 DPI) ---- */
-#define V2_PAD        20
-#define V2_TOP        16
-#define V2_BTN_H      30
-#define V2_DASH_Y     72
-#define V2_ROW_H      26
-static RECT g_rcTableCard;
-static RECT g_rcHeaderText;
-static HIMAGELIST g_hRowImgList = NULL;
-static int g_nRowImgH = 0;
-
-static void SetWindowThemeDyn(HWND h, const WCHAR* app)
-{
-    typedef HRESULT (WINAPI *PFN)(HWND, LPCWSTR, LPCWSTR);
-    static PFN pSet = NULL;
-    static int once = 0;
-    if (!once) {
-        HMODULE m = LoadLibraryW(L"uxtheme.dll");
-        if (m) pSet = (PFN)(void*)GetProcAddress(m, "SetWindowTheme");
-        once = 1;
-    }
-    if (pSet && h) pSet(h, app, NULL);
-}
-
-static void UiSyncThemeMenu(void)
-{
-    UINT id = IDM_THEME_SYSTEM;
-    if (g_nThemePref == 1) id = IDM_THEME_LIGHT;
-    else if (g_nThemePref == 2) id = IDM_THEME_DARK;
-    if (g_hThemeMenu)
-        CheckMenuRadioItem(g_hThemeMenu, IDM_THEME_SYSTEM, IDM_THEME_DARK, id, MF_BYCOMMAND);
-}
-
-static void UiApplyThemeAll(HWND hWnd)
-{
-    HWND hList = GetDlgItem(hWnd, IDC_ATTR_LIST);
-    UiApplyPalette();
-    UiApplyTitleBar(hWnd);
-    if (hList) {
-        SubclassAttrHeader(hList);
-        InvalidateRect(ListView_GetHeader(hList), NULL, FALSE);
-        ListView_SetBkColor(hList, CLR_PANEL);
-        ListView_SetTextBkColor(hList, CLR_PANEL);
-        ListView_SetTextColor(hList, CLR_TEXT);
-        SetWindowThemeDyn(hList, g_bUiDark ? L"DarkMode_Explorer" : L"Explorer");
-    }
-    UiSyncThemeMenu();
-    RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME);
-}
-
-static void UiSetThemePref(HWND hWnd, int v)
-{
-    g_nThemePref = v;
-    g_nThemeOverride = 0;
-    SaveThemePref(v);
-    UiApplyThemeAll(hWnd);
-}
-
-static int ButtonTextW(HWND hBtn, WCHAR* wz, int n)
-{
-    wz[0] = 0;
-    return GetWindowTextW(hBtn, wz, n);
-}
-
-static int MeasureActionButton(HDC hdc, HWND hBtn)
-{
-    WCHAR wz[64];
-    SIZE sz;
-    int w;
-    HFONT fo = (HFONT)SelectObject(hdc, g_hFontLabel);
-    ButtonTextW(hBtn, wz, 64);
-    GetTextExtentPoint32W(hdc, wz, lstrlenW(wz), &sz);
-    w = sz.cx + UiScale(24);
-    if (GetDlgCtrlID(hBtn) == IDC_REREAD_BTN) {
-        GetTextExtentPoint32W(hdc, L"F5", 2, &sz);
-        w += sz.cx + UiScale(8);
-    }
-    SelectObject(hdc, fo);
-    return w;
-}
-
-static void DrawActionButton(const DRAWITEMSTRUCT* di)
-{
-    HDC hdc = di->hDC;
-    RECT r = di->rcItem;
-    WCHAR wz[64];
-    SIZE sz, szH = { 0, 0 };
-    BOOL bDis = (di->itemState & ODS_DISABLED) != 0;
-    BOOL bDown = (di->itemState & ODS_SELECTED) != 0;
-    BOOL bHint = (di->CtlID == IDC_REREAD_BTN);
-    int x;
-    RECT rt;
-    HFONT fo;
-    FillRectColor(hdc, &r, CLR_BG);
-    DrawCard(hdc, &r, UiScale(5), bDown ? g_Pal.hover : g_Pal.btn,
-             bDis ? CLR_BORDER : CLR_BORDER2, FALSE, 0, 0);
-    ButtonTextW(di->hwndItem, wz, 64);
-    fo = (HFONT)SelectObject(hdc, g_hFontLabel);
-    GetTextExtentPoint32W(hdc, wz, lstrlenW(wz), &sz);
-    if (bHint) GetTextExtentPoint32W(hdc, L"F5", 2, &szH);
-    x = r.left + (r.right - r.left - sz.cx - (bHint ? szH.cx + UiScale(8) : 0)) / 2;
-    SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, bDis ? CLR_TEXT_FAINT : CLR_TEXT);
-    rt = r; rt.left = x; rt.right = x + sz.cx + 1;
-    DrawTextW(hdc, wz, -1, &rt, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-    if (bHint) {
-        rt.left = rt.right + UiScale(8) - 1; rt.right = rt.left + szH.cx + 1;
-        SetTextColor(hdc, CLR_TEXT_FAINT);
-        DrawTextW(hdc, L"F5", 2, &rt, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    }
-    SelectObject(hdc, fo);
-    if ((di->itemState & ODS_FOCUS) && !(di->itemState & ODS_NOFOCUSRECT)) {
-        RECT rf = r;
-        InflateRect(&rf, -UiScale(3), -UiScale(3));
-        SetTextColor(hdc, CLR_TEXT);
-        SetBkColor(hdc, g_Pal.btn);
-        DrawFocusRect(hdc, &rf);
-    }
-}
-
-static void PaintMainV2(HWND hWnd, HDC hdc, const RECT* rcClient)
-{
-    const DRIVE_INFO* p = SelDrive();
-    int sw = UiScale(DRIVE_BTN_PANEL_W);
-    RECT rs = { 0, 0, sw, rcClient->bottom };
-    FillRectColor(hdc, rcClient, CLR_BG);
-    FillRectColor(hdc, &rs, CLR_SIDE);
-    { RECT ln = { sw - 1, 0, sw, rcClient->bottom }; FillRectColor(hdc, &ln, CLR_BORDER); }
-    {
-        RECT rc = { UiScale(16), UiScale(14), sw - UiScale(16), UiScale(32) };
-        WCHAR wz[64];
-        HFONT fo = (HFONT)SelectObject(hdc, g_hFontPill);
-        U8ToW(Tr(STR_DRIVES), wz, 64);
-        CharUpperW(wz);
-        SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, CLR_TEXT_FAINT);
-        DrawTextW(hdc, wz, -1, &rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        SelectObject(hdc, fo);
-    }
-    if (p) {
-        RECT r1 = g_rcHeaderText, r2 = g_rcHeaderText;
-        char sub[256], cap[32];
-        const char* ctl = DriveControllerLabel(p);
-        r1.bottom = r1.top + UiScale(28);
-        r2.top = r1.bottom + UiScale(2); r2.bottom = r2.top + UiScale(18);
-        DrawTextColor(hdc, p->szModel[0] ? p->szModel : "-", &r1, g_hFontH1, CLR_TEXT,
-                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-        FormatSize(p->dwCapacityMB, cap, sizeof(cap));
-        safe_snprintf(sub, "%s \xC2\xB7 %s", cap, GetDriveTypeName(p->eType));
-        if (p->szProtocol[0])
-            safe_snprintf_n(sub + strlen(sub), (int)(sizeof(sub) - strlen(sub)), " \xC2\xB7 %s", p->szProtocol);
-        if (ctl && ctl[0] && strcmp(ctl, "\xE2\x80\x94") != 0 && strcmp(ctl, "-") != 0)
-            safe_snprintf_n(sub + strlen(sub), (int)(sizeof(sub) - strlen(sub)), " \xC2\xB7 %s", ctl);
-        if (p->szSerial[0])
-            safe_snprintf_n(sub + strlen(sub), (int)(sizeof(sub) - strlen(sub)), " \xC2\xB7 S/N %s", p->szSerial);
-        if (p->szFirmware[0])
-            safe_snprintf_n(sub + strlen(sub), (int)(sizeof(sub) - strlen(sub)), " \xC2\xB7 %s %s",
-                          TN("ПО", "FW"), p->szFirmware);
-        DrawTextColor(hdc, sub, &r2, g_hFontLabel, CLR_TEXT_DIM,
-                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-    }
-    if (g_rcTableCard.right > g_rcTableCard.left)
-        DrawCard(hdc, &g_rcTableCard, UiScale(8), CLR_PANEL, CLR_BORDER, FALSE, 0, 0);
-    (void)hWnd;
-}
-
-static void UiEnsureRowHeight(HWND hList)
-{
-    int h = UiScale(V2_ROW_H);
-    if (!hList || h == g_nRowImgH) return;
-    if (g_hRowImgList) {
-        ListView_SetImageList(hList, NULL, LVSIL_SMALL);
-        ImageList_Destroy(g_hRowImgList);
-    }
-    g_hRowImgList = ImageList_Create(1, h, ILC_COLOR32, 1, 1);
-    ListView_SetImageList(hList, g_hRowImgList, LVSIL_SMALL);
-    g_nRowImgH = h;
-}
-
-static void LayoutAttrColumns(HWND hList)
-{
-    RECT rc;
-    int fixed, rest, paramW, i;
-    /* Decode is fixed so «Расшифровка» fits. The parameter name takes
-     * the width that is left. Do not grow past the list: that adds a
-     * horizontal scrollbar. */
-    int cw[8] = { 76, 0, 100, 80, 70, 116, 150, 136 };
-    GetClientRect(hList, &rc);
-    fixed = 0;
-    for (i = 0; i < 8; i++) if (cw[i]) fixed += UiScale(cw[i]);
-    rest = (rc.right - rc.left) - fixed;
-    if (rest < UiScale(96)) rest = UiScale(96);
-    paramW = rest;
-    for (i = 0; i < 8; i++)
-        ListView_SetColumnWidth(hList, i, (i == 1) ? paramW : UiScale(cw[i]));
-}
-
 static void LayoutMainWindow(HWND hWnd)
 {
     RECT rc;
-    int cx, cy, i, sw, x0, xr, bx;
-    HWND hList;
-    HDC hdc;
+    int cxClient, cyClient;
+    int i, nBtnW, nStartY, nRightX, nBarsW, nInfoX;
+    HWND hDriveLabel, hHl, hPred, hList;
 
     GetClientRect(hWnd, &rc);
-    cx = rc.right - rc.left;
-    cy = rc.bottom - rc.top;
-    if (cx < 100 || cy < 100) return;
+    cxClient = rc.right - rc.left;
+    cyClient = rc.bottom - rc.top;
+    if (cxClient < 100 || cyClient < 100) return;
 
-    sw = UiScale(DRIVE_BTN_PANEL_W);
+    nBtnW   = UiScale(DRIVE_BTN_PANEL_W - 12);
+    nStartY = UiScale(40);
     for (i = 0; i < MAX_DRIVES; i++) {
         if (g_hDriveBtn[i]) {
-            int nY = UiScale(40) + i * (UiScale(DRIVE_BTN_H) + UiScale(DRIVE_BTN_GAP));
-            SetWindowPos(g_hDriveBtn[i], NULL, UiScale(12), nY,
-                         sw - UiScale(24), UiScale(DRIVE_BTN_H), SWP_NOZORDER);
+            int nY = nStartY + i * (UiScale(DRIVE_BTN_H) + UiScale(DRIVE_BTN_GAP));
+            SetWindowPos(g_hDriveBtn[i], NULL, UiScale(6), nY, nBtnW, UiScale(DRIVE_BTN_H),
+                         SWP_NOZORDER);
         }
     }
+
+    hDriveLabel = GetDlgItem(hWnd, IDC_DRIVE_LIST);
+    if (hDriveLabel)
+        SetWindowPos(hDriveLabel, NULL, UiScale(6), UiScale(8), nBtnW, UiScale(16), SWP_NOZORDER);
+
+    nRightX = UiScale(DRIVE_BTN_PANEL_W + 10);
+    nBarsW  = UiScale(190);
+
+    hHl = GetDlgItem(hWnd, IDC_HEALTH_LABEL);
+    if (hHl) SetWindowPos(hHl, NULL, nRightX, UiScale(40), nBarsW, UiScale(14), SWP_NOZORDER);
+    if (g_hHealthBar)
+        SetWindowPos(g_hHealthBar, NULL, nRightX, UiScale(56), nBarsW, UiScale(48), SWP_NOZORDER);
+    {
+        HWND hReread = GetDlgItem(hWnd, IDC_REREAD_BTN);
+        HWND hReport = GetDlgItem(hWnd, IDC_REPORT_BTN);
+        HWND hEject  = GetDlgItem(hWnd, IDC_EJECT_BTN);
+        if (hReread) SetWindowPos(hReread, NULL, nRightX, UiScale(110), UiScale(90), UiScale(24), SWP_NOZORDER);
+        if (hReport) SetWindowPos(hReport, NULL, nRightX + UiScale(100), UiScale(110), UiScale(90), UiScale(24), SWP_NOZORDER);
+        if (hEject)  SetWindowPos(hEject,  NULL, nRightX, UiScale(138), nBarsW, UiScale(24), SWP_NOZORDER);
+        {
+            int axL[] = { IDC_AXIS_MEDIA_L, IDC_AXIS_IFACE_L,
+                          IDC_AXIS_TEMPA_L, IDC_AXIS_ROW4_L };
+            int axV[] = { IDC_AXIS_MEDIA_V, IDC_AXIS_IFACE_V,
+                          IDC_AXIS_TEMPA_V, IDC_AXIS_ROW4_V };
+            int ai;
+            for (ai = 0; ai < 4; ai++) {
+                HWND hL = GetDlgItem(hWnd, axL[ai]);
+                HWND hV = GetDlgItem(hWnd, axV[ai]);
+                int y = UiScale(166) + UiScale(16) * ai;
+                if (hL) SetWindowPos(hL, NULL, nRightX, y, UiScale(78), UiScale(16), SWP_NOZORDER);
+                if (hV) SetWindowPos(hV, NULL, nRightX + UiScale(80), y, nBarsW - UiScale(80), UiScale(16), SWP_NOZORDER);
+            }
+        }
+    }
+
+    nInfoX = nRightX + nBarsW + UiScale(10);
+    {
+        int nLblW2  = UiScale(100);
+        int nValX2  = nInfoX + nLblW2 + UiScale(4);
+        int nValW2  = cxClient - nValX2 - UiScale(8);
+        int nInfoY2 = UiScale(36), nInfoH2 = UiScale(16), nInfoGap2 = UiScale(2);
+        int lblIds[] = { IDC_MODEL_LABEL, IDC_BRAND_LABEL, IDC_CONTROLLER_LABEL,
+                         IDC_SERIAL_LABEL, IDC_FIRMWARE_LABEL,
+                         IDC_SIZE_LABEL, IDC_TEMP_LABEL, IDC_POH_LABEL, IDC_STATUS_LABEL,
+                         IDC_PROTOCOL_LABEL, IDC_ADAPTER_LABEL };
+        int valIds[] = { IDC_MODEL_STATIC, IDC_BRAND_STATIC, IDC_CONTROLLER_STATIC,
+                         IDC_SERIAL_STATIC, IDC_FIRMWARE_STATIC,
+                         IDC_SIZE_STATIC, IDC_TEMP_STATIC, IDC_POH_STATIC, IDC_STATUS_STATIC,
+                         IDC_PROTOCOL_STATIC, IDC_ADAPTER_STATIC };
+        int k;
+        if (nValW2 < UiScale(40)) nValW2 = UiScale(40);
+        for (k = 0; k < 11; k++) {
+            HWND hL = GetDlgItem(hWnd, lblIds[k]);
+            HWND hV = GetDlgItem(hWnd, valIds[k]);
+            int y = nInfoY2 + (nInfoH2 + nInfoGap2) * k;
+            if (hL) SetWindowPos(hL, NULL, nInfoX, y, nLblW2, nInfoH2, SWP_NOZORDER);
+            if (hV) SetWindowPos(hV, NULL, nValX2, y, nValW2, nInfoH2, SWP_NOZORDER);
+        }
+    }
+    hPred = GetDlgItem(hWnd, IDC_PREDICT_STATIC);
+    if (hPred) SetWindowPos(hPred, NULL, nRightX, UiScale(258),
+                            cxClient - nRightX - UiScale(8), UiScale(17), SWP_NOZORDER);
     {
         HWND hMon = GetDlgItem(hWnd, IDC_MONITOR_STATIC);
-        if (hMon) SetWindowPos(hMon, NULL, UiScale(16), cy - UiScale(30),
-                               sw - UiScale(32), UiScale(18), SWP_NOZORDER);
+        if (hMon) SetWindowPos(hMon, NULL, nRightX, UiScale(276),
+                               cxClient - nRightX - UiScale(8), UiScale(18), SWP_NOZORDER);
     }
-
-    x0 = sw + UiScale(V2_PAD);
-    xr = cx - UiScale(V2_PAD);
-
-    /* Action buttons, right-aligned on the header row. */
-    bx = xr;
-    hdc = GetDC(hWnd);
-    {
-        int ids[3] = { IDC_EJECT_BTN, IDC_REPORT_BTN, IDC_REREAD_BTN };
-        for (i = 0; i < 3; i++) {
-            HWND hb = GetDlgItem(hWnd, ids[i]);
-            int w;
-            if (!hb) continue;
-            w = MeasureActionButton(hdc, hb);
-            bx -= w;
-            SetWindowPos(hb, NULL, bx, UiScale(V2_TOP), w, UiScale(V2_BTN_H), SWP_NOZORDER);
-            bx -= UiScale(6);
-        }
-    }
-    ReleaseDC(hWnd, hdc);
-    g_rcHeaderText.left = x0; g_rcHeaderText.top = UiScale(V2_TOP) - UiScale(2);
-    g_rcHeaderText.right = bx - UiScale(12); g_rcHeaderText.bottom = UiScale(V2_DASH_Y);
-
-    if (g_hHealthBar)
-        SetWindowPos(g_hHealthBar, NULL, x0, UiScale(V2_DASH_Y), xr - x0,
-                     UiScale(DASH_H), SWP_NOZORDER);
-
-    g_rcTableCard.left = x0;
-    g_rcTableCard.right = xr;
-    g_rcTableCard.top = UiScale(V2_DASH_Y) + UiScale(DASH_H) + UiScale(12);
-    g_rcTableCard.bottom = cy - UiScale(16);
-    if (g_rcTableCard.bottom < g_rcTableCard.top + UiScale(80))
-        g_rcTableCard.bottom = g_rcTableCard.top + UiScale(80);
 
     hList = GetDlgItem(hWnd, IDC_ATTR_LIST);
     if (hList) {
-        int in = UiScale(3);
-        UiEnsureRowHeight(hList);
-        SetWindowPos(hList, NULL, g_rcTableCard.left + in, g_rcTableCard.top + in,
-                     g_rcTableCard.right - g_rcTableCard.left - 2 * in,
-                     g_rcTableCard.bottom - g_rcTableCard.top - 2 * in, SWP_NOZORDER);
-        LayoutAttrColumns(hList);
+        int nListTop = UiScale(298);
+        int nListH   = cyClient - nListTop - UiScale(8);
+        int nListW   = cxClient - nRightX - UiScale(8);
+        if (nListH < UiScale(50)) nListH = UiScale(50);
+        if (nListW < UiScale(200)) nListW = UiScale(200);
+        SetWindowPos(hList, NULL, nRightX, nListTop, nListW, nListH, SWP_NOZORDER);
     }
-    InvalidateRect(hWnd, NULL, FALSE);
-}
-
-/* ---- SMART table custom draw (v2) ---- */
-static PILL_KIND AttrPillKind(int nSt)
-{
-    switch (nSt) {
-    case ATTRST_BAD:  return PILL_BAD;
-    case ATTRST_WARN: return PILL_WARN;
-    case ATTRST_RISK: return PILL_RISK;
-    case ATTRST_OK:   return PILL_OK;
-    case ATTRST_SKIP: return PILL_SKIP;
-    case ATTRST_DIM:
-    case ATTRST_PAST:
-    case ATTRST_INFO:
-    case ATTRST_POWERLOG: return PILL_NEUTRAL;
-    default: return PILL_NONE;
-    }
-}
-
-static LRESULT AttrListCustomDraw(NMLVCUSTOMDRAW* pCD)
-{
-    HWND hList = pCD->nmcd.hdr.hwndFrom;
-    switch (pCD->nmcd.dwDrawStage) {
-    case CDDS_PREPAINT:
-        return CDRF_NOTIFYITEMDRAW;
-    case CDDS_ITEMPREPAINT:
-        pCD->nmcd.uItemState &= ~(UINT)CDIS_FOCUS;
-        return CDRF_NOTIFYSUBITEMDRAW;
-    case CDDS_SUBITEM | CDDS_ITEMPREPAINT:
-        {
-            HDC hdc = pCD->nmcd.hdc;
-            int item = (int)pCD->nmcd.dwItemSpec;
-            int sub = pCD->iSubItem;
-            int nSt = (int)(pCD->nmcd.lItemlParam & 0xFF);
-            int nAlt = (int)(pCD->nmcd.lItemlParam & 0x100);
-            BOOL bHl = (nSt == ATTRST_BAD || nSt == ATTRST_WARN || nSt == ATTRST_RISK);
-            BOOL bSel = (ListView_GetItemState(hList, item, LVIS_SELECTED) & LVIS_SELECTED) != 0;
-            RECT rc;
-            COLORREF bg;
-            WCHAR wz[128];
-            LVITEMW li;
-            int pad = UiScale(12);
-
-            ListView_GetSubItemRect(hList, item, sub, LVIR_BOUNDS, &rc);
-            if (sub == 0) {
-                RECT r1;
-                ListView_GetSubItemRect(hList, item, 1, LVIR_BOUNDS, &r1);
-                rc.right = r1.left;
-            }
-            if (bSel) bg = g_Pal.rowSel;
-            else if (bHl) bg = g_Pal.rowHl;
-            else bg = (item % 2) ? CLR_ROW2 : CLR_ROW1;
-            FillRectColor(hdc, &rc, bg);
-            { RECT ln = { rc.left, rc.bottom - 1, rc.right, rc.bottom }; FillRectColor(hdc, &ln, CLR_BORDER); }
-            if (sub == 0 && bHl) {
-                RECT bar = { rc.left, rc.top, rc.left + UiScale(3), rc.bottom - 1 };
-                PILL_KIND k = AttrPillKind(nSt);
-                COLORREF b2, f2;
-                PillColors(k, &b2, &f2);
-                FillRectColor(hdc, &bar, f2);
-            }
-
-            ZeroMemory(&li, sizeof(li));
-            li.iSubItem = sub;
-            li.pszText = wz;
-            li.cchTextMax = 128;
-            wz[0] = 0;
-            SendMessageW(hList, LVM_GETITEMTEXTW, (WPARAM)item, (LPARAM)&li);
-
-            if (sub == ATTR_COL_STATUS) {
-                PILL_KIND k = AttrPillKind(nSt);
-                const char* psz = NULL;
-                WCHAR wl[64];
-                if (k == PILL_NONE) return CDRF_SKIPDEFAULT;
-                switch (nSt) {
-                case ATTRST_BAD:  psz = nAlt ? Tr(STR_ST_BAD) : Tr(STR_ST_FAIL); break;
-                case ATTRST_WARN: psz = nAlt ? Tr(STR_ST_HOT) : Tr(STR_ST_WARN); break;
-                case ATTRST_RISK: psz = Tr(STR_ST_RISK); break;
-                case ATTRST_OK:   psz = Tr(STR_ST_OK); break;
-                case ATTRST_DIM:  psz = Tr(STR_ST_DIM); break;
-                case ATTRST_SKIP: psz = Tr(STR_ST_SKIP); break;
-                case ATTRST_PAST: psz = Tr(STR_ST_PAST); break;
-                default: psz = NULL; break;   /* INFO / POWERLOG: list text */
-                }
-                if (psz) U8ToW(psz, wl, 64);
-                else lstrcpynW(wl, wz[0] ? wz : L"", 64);
-                if (k == PILL_NEUTRAL || k == PILL_SKIP) CharLowerW(wl);
-                else CharUpperW(wl);
-                if (wl[0])
-                    DrawPillW(hdc, rc.left + pad, (rc.top + rc.bottom - 1) / 2, wl, k, FALSE);
-                return CDRF_SKIPDEFAULT;
-            }
-            if (sub == 0) {
-                /* "5 (05h)" -> decimal primary, faint hex if it fits. */
-                WCHAR prim[96], sec[64];
-                WCHAR* op = wcsstr(wz, L" (");
-                RECT rt = rc;
-                SIZE szP, szS;
-                HFONT fo;
-                int room;
-                prim[0] = sec[0] = 0;
-                if (op) {
-                    size_t n = (size_t)(op - wz);
-                    WCHAR* cl;
-                    lstrcpynW(prim, wz, (int)n + 1);
-                    lstrcpynW(sec, op + 2, 64);
-                    cl = wcsrchr(sec, L')');
-                    if (cl && cl[1] == 0) *cl = 0;
-                } else {
-                    lstrcpynW(prim, wz, 96);
-                }
-                rt.left += pad; rt.right -= pad; rt.bottom -= 1;
-                SetBkMode(hdc, TRANSPARENT);
-                fo = (HFONT)SelectObject(hdc, g_hFontBody);
-                GetTextExtentPoint32W(hdc, prim, lstrlenW(prim), &szP);
-                SetTextColor(hdc, CLR_TEXT_DIM);
-                DrawTextW(hdc, prim, -1, &rt, DT_LEFT | DT_VCENTER | DT_SINGLELINE |
-                          DT_END_ELLIPSIS | DT_NOPREFIX);
-                SelectObject(hdc, g_hFontLabel);
-                GetTextExtentPoint32W(hdc, sec, lstrlenW(sec), &szS);
-                room = (rt.right - rt.left) - szP.cx - UiScale(8);
-                if (sec[0] && szS.cx <= room) {
-                    RECT r2 = rt;
-                    SetTextColor(hdc, CLR_TEXT_FAINT);
-                    r2.left = rt.left + szP.cx + UiScale(6);
-                    DrawTextW(hdc, sec, -1, &r2, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-                }
-                SelectObject(hdc, fo);
-                return CDRF_SKIPDEFAULT;
-            }
-            {
-                RECT rt = rc;
-                HFONT fo = (HFONT)SelectObject(hdc,
-                    (bHl && (sub == 1 || sub == ATTR_COL_DECODE)) ? g_hFontBodySb : g_hFontBody);
-                UINT fmt = DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX;
-                rt.left += pad; rt.right -= pad; rt.bottom -= 1;
-                fmt |= (sub >= 2 && sub <= ATTR_COL_RAW) ? DT_RIGHT : DT_LEFT;
-                SetBkMode(hdc, TRANSPARENT);
-                SetTextColor(hdc, sub == 0 ? CLR_TEXT_DIM : CLR_TEXT);
-                DrawTextW(hdc, wz, -1, &rt, fmt);
-                SelectObject(hdc, fo);
-            }
-            return CDRF_SKIPDEFAULT;
-        }
-    default:
-        return CDRF_DODEFAULT;
-    }
-}
-
-/* The header is painted here in full (double-buffered) instead of through
- * NM_CUSTOMDRAW: themed headers repaint their own item background on some
- * builds and Wine, which broke the dark palette. */
-static WNDPROC g_pfnHeaderProc = NULL;
-
-static void PaintAttrHeader(HWND hHdr, HDC hdc, const RECT* rc)
-{
-    int n = Header_GetItemCount(hHdr), i;
-    FillRectColor(hdc, rc, CLR_PANEL);
-    for (i = 0; i < n; i++) {
-        RECT ri, rt;
-        WCHAR wz[64];
-        HDITEMW hi;
-        HFONT fo;
-        int order = i;
-        if (!Header_GetItemRect(hHdr, order, &ri)) continue;
-        ZeroMemory(&hi, sizeof(hi));
-        hi.mask = HDI_TEXT;
-        hi.pszText = wz;
-        hi.cchTextMax = 64;
-        wz[0] = 0;
-        SendMessageW(hHdr, HDM_GETITEMW, (WPARAM)order, (LPARAM)&hi);
-        rt = ri;
-        rt.left += UiScale(12); rt.right -= UiScale(12); rt.bottom -= 1;
-        SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, CLR_TEXT_DIM);
-        fo = (HFONT)SelectObject(hdc, g_hFontLabelSb);
-        DrawTextW(hdc, wz, -1, &rt, ((i >= 2 && i <= ATTR_COL_RAW) ? DT_RIGHT : DT_LEFT) |
-                  DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-        SelectObject(hdc, fo);
-    }
-    { RECT ln = { rc->left, rc->bottom - 1, rc->right, rc->bottom }; FillRectColor(hdc, &ln, CLR_BORDER); }
-}
-
-static LRESULT CALLBACK AttrHeaderProc(HWND hHdr, UINT msg, WPARAM wParam, LPARAM lParam)
-{
-    if (msg == WM_ERASEBKGND)
-        return 1;
-    if (msg == WM_PAINT) {
-        PAINTSTRUCT ps;
-        HDC hdcReal = BeginPaint(hHdr, &ps);
-        RECT rc;
-        GetClientRect(hHdr, &rc);
-        if (rc.right > 0 && rc.bottom > 0) {
-            HDC hdc = CreateCompatibleDC(hdcReal);
-            HBITMAP hbm = CreateCompatibleBitmap(hdcReal, rc.right, rc.bottom);
-            HBITMAP hbo = (HBITMAP)SelectObject(hdc, hbm);
-            PaintAttrHeader(hHdr, hdc, &rc);
-            BitBlt(hdcReal, 0, 0, rc.right, rc.bottom, hdc, 0, 0, SRCCOPY);
-            SelectObject(hdc, hbo);
-            DeleteObject(hbm);
-            DeleteDC(hdc);
-        }
-        EndPaint(hHdr, &ps);
-        return 0;
-    }
-    return CallWindowProcW(g_pfnHeaderProc, hHdr, msg, wParam, lParam);
-}
-
-static void SubclassAttrHeader(HWND hList)
-{
-    HWND hHdr = hList ? ListView_GetHeader(hList) : NULL;
-    if (!hHdr || g_pfnHeaderProc) return;
-    g_pfnHeaderProc = (WNDPROC)SetWindowLongPtrW(hHdr, GWLP_WNDPROC, (LONG_PTR)AttrHeaderProc);
-}
-
-/* ---- --demo fixtures: three drives, no device I/O. Real engine verdicts. ---- */
-static void DemoAttr(DRIVE_INFO* g, BYTE id, BYTE val, BYTE worst, BYTE thr, unsigned long long raw)
-{
-    int i, b;
-    for (i = 0; i < 30; i++) {
-        SMART_ATTRIBUTE* a = &g->attrData.stAttributes[i];
-        if (a->bAttrID != 0) continue;
-        a->bAttrID = id;
-        a->wStatusFlags = (WORD)(thr ? 0x0033 : 0x0032);
-        a->bAttrValue = val;
-        a->bWorstValue = worst;
-        for (b = 0; b < 6; b++) { a->bRawValue[b] = (BYTE)(raw & 0xFFu); raw >>= 8; }
-        g->threshData.stThresholds[i].bAttrID = id;
-        g->threshData.stThresholds[i].bThresholdValue = thr;
-        return;
-    }
-}
-
-static void DemoBase(DRIVE_INFO* g, int idx, DRIVE_TYPE t, const char* model, const char* sn,
-                     const char* fw, DWORD mb, const char* proto, int tempC, DWORD poh, DWORD pc)
-{
-    memset(g, 0, sizeof(*g));
-    g->nDriveIndex = idx;
-    g->eType = t;
-    g->bSMART_Supported = TRUE;
-    g->bSMART_Enabled = TRUE;
-    g->bGotReturnStatus = TRUE;
-    g->nEndurancePercent = -1;
-    g->nSSDLifeLeft = -1;
-    g->nSSDTotalWritesGB = -1;
-    g->nSSDAvgEraseCount = -1;
-    g->nHealthPercent = -1;
-    g->nTempMaxC = -1; g->nTempMinC = -1; g->nTempWarnC = -1; g->nTempCritC = -1;
-    lstrcpynA(g->szModel, model, (int)sizeof(g->szModel));
-    lstrcpynA(g->szSerial, sn, (int)sizeof(g->szSerial));
-    lstrcpynA(g->szFirmware, fw, (int)sizeof(g->szFirmware));
-    lstrcpynA(g->szProtocol, proto, (int)sizeof(g->szProtocol));
-    g->dwCapacityMB = mb;
-    g->nTemperatureC = tempC;
-    g->dwPowerOnHours = poh;
-    g->dwPowerCycleCount = pc;
-    g->attrData.wRevisionNumber = 0x10;
-}
-
-static int DemoFill(DRIVE_INFO* d)
-{
-    DRIVE_INFO* g;
-    const char* sata = UiLangIsEn() ? "SATA III (6 Gb/s)" : "SATA III (6 \xD0\x93\xD0\xB1\xD0\xB8\xD1\x82/\xD1\x81)";
-
-    g = &d[0];
-    DemoBase(g, 0, DRIVE_TYPE_SSD_SATA, "Samsung SSD 870 EVO 1TB", "S6PTNM0T812345K", "SVT02B6Q",
-             953869, sata, 38, 9120, 1204);
-    DemoAttr(g, 5, 100, 100, 10, 0);
-    DemoAttr(g, 9, 98, 98, 0, 9120);
-    DemoAttr(g, 12, 99, 99, 0, 1204);
-    DemoAttr(g, 177, 97, 97, 0, 31);
-    DemoAttr(g, 179, 100, 100, 10, 0);
-    DemoAttr(g, 181, 100, 100, 10, 0);
-    DemoAttr(g, 182, 100, 100, 10, 0);
-    DemoAttr(g, 183, 100, 100, 10, 0);
-    DemoAttr(g, 187, 100, 100, 0, 0);
-    DemoAttr(g, 190, 62, 48, 0, 38);
-    DemoAttr(g, 194, 62, 48, 0, 38);
-    DemoAttr(g, 199, 100, 100, 0, 0);
-    DemoAttr(g, 235, 99, 99, 0, 41);
-    DemoAttr(g, 241, 99, 99, 0, 21474836480ull);
-
-    g = &d[1];
-    DemoBase(g, 1, DRIVE_TYPE_HDD, "WDC WD20EZBX-00AYRA0", "WD-WX12A80K3P7L", "01.01A01",
-             1907729, sata, 41, 17170, 3412);
-    DemoAttr(g, 1, 200, 200, 51, 0);
-    DemoAttr(g, 3, 171, 169, 21, 4425);
-    DemoAttr(g, 4, 97, 97, 0, 3488);
-    DemoAttr(g, 5, 199, 199, 140, 8);
-    DemoAttr(g, 7, 200, 200, 0, 0);
-    DemoAttr(g, 9, 77, 77, 0, 17170);
-    DemoAttr(g, 10, 100, 100, 0, 0);
-    DemoAttr(g, 11, 100, 100, 0, 0);
-    DemoAttr(g, 12, 97, 97, 0, 3412);
-    DemoAttr(g, 192, 200, 200, 0, 87);
-    DemoAttr(g, 193, 194, 194, 0, 18940);
-    DemoAttr(g, 194, 106, 97, 0, 41);
-    DemoAttr(g, 196, 200, 200, 0, 8);
-    DemoAttr(g, 197, 200, 200, 0, 0);
-    DemoAttr(g, 198, 100, 253, 0, 0);
-    DemoAttr(g, 199, 200, 200, 0, 0);
-    DemoAttr(g, 200, 100, 253, 0, 0);
-
-    g = &d[2];
-    DemoBase(g, 2, DRIVE_TYPE_HDD, "ST4000LM024-2AN17V", "WCK1A2B3", "0001",
-             3815447, UiLangIsEn() ? "USB SAT \xC2\xB7 SATA 6 Gb/s"
-                                   : "USB SAT \xC2\xB7 SATA 6 \xD0\x93\xD0\xB1\xD0\xB8\xD1\x82/\xD1\x81",
-             47, 31200, 2210);
-    g->bIsUSB = TRUE;
-    g->eUsbBridgeType = USB_BRIDGE_SAT;
-    g->wUsbVid = 0x0BC2; g->wUsbPid = 0x2343;
-    DemoAttr(g, 1, 79, 64, 6, 81240512);
-    DemoAttr(g, 3, 99, 99, 0, 0);
-    DemoAttr(g, 4, 98, 98, 20, 2410);
-    DemoAttr(g, 5, 92, 92, 36, 1384);
-    DemoAttr(g, 7, 82, 60, 30, 175938620);
-    DemoAttr(g, 9, 65, 65, 0, 31200);
-    DemoAttr(g, 10, 100, 100, 97, 0);
-    DemoAttr(g, 12, 98, 98, 20, 2210);
-    DemoAttr(g, 187, 1, 1, 0, 214);
-    DemoAttr(g, 188, 100, 99, 0, 3);
-    DemoAttr(g, 190, 53, 41, 40, 47);
-    DemoAttr(g, 194, 47, 59, 0, 47);
-    DemoAttr(g, 197, 99, 99, 0, 56);
-    DemoAttr(g, 198, 99, 99, 0, 56);
-    DemoAttr(g, 199, 200, 200, 0, 0);
-
-    {
-        int i;
-        for (i = 0; i < 3; i++) {
-            int t = d[i].nTemperatureC;
-            ExtractTemperatureFromATA(&d[i]);
-            if (d[i].nTemperatureC <= 0) d[i].nTemperatureC = t;
-            ExtractCommonATACounters(&d[i]);
-            ExtractSSDIndicators(&d[i]);
-            IdentifyDriveParts(&d[i]);
-            AssessDriveHealth(&d[i]);
-        }
-    }
-    return 3;
 }
 
 LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
@@ -5898,8 +4972,6 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         MonitorLoad();
         CreateMenuBar(hWnd);
         CreateControls(hWnd);
-        UiApplyFonts(hWnd);
-        UiApplyThemeAll(hWnd);
         /* Tray icons show each disk temperature. With monitoring on, minimize
          * hides the window and the timer keeps running. Close still exits. */
         DeviceNotify_Register(hWnd);
@@ -5913,7 +4985,13 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         return 0;
 
     case WM_ERASEBKGND:
-        return 1;   /* WM_PAINT paints everything through a back buffer */
+        {
+            HDC hdc = (HDC)wParam;
+            RECT rc;
+            GetClientRect(hWnd, &rc);
+            FillRect(hdc, &rc, g_hbrBG);
+        }
+        return 1;
 
     case WM_CTLCOLORSTATIC:
         return HandleCtlColor(hWnd, wParam);
@@ -5933,52 +5011,177 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
     case WM_NOTIFY:
         {
             NMHDR* pHdr = (NMHDR*)lParam;
-            HWND hList = GetDlgItem(hWnd, IDC_ATTR_LIST);
-            HWND hHdr  = hList ? ListView_GetHeader(hList) : NULL;
-            if (hHdr && pHdr->hwndFrom == hHdr && pHdr->code == NM_CUSTOMDRAW)
-                return CDRF_DODEFAULT;   /* painted by AttrHeaderProc */
-            if (pHdr->idFrom == IDC_ATTR_LIST && pHdr->code == NM_CUSTOMDRAW)
-                return AttrListCustomDraw((NMLVCUSTOMDRAW*)lParam);
+            /* Status badge for col 6 only. Code comes from lItemlParam
+             * (set at fill time). Never LVM_GETITEM / CreateFont here. */
+            {
+                HWND hList = GetDlgItem(hWnd, IDC_ATTR_LIST);
+                HWND hHdr  = hList ? ListView_GetHeader(hList) : NULL;
+                if (hHdr && pHdr->hwndFrom == hHdr && pHdr->code == NM_CUSTOMDRAW) {
+                    NMCUSTOMDRAW* pCD = (NMCUSTOMDRAW*)lParam;
+                    if (pCD->dwDrawStage == CDDS_PREPAINT)
+                        return CDRF_NOTIFYITEMDRAW;
+                    if (pCD->dwDrawStage == CDDS_ITEMPREPAINT) {
+                        HDC hdc = pCD->hdc;
+                        HBRUSH hbr = CreateSolidBrush(CLR_HEADER);
+                        FillRect(hdc, &pCD->rc, hbr);
+                        DeleteObject(hbr);
+                        HPEN hp = CreatePen(PS_SOLID, 1, CLR_BORDER);
+                        HPEN hpOld = (HPEN)SelectObject(hdc, hp);
+                        MoveToEx(hdc, pCD->rc.left, pCD->rc.bottom - 1, NULL);
+                        LineTo(hdc, pCD->rc.right, pCD->rc.bottom - 1);
+                        SelectObject(hdc, hpOld);
+                        DeleteObject(hp);
+                        WCHAR wz[64];
+                        HDITEMW hi;
+                        ZeroMemory(&hi, sizeof(hi));
+                        hi.mask = HDI_TEXT;
+                        hi.pszText = wz;
+                        hi.cchTextMax = 64;
+                        SendMessageW(hHdr, HDM_GETITEMW, pCD->dwItemSpec, (LPARAM)&hi);
+                        SetBkMode(hdc, TRANSPARENT);
+                        SetTextColor(hdc, CLR_TEXT);
+                        RECT rcT = pCD->rc;
+                        HFONT hOldHdr = (HFONT)SelectObject(hdc, g_hFontSmall);
+                        rcT.left += UiScale(6);
+                        DrawTextW(hdc, wz, -1, &rcT,
+                                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                        SelectObject(hdc, hOldHdr);
+                        return CDRF_SKIPDEFAULT;
+                    }
+                    return CDRF_DODEFAULT;
+                }
+            }
+            if (pHdr->idFrom == IDC_ATTR_LIST && pHdr->code == NM_CUSTOMDRAW) {
+                NMLVCUSTOMDRAW* pCD = (NMLVCUSTOMDRAW*)lParam;
+                switch (pCD->nmcd.dwDrawStage) {
+                case CDDS_PREPAINT:
+                    return CDRF_NOTIFYITEMDRAW;
+                case CDDS_ITEMPREPAINT:
+                    pCD->clrTextBk = (pCD->nmcd.dwItemSpec % 2 == 0) ? CLR_ROW1 : CLR_ROW2;
+                    pCD->clrText   = CLR_TEXT;
+                    return CDRF_NOTIFYSUBITEMDRAW;
+                case CDDS_SUBITEM | CDDS_ITEMPREPAINT:
+                    {
+                        COLORREF clrRowBk = (pCD->nmcd.dwItemSpec % 2 == 0)
+                                            ? CLR_ROW1 : CLR_ROW2;
+                        pCD->clrTextBk = clrRowBk;
+                        pCD->clrText   = CLR_TEXT;
+                        if (pCD->iSubItem != ATTR_COL_STATUS)
+                            return CDRF_NEWFONT;
+
+                        int nSt = (int)(pCD->nmcd.lItemlParam & 0xFF);
+                        RECT rcCell = pCD->nmcd.rc;
+                        if (nSt == ATTRST_NONE || (rcCell.right - rcCell.left) < 8)
+                            return CDRF_DODEFAULT;
+
+                        COLORREF clrBadgeBg;
+                        const char* psz;
+                        int nAlt = (int)(pCD->nmcd.lItemlParam & 0x100);
+                        switch (nSt) {
+                        case ATTRST_BAD:
+                            clrBadgeBg = CLR_RED;
+                            psz = nAlt ? Tr(STR_ST_BAD) : Tr(STR_ST_FAIL);
+                            break;
+                        case ATTRST_WARN:
+                            clrBadgeBg = CLR_ORANGE;
+                            psz = nAlt ? Tr(STR_ST_HOT) : Tr(STR_ST_WARN);
+                            break;
+                        case ATTRST_RISK:
+                            clrBadgeBg = CLR_YELLOW;
+                            psz = Tr(STR_ST_RISK);
+                            break;
+                        case ATTRST_OK:
+                            clrBadgeBg = CLR_GREEN;
+                            psz = Tr(STR_ST_OK);
+                            break;
+                        case ATTRST_DIM:
+                            clrBadgeBg = RGB(148, 163, 184);
+                            psz = Tr(STR_ST_DIM);
+                            break;
+                        case ATTRST_SKIP:
+                            clrBadgeBg = RGB(148, 163, 184);
+                            psz = Tr(STR_ST_SKIP);
+                            break;
+                        case ATTRST_PAST:
+                            clrBadgeBg = RGB(100, 116, 139);
+                            psz = Tr(STR_ST_PAST);
+                            break;
+                        case ATTRST_INFO:
+                            clrBadgeBg = RGB(71, 99, 128);
+                            psz = Tr(STR_ST_INFO);
+                            break;
+                        case ATTRST_POWERLOG:
+                            clrBadgeBg = RGB(71, 99, 128);
+                            psz = Tr(STR_ST_POWERLOG);
+                            break;
+                        default:
+                            return CDRF_DODEFAULT;
+                        }
+
+                        HDC hdc = pCD->nmcd.hdc;
+                        HBRUSH hbrRow = CreateSolidBrush(clrRowBk);
+                        FillRect(hdc, &rcCell, hbrRow);
+                        DeleteObject(hbrRow);
+
+                        HFONT hOldFont = (HFONT)SelectObject(hdc, g_hFontSmall);
+                        WCHAR wz[40];
+                        if (nSt == ATTRST_INFO || nSt == ATTRST_POWERLOG) {
+                            LVITEMW li;
+                            ZeroMemory(&li, sizeof(li));
+                            li.mask = LVIF_TEXT;
+                            li.iItem = (int)pCD->nmcd.dwItemSpec;
+                            li.iSubItem = 6;
+                            li.pszText = wz;
+                            li.cchTextMax = 40;
+                            if (!SendMessageW(pCD->nmcd.hdr.hwndFrom, LVM_GETITEMW,
+                                              0, (LPARAM)&li) || !wz[0])
+                                U8ToW(psz, wz, 40);
+                        } else {
+                            U8ToW(psz, wz, 40);
+                        }
+                        SIZE sz;
+                        GetTextExtentPoint32W(hdc, wz, lstrlenW(wz), &sz);
+
+                        int badgeH  = sz.cy + UiScale(6);
+                        int badgeW  = sz.cx + UiScale((nSt == ATTRST_SKIP) ? 20 : 16);
+                        int cellCX  = rcCell.right  - rcCell.left;
+                        int cellCY  = rcCell.bottom - rcCell.top;
+                        int bx      = rcCell.left + (cellCX - badgeW) / 2;
+                        int by      = rcCell.top  + (cellCY - badgeH) / 2;
+                        RECT rcBadge = { bx, by, bx + badgeW, by + badgeH };
+
+                        HBRUSH hbrBadge = CreateSolidBrush(clrBadgeBg);
+                        HPEN   hpBorder = CreatePen(PS_SOLID, 1, clrBadgeBg);
+                        HBRUSH hbrOld   = (HBRUSH)SelectObject(hdc, hbrBadge);
+                        HPEN   hpOld    = (HPEN)SelectObject(hdc, hpBorder);
+                        RoundRect(hdc, rcBadge.left, rcBadge.top,
+                                       rcBadge.right, rcBadge.bottom,
+                                       UiScale(8), UiScale(8));
+                        SelectObject(hdc, hbrOld);
+                        SelectObject(hdc, hpOld);
+                        DeleteObject(hbrBadge);
+                        DeleteObject(hpBorder);
+
+                        SetBkMode(hdc, TRANSPARENT);
+                        SetTextColor(hdc, RGB(255, 255, 255));
+                        /* INFO and power-log share a color but not a label.
+                         * Paint the list text: psz for INFO is always «контекст». */
+                        if (nSt == ATTRST_INFO || nSt == ATTRST_POWERLOG)
+                            DrawTextW(hdc, wz, -1, &rcBadge,
+                                      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                        else
+                            DrawTextU8(hdc, psz, &rcBadge,
+                                       DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+                        SelectObject(hdc, hOldFont);
+                        return CDRF_SKIPDEFAULT;
+                    }
+                default:
+                    return CDRF_DODEFAULT;
+                }
+            }
         }
         return 0;
-
-    case WM_PAINT:
-        {
-            PAINTSTRUCT ps;
-            HDC hdcReal = BeginPaint(hWnd, &ps);
-            RECT rc;
-            GetClientRect(hWnd, &rc);
-            if (rc.right > 0 && rc.bottom > 0) {
-                HDC hdc = CreateCompatibleDC(hdcReal);
-                HBITMAP hbm = CreateCompatibleBitmap(hdcReal, rc.right, rc.bottom);
-                HBITMAP hbo = (HBITMAP)SelectObject(hdc, hbm);
-                PaintMainV2(hWnd, hdc, &rc);
-                BitBlt(hdcReal, ps.rcPaint.left, ps.rcPaint.top,
-                       ps.rcPaint.right - ps.rcPaint.left, ps.rcPaint.bottom - ps.rcPaint.top,
-                       hdc, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
-                SelectObject(hdc, hbo);
-                DeleteObject(hbm);
-                DeleteDC(hdc);
-            }
-            EndPaint(hWnd, &ps);
-        }
-        return 0;
-
-    case WM_DRAWITEM:
-        {
-            const DRAWITEMSTRUCT* di = (const DRAWITEMSTRUCT*)lParam;
-            if (di && di->CtlType == ODT_BUTTON) {
-                DrawActionButton(di);
-                return TRUE;
-            }
-        }
-        break;
-
-    case WM_SETTINGCHANGE:
-        if (lParam && lstrcmpiW((LPCWSTR)lParam, L"ImmersiveColorSet") == 0 &&
-            g_nThemePref == 0 && g_nThemeOverride == 0)
-            UiApplyThemeAll(hWnd);
-        break;
 
     case WM_DEVICECHANGE:
         if (wParam == DBT_DEVICEARRIVAL || wParam == DBT_DEVICEREMOVECOMPLETE) {
@@ -6066,15 +5269,6 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             else if (nCtrl == IDM_MONITOR) {
                 MonitorToggle(hWnd);
             }
-            else if (nCtrl == IDM_THEME_SYSTEM) {
-                UiSetThemePref(hWnd, 0);
-            }
-            else if (nCtrl == IDM_THEME_LIGHT) {
-                UiSetThemePref(hWnd, 1);
-            }
-            else if (nCtrl == IDM_THEME_DARK) {
-                UiSetThemePref(hWnd, 2);
-            }
         }
         return 0;
 
@@ -6153,6 +5347,7 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         return 0;
 
     case WM_DESTROY:
+        AttrColsSave(hWnd);
         UiSaveWindowPlace(hWnd);
         KillTimer(hWnd, IDT_HOTPLUG);
         KillTimer(hWnd, IDT_MONITOR);

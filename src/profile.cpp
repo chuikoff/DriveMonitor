@@ -148,7 +148,10 @@ static const PROF_ATTR kSamsungSsd[] = {
     PA(0, 0, 0)
 };
 
-/* Kingston A400 + the 7-character SM2258/SM2259 firmware only.
+/* SM2258/SM2259 map. a400-smi225 is Kingston A400 plus the 7-character
+ * firmware. kpss-smi225 is model KPSS120G2 plus that same shape
+ * (W0714A0). The shape alone does not select this table, and the model
+ * with another firmware (HT3618C1) does not either.
  * Apacer AS340/AS350 keep their own life counter (231). */
 static const PROF_ATTR kSmi225[] = {
     PN(0xA0, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Неисправимые ошибки", "Uncorrectable errors"),
@@ -262,6 +265,11 @@ static const DRIVE_PROFILE kProfiles[] = {
     { "smi-s225-fw", NULL, PROF_KIND_CONTROLLER, NULL, NULL, PROF_FW_SMI225,
       VENDOR_UNKNOWN, CONTROLLER_SMI, 0, 0, NULL, NULL, kSmi225, 0, NULL },
     { "a400-smi225", NULL, PROF_KIND_EXACT, "A400", NULL, PROF_FW_SMI225,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 0, 0,
+      "Silicon Motion SM2258/SM2259", NULL, kSmi225, 0, NULL },
+    /* KingPrice KPSS120G2 is sold with more than one controller.
+     * Only this model plus the SM2258 firmware shape takes kSmi225. */
+    { "kpss-smi225", NULL, PROF_KIND_EXACT, "KPSS120G2", NULL, PROF_FW_SMI225,
       VENDOR_UNKNOWN, CONTROLLER_SMI, 0, 0,
       "Silicon Motion SM2258/SM2259", NULL, kSmi225, 0, NULL },
     { "smi-ve", NULL, PROF_KIND_CONTROLLER, NULL, NULL, PROF_FW_VE,

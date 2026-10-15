@@ -6,16 +6,16 @@
 #define IDI_APPICON     101
 #define IDR_VERSION     1
 
-#define DRIVEMONITOR_VERSION         "3.0"
-#define DRIVEMONITOR_BUILD           0
-#define DRIVEMONITOR_BUILD_STR       "0"
-#define DRIVEMONITOR_FILEVERSION     3,0,0,0
-#define DRIVEMONITOR_FILEVERSION_STR "3.0-beta"
+#define DRIVEMONITOR_VERSION         "2.0"
+#define DRIVEMONITOR_BUILD           4
+#define DRIVEMONITOR_BUILD_STR       "4"
+#define DRIVEMONITOR_FILEVERSION     2,0,0,4
+#define DRIVEMONITOR_FILEVERSION_STR "2.0 beta 4"
 
 /* Tag that holds the source of the published GPL exe.
  * 1.7.23 is the stable release and is not this tag.
  * Change this when a newer GPL exe is published, to that tag. */
-#define DRIVEMONITOR_SOURCE_TAG "3.0-beta"
+#define DRIVEMONITOR_SOURCE_TAG "2.0-beta-4"
 #define DRIVEMONITOR_SOURCE_URL "https://github.com/chuikoff/DriveMonitor/tree/" DRIVEMONITOR_SOURCE_TAG
 
 #define IDC_ADAPTER_LABEL   1027

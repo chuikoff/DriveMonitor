@@ -287,6 +287,43 @@ static void TestFirmwareShape(void)
     Expect(!Lookup(0xA9, &sem, &enc), "brand does not invent A9");
 }
 
+/* KPSS120G2 is sold with more than one controller. The SM2258 map
+ * applies only together with the 7-character firmware shape. */
+static void TestKpssSmi225(void)
+{
+    int sem = 0, enc = 0;
+
+    Blank(DRIVE_TYPE_SSD_SATA, FALSE);
+    Name("KPSS120G2", "W0714A0");
+    Go();
+    ExpectId("kpss-smi225", 100, "KPSS120G2 W0714A0");
+    Expect(g.eController == CONTROLLER_SMI, "KPSS SMI");
+    Expect(strstr(g.szControllerChip, "SM2258") != NULL, "KPSS chip");
+    Expect(Lookup(0xA9, &sem, &enc) && sem == PROF_SEM_ENDURANCE &&
+           enc == PROF_ENC_PERCENT, "KPSS 169 life");
+    Expect(Lookup(0xA0, &sem, &enc) && sem == PROF_SEM_NONE, "KPSS 160 not media");
+    Expect(Lookup(0xC3, &sem, &enc) && sem == PROF_SEM_NONE, "KPSS 195 not scored");
+    Expect(Lookup(0xE8, &sem, &enc) && enc == PROF_ENC_PERCENT, "KPSS 232 spare");
+    Expect(Lookup(0xF1, &sem, &enc) && sem == PROF_SEM_HOST_WRITE &&
+           enc == PROF_ENC_BLOCK32, "KPSS 241 32 MiB");
+    Expect(Lookup(0xF5, &sem, &enc) && sem == PROF_SEM_NAND_WRITE &&
+           enc == PROF_ENC_BLOCK32, "KPSS 245 32 MiB");
+
+    Blank(DRIVE_TYPE_SSD_SATA, FALSE);
+    Name("KPSS120G2", "HT3618C1");
+    Go();
+    ExpectId("ata-generic", 50, "KPSS other firmware");
+    Expect(g.eController == CONTROLLER_UNKNOWN, "HT3618C1 is not SMI");
+    Expect(!Lookup(0xA9, &sem, &enc), "other firmware does not name 169");
+
+    Blank(DRIVE_TYPE_SSD_SATA, FALSE);
+    Name("OTHERSSD", "W0714A0");
+    Go();
+    ExpectId("ata-generic", 50, "W0714A0 alone");
+    Expect(g.eController == CONTROLLER_UNKNOWN, "firmware shape does not set SMI");
+    Expect(!Lookup(0xF1, &sem, &enc), "shape alone does not name 241");
+}
+
 static void TestRegister(void)
 {
     PROFILE_DEF a, b, w, extra;
@@ -767,6 +804,7 @@ int main(void)
     TestPriority();
     TestSameIdDifferentMeaning();
     TestFirmwareShape();
+    TestKpssSmi225();
     TestWriteVolume();
     TestRegister();
     TestDecodeAndUsb();
