@@ -33,8 +33,8 @@ static DWORD NvmeIdentQuality(const BYTE* p, DWORD n)
         q += 10;
     }
     if (n >= (NVME_IDENT_CCTEMP_OFF + 2)) {
-        wctemp = (WORD)p[NVME_IDENT_WCTEMP_OFF] |
-                 ((WORD)p[NVME_IDENT_WCTEMP_OFF + 1] << 8);
+        wctemp = (WORD)((WORD)p[NVME_IDENT_WCTEMP_OFF] |
+                        ((WORD)p[NVME_IDENT_WCTEMP_OFF + 1] << 8));
         if (wctemp >= 274 && wctemp <= 400) q += 100;
         q += 10;
     }
@@ -48,9 +48,9 @@ void FillNvmeTempThresholdsFromIdent(DRIVE_INFO* pInfo, DWORD nCopied)
     id = (const BYTE*)&pInfo->nvmeIdent;
     if (nCopied < (NVME_IDENT_CCTEMP_OFF + 2)) return;
     pInfo->wNVMeWarnTempThreshold =
-        (WORD)id[NVME_IDENT_WCTEMP_OFF] | ((WORD)id[NVME_IDENT_WCTEMP_OFF + 1] << 8);
+        (WORD)((WORD)id[NVME_IDENT_WCTEMP_OFF] | ((WORD)id[NVME_IDENT_WCTEMP_OFF + 1] << 8));
     pInfo->wNVMeCritTempThreshold =
-        (WORD)id[NVME_IDENT_CCTEMP_OFF] | ((WORD)id[NVME_IDENT_CCTEMP_OFF + 1] << 8);
+        (WORD)((WORD)id[NVME_IDENT_CCTEMP_OFF] | ((WORD)id[NVME_IDENT_CCTEMP_OFF + 1] << 8));
 }
 
 void FillNvmeProtocolFromIdent(DRIVE_INFO* pInfo)
@@ -493,7 +493,7 @@ static BOOL NvmeMiniportAdmin(HANDLE hDrive, DWORD cdw0, DWORD nsid, DWORD cdw10
     pt->SrbIoCtrl.HeaderLength = sizeof(MY_SRB_IO_CONTROL);
     memcpy(pt->SrbIoCtrl.Signature, "NvmeMini", 8);
     pt->SrbIoCtrl.Timeout = 40;
-    pt->SrbIoCtrl.ControlCode = NVME_PASS_THROUGH_SRB_IO_CODE;
+    pt->SrbIoCtrl.ControlCode = (ULONG)NVME_PASS_THROUGH_SRB_IO_CODE;
     pt->SrbIoCtrl.Length = sizeof(MY_NVME_PT) - sizeof(MY_SRB_IO_CONTROL);
     pt->Direction = 2;
     pt->DataBufferLen = 4096;
@@ -535,7 +535,7 @@ static BOOL NvmeIntelRstAdmin(HANDLE hDrive, DWORD opcode, DWORD nsid, DWORD cdw
     pt->SRB.HeaderLength = sizeof(MY_SRB_IO_CONTROL);
     memcpy(pt->SRB.Signature, "IntelNvm", 8);
     pt->SRB.Timeout = 10;
-    pt->SRB.ControlCode = IOCTL_INTEL_NVME_PASS_THROUGH;
+    pt->SRB.ControlCode = (ULONG)IOCTL_INTEL_NVME_PASS_THROUGH;
     pt->SRB.Length = sizeof(MY_INTEL_NVME_PT) - sizeof(MY_SRB_IO_CONTROL);
     pt->Version = 1;
     pt->PathId = addr.PathId;

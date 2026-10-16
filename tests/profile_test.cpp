@@ -87,60 +87,60 @@ static void ExpectId(const char* id, int score, const char* msg)
 
 static const PROF_ATTR kLifeA[] = {
     { 0xE7, PROF_SEM_ENDURANCE, PROF_ENC_PERCENT, 0, "A life", "A life", NULL, NULL,
-      0, 0, 0, 0, 0, 0, 0 },
-    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0 }
+      0, 0, 0, 0, 0, 0, 0, 0 },
+    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0 }
 };
 static const PROF_ATTR kLifeB[] = {
     { 0xE7, PROF_SEM_WEAR, PROF_ENC_COUNTER, 0, "B wear", "B wear", NULL, NULL,
-      0, 0, 0, 0, 0, 0, 0 },
-    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0 }
+      0, 0, 0, 0, 0, 0, 0, 0 },
+    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0 }
 };
 static const PROF_ATTR kLifeAgree[] = {
     { 0xE7, PROF_SEM_ENDURANCE, PROF_ENC_PERCENT, 0, "Same", "Same", NULL, NULL,
-      0, 0, 0, 0, 0, 0, 0 },
-    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0 }
+      0, 0, 0, 0, 0, 0, 0, 0 },
+    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0 }
 };
 static const PROF_ATTR kWidget[] = {
     { 0xE7, PROF_SEM_ENDURANCE, PROF_ENC_PERCENT, 0, "Widget life", "Widget life", NULL, NULL,
-      0, 0, 0, 0, 0, 0, 0 },
+      0, 0, 0, 0, 0, 0, 0, 0 },
     { 0x11, PROF_SEM_MEDIA, PROF_ENC_COUNTER, 0, "Widget media", "Widget media", NULL, NULL,
-      0, 0, 0, 0, 0, 0, 0 },
-    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0 }
+      0, 0, 0, 0, 0, 0, 0, 0 },
+    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0 }
 };
 static const PROF_ATTR kSpecLong[] = {
     { 0x11, PROF_SEM_MEDIA, PROF_ENC_COUNTER, 0, "Long media", "Long media", NULL, NULL,
-      0, 0, 0, 0, 0, 0, 0 },
-    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0 }
+      0, 0, 0, 0, 0, 0, 0, 0 },
+    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0 }
 };
 static const PROF_ATTR kSpecShort[] = {
     { 0x11, PROF_SEM_WEAR, PROF_ENC_COUNTER, 0, "Short wear", "Short wear", NULL, NULL,
-      0, 0, 0, 0, 0, 0, 0 },
-    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0 }
+      0, 0, 0, 0, 0, 0, 0, 0 },
+    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0 }
 };
 static const PROF_ATTR kCoverMedia[] = {
     { 0x11, PROF_SEM_MEDIA, PROF_ENC_COUNTER, 0, "Cover media", "Cover media", NULL, NULL,
-      0, 0, 0, 0, 0, 0, 0 },
-    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0 }
+      0, 0, 0, 0, 0, 0, 0, 0 },
+    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0 }
 };
 static const PROF_ATTR kCoverWear[] = {
     { 0x11, PROF_SEM_WEAR, PROF_ENC_COUNTER, 0, "Cover wear", "Cover wear", NULL, NULL,
-      0, 0, 0, 0, 0, 0, 0 },
-    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0 }
+      0, 0, 0, 0, 0, 0, 0, 0 },
+    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0 }
 };
 static const PROF_ATTR kCoverSame[] = {
     { 0x11, PROF_SEM_MEDIA, PROF_ENC_COUNTER, 0, "Cover same", "Cover same", NULL, NULL,
-      0, 0, 0, 0, 2, 0, 0 },
-    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0 }
+      0, 0, 0, 0, 2, 0, 0, 0 },
+    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0 }
 };
 static const PROF_ATTR kPrefHi[] = {
     { 0x42, PROF_SEM_ENDURANCE, PROF_ENC_VALUE, 0, "Hi", "Hi", NULL, NULL,
       0, 0, 0, 0, 0, 0, 0, 1 },
-    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0 }
+    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0 }
 };
 static const PROF_ATTR kPrefLo[] = {
     { 0x42, PROF_SEM_ENDURANCE, PROF_ENC_VALUE, 0, "Lo", "Lo", NULL, NULL,
       0, 0, 0, 0, 0, 0, 0, 0 },
-    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0 }
+    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0 }
 };
 
 static void DefExact(PROFILE_DEF* d, const char* id, const char* model,
@@ -616,13 +616,13 @@ static void TestDecodeAndUsb(void)
 
 static const PROF_ATTR kRankBad[] = {
     { 0x11, PROF_SEM_MEDIA, PROF_ENC_COUNTER, 0, "Bad", "Bad", NULL, NULL,
-      PROF_RULE_WORSE, PROF_SLOT_NONE, PROF_SCOPE_ANY, 0, 1, 1, 0 },
-    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0 }
+      PROF_RULE_WORSE, PROF_SLOT_NONE, PROF_SCOPE_ANY, 0, 1, 1, 0, 0 },
+    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0 }
 };
 static const PROF_ATTR kRankCau[] = {
     { 0x11, PROF_SEM_MEDIA, PROF_ENC_COUNTER, 0, "Cau", "Cau", NULL, NULL,
-      PROF_RULE_WORSE, PROF_SLOT_NONE, PROF_SCOPE_ANY, 0, 1, 0, 0 },
-    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0 }
+      PROF_RULE_WORSE, PROF_SLOT_NONE, PROF_SCOPE_ANY, 0, 1, 0, 0, 0 },
+    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0 }
 };
 
 static void TestHealthRule(void)

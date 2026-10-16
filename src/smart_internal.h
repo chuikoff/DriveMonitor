@@ -194,7 +194,7 @@ static inline BOOL IsBufferAllFF(const BYTE* p, int nLen)
 
 static inline WORD ReadLE16(const BYTE* p)
 {
-    return (WORD)p[0] | ((WORD)p[1] << 8);
+    return (WORD)((WORD)p[0] | ((WORD)p[1] << 8));
 }
 
 static inline DWORD ReadLE32(const BYTE* p)
@@ -225,7 +225,7 @@ static inline unsigned __int64 IdentLba48(const WORD* pIdent)
 
 static inline WORD GetRawValue16Lo(const BYTE* pRaw)
 {
-    return ((WORD)pRaw[1] << 8) | (WORD)pRaw[0];
+    return (WORD)(((WORD)pRaw[1] << 8) | (WORD)pRaw[0]);
 }
 
 static inline const SMART_ATTRIBUTE* FindAttr(const DRIVE_INFO* pInfo, BYTE id)

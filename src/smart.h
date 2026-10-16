@@ -867,7 +867,7 @@ typedef struct _PROF_ATTR {
     unsigned short caution;
     unsigned short bad;       /* both HDD and SSD; 0 = off */
     unsigned short badHdd;    /* HDD only; 0 = off */
-    unsigned char pref = 0;  /* higher wins among one semantic; 0 is normal */
+    unsigned char pref;      /* higher wins among one semantic; 0 is normal */
 } PROF_ATTR;
 
 /* Normalized channel rule for one attribute. rule is OFF or WORSE. */

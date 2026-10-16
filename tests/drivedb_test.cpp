@@ -900,10 +900,10 @@ static int CellKind(BYTE id)
  * an id: z54z10 prints the two 24-bit fields of that order. */
 static const PROF_ATTR kWidgetPack[] = {
     { 0x42, PROF_SEM_NONE, PROF_ENC_PACKED, 0, "Packed", "Packed",
-      NULL, NULL, 0, 0, 0, 0, 0, 0, 0 },
+      NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0 },
     { 0x43, PROF_SEM_NONE, PROF_ENC_PAIR, 0, "Pair", "Pair",
-      NULL, NULL, 0, 0, 0, 0, 0, 0, 0 },
-    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0 }
+      NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0 }
 };
 
 static void TestPackedCell(void)
@@ -1054,8 +1054,8 @@ static void TestIntelIndicators(void)
  * says so. No new case in ExtractSSDIndicators. */
 static const PROF_ATTR kWidgetLife[] = {
     { 0x42, PROF_SEM_ENDURANCE, PROF_ENC_VALUE, 0, "Widget life", "Widget life",
-      NULL, NULL, 0, 0, 0, 0, 0, 0, 0 },
-    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0 }
+      NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0 }
 };
 
 static void TestWidgetLife(void)

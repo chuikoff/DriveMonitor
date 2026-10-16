@@ -3123,13 +3123,16 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
 
 /* Host or NAND writes with a named unit. A wear percent stays out. */
 static int WriteVolumeGiB(const DRIVE_INFO* p, BYTE id,
-                          unsigned __int64 nRaw, unsigned __int64* nGiB)
+                          unsigned __int64 nRaw, unsigned __int64* nGiB,
+                          int* pSem = NULL)
 {
     int sem = PROF_SEM_NONE, enc = PROF_ENC_NONE;
+    if (pSem) *pSem = PROF_SEM_NONE;
     if (!nGiB) return 0;
     *nGiB = 0;
     if (!p || !ProfileLookup(p, id, &sem, &enc) || !ProfileWriteVolume(sem, enc))
         return 0;
+    if (pSem) *pSem = sem;
     if (enc == PROF_ENC_BLOCK32)
         *nGiB = Smi225xHostGiB(nRaw);
     else if (enc == PROF_ENC_SCALE &&
@@ -3286,13 +3289,18 @@ void ExtractSSDIndicators(DRIVE_INFO* pInfo)
     for (i = 0; i < 30; i++) {
         SMART_ATTRIBUTE* a = &pInfo->attrData.stAttributes[i];
         unsigned __int64 nGiB = 0;
+        int sem = PROF_SEM_NONE;
         if (a->bAttrID == 0) continue;
-        if (pInfo->nSSDTotalWritesGB >= 0) break;
         if (!WriteVolumeGiB(pInfo, a->bAttrID,
-                            GetRawValue48(a->bRawValue), &nGiB))
+                            GetRawValue48(a->bRawValue), &nGiB, &sem))
             continue;
         if (nGiB > 4000000ULL) nGiB = 4000000ULL;
-        pInfo->nSSDTotalWritesGB = (int)nGiB;
+        if (sem == PROF_SEM_HOST_WRITE) {
+            pInfo->nSSDTotalWritesGB = (int)nGiB;
+            break;
+        }
+        if (pInfo->nSSDTotalWritesGB < 0)
+            pInfo->nSSDTotalWritesGB = (int)nGiB;
     }
 }
 

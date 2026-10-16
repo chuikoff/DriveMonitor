@@ -12,19 +12,19 @@ void FillAtaProtocolFromIdent(DRIVE_INFO* pInfo, const WORD* pIdent)
      * Use word 76 (supported) for the disk, prefix USB later. */
     neg = pInfo->bIsUSB ? 0 : (unsigned)((w77 >> 1) & 0x7);
     if (neg == 3)
-        safe_snprintf(pInfo->szProtocol, TN("SATA 6 Гбит/с", "SATA 6 Gb/s"));
+        safe_snprintf(pInfo->szProtocol, "%s", TN("SATA 6 Гбит/с", "SATA 6 Gb/s"));
     else if (neg == 2)
-        safe_snprintf(pInfo->szProtocol, TN("SATA 3 Гбит/с", "SATA 3 Gb/s"));
+        safe_snprintf(pInfo->szProtocol, "%s", TN("SATA 3 Гбит/с", "SATA 3 Gb/s"));
     else if (neg == 1)
-        safe_snprintf(pInfo->szProtocol, TN("SATA 1.5 Гбит/с", "SATA 1.5 Gb/s"));
+        safe_snprintf(pInfo->szProtocol, "%s", TN("SATA 1.5 Гбит/с", "SATA 1.5 Gb/s"));
     else if (w76 != 0 && w76 != 0xFFFF) {
         /* Word 76: bit1=1.5, bit2=3.0, bit3=6.0 Gb/s supported. */
         if (w76 & 0x0008)
-            safe_snprintf(pInfo->szProtocol, TN("SATA 6 Гбит/с", "SATA 6 Gb/s"));
+            safe_snprintf(pInfo->szProtocol, "%s", TN("SATA 6 Гбит/с", "SATA 6 Gb/s"));
         else if (w76 & 0x0004)
-            safe_snprintf(pInfo->szProtocol, TN("SATA 3 Гбит/с", "SATA 3 Gb/s"));
+            safe_snprintf(pInfo->szProtocol, "%s", TN("SATA 3 Гбит/с", "SATA 3 Gb/s"));
         else if (w76 & 0x0002)
-            safe_snprintf(pInfo->szProtocol, TN("SATA 1.5 Гбит/с", "SATA 1.5 Gb/s"));
+            safe_snprintf(pInfo->szProtocol, "%s", TN("SATA 1.5 Гбит/с", "SATA 1.5 Gb/s"));
         else
             safe_snprintf(pInfo->szProtocol, "SATA");
     } else {
@@ -53,6 +53,7 @@ void SwapATAString(char* szDst, const WORD* pSrc, int nWords)
 BOOL EnableSMART(HANDLE hDrive, int nDrive)
 {
     SENDCMDINPARAMS cip;
+    (void)nDrive;
     if (!DriveAllowsAtaIoctl(hDrive)) return FALSE;
     SENDCMDOUTPARAMS cop;
     DWORD dwBytes = 0;
@@ -78,6 +79,7 @@ BOOL EnableSMART(HANDLE hDrive, int nDrive)
 BOOL GetIdentifyData(HANDLE hDrive, int nDrive, DRIVE_INFO* pInfo)
 {
     BYTE inBuf[sizeof(SENDCMDINPARAMS) - 1 + IDENTIFY_BUFFER_SIZE];
+    (void)nDrive;
     if (!DriveAllowsAtaIoctl(hDrive)) return FALSE;
     BYTE outBuf[sizeof(SENDCMDOUTPARAMS) - 1 + IDENTIFY_BUFFER_SIZE];
     DWORD dwBytes = 0;
@@ -132,6 +134,7 @@ BOOL GetIdentifyData(HANDLE hDrive, int nDrive, DRIVE_INFO* pInfo)
 BOOL GetSMARTAttributes(HANDLE hDrive, int nDrive, DRIVE_INFO* pInfo)
 {
     BYTE inBuf[sizeof(SENDCMDINPARAMS) - 1];
+    (void)nDrive;
     if (!DriveAllowsAtaIoctl(hDrive)) return FALSE;
     BYTE outBuf[sizeof(SENDCMDOUTPARAMS) - 1 + READ_ATTRIBUTE_BUFFER_SIZE];
     DWORD dwBytes = 0;
@@ -161,6 +164,7 @@ BOOL GetSMARTAttributes(HANDLE hDrive, int nDrive, DRIVE_INFO* pInfo)
 BOOL GetSMARTThresholds(HANDLE hDrive, int nDrive, DRIVE_INFO* pInfo)
 {
     BYTE inBuf[sizeof(SENDCMDINPARAMS) - 1];
+    (void)nDrive;
     if (!DriveAllowsAtaIoctl(hDrive)) return FALSE;
     BYTE outBuf[sizeof(SENDCMDOUTPARAMS) - 1 + READ_THRESHOLD_BUFFER_SIZE];
     DWORD dwBytes = 0;
@@ -201,6 +205,7 @@ BOOL GetSMARTPredictFailure(HANDLE hDrive, int nDrive, BOOL* pbFail)
     SENDCMDINPARAMS cip;
     MY_OUTPARAMS    cop;
     DWORD dwBytes = 0;
+    (void)nDrive;
     if (!DriveAllowsAtaIoctl(hDrive)) return FALSE;
     ZeroMemory(&cip, sizeof(cip));
     ZeroMemory(&cop, sizeof(cop));
@@ -236,6 +241,7 @@ static BOOL ReadSMARTLog(HANDLE hDrive, int nDrive, BYTE bLogAddr,
                          BYTE* pOutBuf, DWORD dwBufSize)
 {
     BYTE inBuf[sizeof(SENDCMDINPARAMS) - 1];
+    (void)nDrive;
     if (!DriveAllowsAtaIoctl(hDrive)) return FALSE;
     BYTE outBuf[sizeof(SENDCMDOUTPARAMS) - 1 + 512];
     DWORD dwBytes = 0;
@@ -704,7 +710,7 @@ int FillSmartData(DRIVE_INFO* pInfo, const BYTE* pRawBuf)
     }
     pInfo->bSmartDataInvalid = FALSE;
     ZeroMemory(&pInfo->attrData, sizeof(SMART_ATTRIBUTE_DATA));
-    pInfo->attrData.wRevisionNumber = (WORD)pRawBuf[0] | ((WORD)pRawBuf[1] << 8);
+    pInfo->attrData.wRevisionNumber = (WORD)((WORD)pRawBuf[0] | ((WORD)pRawBuf[1] << 8));
 
     for (i = 0; i < 30; i++) {
         const BYTE* pEntry = pRawBuf + 2 + i * 12;
@@ -714,7 +720,7 @@ int FillSmartData(DRIVE_INFO* pInfo, const BYTE* pRawBuf)
         /* ATA 12-byte attr: ID, flags[1..2], value, worst, raw[5..10], reserved[11]. */
         SMART_ATTRIBUTE* pA = &pInfo->attrData.stAttributes[nCount];
         pA->bAttrID      = bID;
-        pA->wStatusFlags = (WORD)pEntry[1] | ((WORD)pEntry[2] << 8);
+        pA->wStatusFlags = (WORD)((WORD)pEntry[1] | ((WORD)pEntry[2] << 8));
         pA->bAttrValue   = pEntry[3];
         pA->bWorstValue  = pEntry[4];
         memcpy(pA->bRawValue, &pEntry[5], 6);
@@ -738,7 +744,7 @@ int FillSmartThreshold(DRIVE_INFO* pInfo, const BYTE* pRawBuf)
     int nCount = 0;
     int i, j;
     ZeroMemory(&pInfo->threshData, sizeof(SMART_THRESHOLD_DATA));
-    pInfo->threshData.wRevisionNumber = (WORD)pRawBuf[0] | ((WORD)pRawBuf[1] << 8);
+    pInfo->threshData.wRevisionNumber = (WORD)((WORD)pRawBuf[0] | ((WORD)pRawBuf[1] << 8));
 
     for (i = 0; i < 30; i++) {
         const BYTE* pEntry = pRawBuf + 2 + i * 12;

@@ -4785,6 +4785,7 @@ void CreateControls(HWND hWnd)
 static LRESULT HandleCtlColor(HWND hWnd, WPARAM wParam)
 {
     HDC  hdc     = (HDC)wParam;
+    (void)hWnd;
 
     HWND hSender = WindowFromDC(hdc);
     if (hSender) {
