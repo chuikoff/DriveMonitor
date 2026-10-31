@@ -290,10 +290,18 @@ static int NameHintEnc(const char* fmt)
     return RawFormatComposite(fmt) ? PROF_ENC_PACKED : PROF_ENC_COUNTER;
 }
 
+/* raw16 and raw16:order are one 16-bit field. raw16(raw16) and
+ * raw16(avg16) pack more than that and stay composite. */
+static int FmtIsPlainRaw16(const char* fmt)
+{
+    if (!fmt || strncmp(fmt, "raw16", 5) != 0) return 0;
+    return fmt[5] == '\0' || fmt[5] == ':';
+}
+
 static void MapAttr(const char* fmt, const char* name, int* sem, int* enc)
 {
     char low[44];
-    bool write, read, nand, life;
+    bool write, read, nand;
     *sem = PROF_SEM_NONE;
     *enc = PROF_ENC_COUNTER;
     if (!name || !name[0]) {
@@ -330,21 +338,18 @@ static void MapAttr(const char* fmt, const char* name, int* sem, int* enc)
         else if (write) *sem = PROF_SEM_HOST_WRITE;
         return;
     }
-    life = HasCI(low, "percent_lifetime_remain") ||
-           HasCI(low, "remaining_lifetime") ||
-           HasCI(low, "lifetime_left") ||
-           HasCI(low, "life_left") ||
-           HasCI(low, "remaining_life");
-    if (life && !HasCI(low, "used") && !HasCI(low, "consumed")) {
-        *sem = PROF_SEM_ENDURANCE;
-        *enc = PROF_ENC_PERCENT;
-        return;
-    }
+    /* A life-left name is not a percent. Value 85 and RAW 15 are not
+     * one figure, and neither becomes endurance until a local profile
+     * says PERCENT or VALUE. The label still shows. */
     if ((HasCI(low, "erase_count") || HasCI(low, "erase_ct")) &&
         !HasCI(low, "fail")) {
         *sem = PROF_SEM_ERASE;
-        *enc = (fmt && strstr(fmt, "avg16") != NULL)
-            ? PROF_ENC_MAXAVG : PROF_ENC_COUNTER;
+        if (fmt && strstr(fmt, "avg16") != NULL)
+            *enc = PROF_ENC_MAXAVG;
+        else if (FmtIsPlainRaw16(fmt))
+            *enc = PROF_ENC_LO16;
+        else
+            *enc = PROF_ENC_COUNTER;
         return;
     }
     if (HasCI(low, "wear")) {
@@ -363,6 +368,12 @@ static void MapAttr(const char* fmt, const char* name, int* sem, int* enc)
         *enc = NameHintEnc(fmt);
         return;
     }
+    if (HasCI(low, "protect_mode") || HasCI(low, "protectmode") ||
+        HasCI(low, "write_protect") || HasCI(low, "writeprotect")) {
+        *sem = PROF_SEM_MEDIA;
+        *enc = PROF_ENC_COUNTER;
+        return;
+    }
     /* A raw format is still a decode. Health scoring ignores sem NONE.
      * Unknown_* stays unnamed in GetAttrDecode; the encoding is only
      * used when the name itself is a real label. */
@@ -373,6 +384,8 @@ static void MapAttr(const char* fmt, const char* name, int* sem, int* enc)
         *enc = PROF_ENC_PAIR;
     else if (RawFormatComposite(fmt))
         *enc = PROF_ENC_PACKED;
+    else if (FmtIsPlainRaw16(fmt))
+        *enc = PROF_ENC_LO16;
     else if (strncmp(fmt ? fmt : "", "raw", 3) == 0)
         *enc = PROF_ENC_COUNTER;
     else

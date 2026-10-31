@@ -8,7 +8,8 @@
 #include "resource.h"
 
 #define DRIVEMONITOR_WNDCLASS L"DriveMonitorMainWnd"
-#define MAX_DRIVES 8
+/* Slots kept for the scan. The left column scrolls when they do not fit. */
+#define MAX_DRIVES 32
 
 #define IDC_DRIVE_LIST       1001
 #define IDC_HEALTH_STATIC    1002
@@ -34,12 +35,14 @@
 #define IDC_REREAD_BTN         1026
 #define IDC_REPORT_BTN         1035
 #define IDC_EJECT_BTN          1039
+#define IDC_LATENCY_BTN        1050
 #define IDC_MONITOR_STATIC   1048
 #define IDC_DRIVE_BTN_BASE   1100
 #define IDM_ABOUT            2001
 #define IDM_EXIT             2002
 #define IDM_REPORT           2003
 #define IDM_SCREENSHOT       2004
+#define IDM_COPY_REPORT      2005
 #define IDM_DONATE           2006
 #define IDM_EJECT            2007
 #define IDM_ZOOM_IN          2010
@@ -52,6 +55,22 @@
 #define IDM_LANG_RU          2020
 #define IDM_LANG_EN          2021
 #define IDM_MONITOR          2022
+#define IDM_MONITOR_1M       2023
+#define IDM_MONITOR_5M       2024
+#define IDM_MONITOR_15M      2025
+#define IDM_MONITOR_30M      2026
+#define IDM_MONITOR_1H       2027
+#define IDM_COPY_ROW         2030
+#define IDM_COPY_RAW         2031
+#define IDM_COPY_DECODE      2032
+#define IDM_COPY_RAW_DECODE  2033
+#define IDM_COPY_TABLE_TSV   2034
+#define IDM_COPY_TABLE_MD    2035
+#define IDM_COPY_SERIAL      2036
+#define IDM_COPY_SUMMARY     2037
+#define IDM_LATENCY_TEST     2040
+#define IDM_FULL_READ_TEST   2041
+#define IDM_DRAM_VERIFY      2042
 #define IDT_HOTPLUG          3002
 #define IDT_MONITOR          3003
 #define WM_APP_REFRESH_DONE  (WM_APP + 1)
@@ -103,12 +122,18 @@ void    CreateControls(HWND hWnd);
 void    CreateGDIObjects(void);
 void    DestroyGDIObjects(void);
 void    RefreshData(HWND hWnd);
+void    RefreshDataEx(HWND hWnd, BOOL bBackground);
 void    UpdateDriveButtons(HWND hWnd);
 void    UpdateDriveInfo(HWND hWnd, int nDrive);
 void    UpdateAttrList(HWND hWnd, int nDrive);
 void    PaintMain(HWND hWnd, HDC hdc);
 void    ShowAboutDialog(HWND hWnd);
 void    ShowHealthLectureDialog(HWND hParent);
+void    ShowLatencyProbeDialog(HWND hParent, int nDriveIndex);
+void    ShowLatencyProbeDialogEx(HWND hParent, int nDriveIndex, int initialMode);
+void    ShowDramVerifyDialog(HWND hParent, int nDriveIndex);
+/* Wheel over the drive column scrolls that column. Other targets keep the message. */
+BOOL    DrivePanelOnMouseWheel(const MSG* msg);
 COLORREF GetHealthStatusColor(DRIVE_HEALTH_STATUS eStatus);
 int     UiScale(int px);
 void    UiInitScale(void);

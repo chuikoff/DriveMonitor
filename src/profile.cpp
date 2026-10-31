@@ -99,6 +99,10 @@ static const PROF_ATTR kAtaGeneric[] = {
 };
 
 static const PROF_ATTR kPhison[] = {
+    PN(0x94, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Всего стираний SLC", "Total SLC erase count"),
+    PN(0x95, PROF_SEM_NONE,       PROF_ENC_MAX,     "Макс. стираний SLC", "Max SLC erase count"),
+    PN(0x96, PROF_SEM_NONE,       PROF_ENC_MIN,     "Мин. стираний SLC", "Min SLC erase count"),
+    PN(0x97, PROF_SEM_NONE,       PROF_ENC_AVG,     "Среднее стираний SLC", "Average SLC erase count"),
     PN(0xA0, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Внезапные выключения", "Unsafe shutdowns"),
     /* Remaining spare is not a defect count. */
     PHN(0xA1, PROF_SEM_MEDIA, PROF_ENC_COUNTER,
@@ -117,6 +121,9 @@ static const PROF_ATTR kPhison[] = {
     PN(0xB2, PROF_SEM_MEDIA,      PROF_ENC_COUNTER, "Резервные блоки (использовано)", "Used spare blocks"),
     PN(0xB5, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Ошибки программирования (всего)", "Program fail count"),
     PN(0xB6, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Ошибки стирания (всего)", "Erase fail count"),
+    PHN(0xBB, PROF_SEM_MEDIA, PROF_ENC_COUNTER,
+        "Неисправимые ошибки ECC", "Uncorrectable ECC errors",
+        PROF_RULE_WORSE, PROF_SLOT_REPORTED, PROF_SCOPE_ANY, 0, 1, 100, 0),
     PN(0xC0, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Аварийные отключения питания", "Unsafe power-off events"),
     PN(0xC3, PROF_SEM_NONE,       PROF_ENC_NONE,    "ECC (вендор)", "ECC (vendor)"),
     /* 245 is a NAND counter when 165 is present. Otherwise the name is max erase. */
@@ -188,7 +195,8 @@ static const PROF_ATTR kSmi225[] = {
 /* KingSpec P3-* with SN firmware. 231 Value is life remaining.
  * 169 is a bad-block pair, not endurance. 241/242 are already GiB. */
 static const PROF_ATTR kMaxioSata[] = {
-    PN(0xA7, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Режим защиты", "Protect mode"),
+    PHN(0xA7, PROF_SEM_MEDIA,       PROF_ENC_COUNTER, "Режим защиты", "Protect mode",
+        PROF_RULE_WORSE, PROF_SLOT_PROTECT, PROF_SCOPE_ANY, 0, 0, 1, 0),
     PN(0xA8, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Ошибки SATA PHY", "SATA PHY errors"),
     PN(0xA9, PROF_SEM_NONE,       PROF_ENC_PAIR,    "Плохие блоки", "Bad blocks"),
     PN(0xAD, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Стирания", "Erase count"),
@@ -198,6 +206,64 @@ static const PROF_ATTR kMaxioSata[] = {
     PN(0xE7, PROF_SEM_ENDURANCE,  PROF_ENC_VALUE,   "Остаток ресурса SSD", "SSD life remaining"),
     PN(0xF1, PROF_SEM_HOST_WRITE, PROF_ENC_GIB,     "Записано хостом (ГиБ)", "Host written (GiB)"),
     PN(0xF2, PROF_SEM_HOST_READ,  PROF_ENC_GIB,     "Прочитано хостом (ГиБ)", "Host read (GiB)"),
+    PA(0, 0, 0)
+};
+
+/* Realtek SATA SSD (RTS5732DL, RTS5733, etc.) */
+static const PROF_ATTR kRealtekSata[] = {
+    PN(0x01, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Частота ошибок чтения", "Raw read error rate"),
+    PH(0x05, PROF_SEM_MEDIA,      PROF_ENC_LO16,    PROF_RULE_WORSE,
+       PROF_SLOT_REALLOC, PROF_SCOPE_ANY, 0, 1, 0, 10),
+    PN(0x09, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Часы работы", "Power-on hours"),
+    PN(0x0C, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Число включений", "Power cycles"),
+    PN(0xA5, PROF_SEM_ERASE,      PROF_ENC_MAX,     "Макс. стираний", "Max erase count"),
+    PN(0xA6, PROF_SEM_ERASE,      PROF_ENC_MIN,     "Мин. стираний", "Min erase count"),
+    PN(0xA7, PROF_SEM_ERASE,      PROF_ENC_AVG,     "Среднее стираний", "Average erase count"),
+    PN(0xA8, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Макс. стираний по спецификации", "Specified max erase count"),
+    PN(0xA9, PROF_SEM_ENDURANCE,  PROF_ENC_PERCENT, "Остаток ресурса SSD", "SSD life remaining"),
+    PN(0xAB, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Ошибки программирования", "Program fail count"),
+    PN(0xAC, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Ошибки стирания", "Erase fail count"),
+    PN(0xB1, PROF_SEM_WEAR,       PROF_ENC_COUNTER, "Выравнивание износа", "Wear leveling count"),
+    PN(0xB2, PROF_SEM_MEDIA,      PROF_ENC_COUNTER, "Сбойные блоки в работе", "Runtime invalid blocks"),
+    PN(0xC2, PROF_SEM_THERMAL,    PROF_ENC_COUNTER, "Температура", "Temperature"),
+    PHN(0xC7, PROF_SEM_INTERFACE, PROF_ENC_COUNTER,
+        "Ошибки CRC", "CRC errors",
+        PROF_RULE_WORSE, PROF_SLOT_CRC, PROF_SCOPE_ANY, 0, 1, 100, 0),
+    PN(0xE8, PROF_SEM_NONE,       PROF_ENC_PERCENT, "Резервное пространство", "Available reserved space"),
+    PN(0xF1, PROF_SEM_HOST_WRITE, PROF_ENC_GIB,     "Записано хостом (ГиБ)", "Host written (GiB)"),
+    PN(0xF2, PROF_SEM_HOST_READ,  PROF_ENC_GIB,     "Прочитано хостом (ГиБ)", "Host read (GiB)"),
+    PA(0, 0, 0)
+};
+
+/* Yeestor SATA SSD (YS9082HC/HP, YS9083XT) */
+static const PROF_ATTR kYeestorSata[] = {
+    PN(0x01, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Частота ошибок чтения", "Raw read error rate"),
+    PH(0x05, PROF_SEM_MEDIA,      PROF_ENC_LO16,    PROF_RULE_WORSE,
+       PROF_SLOT_REALLOC, PROF_SCOPE_ANY, 0, 1, 0, 10),
+    PN(0x09, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Часы работы", "Power-on hours"),
+    PN(0x0C, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Число включений", "Power cycles"),
+    PN(0xA0, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Неисправимые секторы", "Uncorrectable sectors"),
+    PN(0xA1, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Годные резервные блоки", "Valid spare blocks"),
+    PN(0xA3, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Начальные плохие блоки", "Initial bad blocks"),
+    PN(0xA4, PROF_SEM_ERASE,      PROF_ENC_COUNTER, "Всего стираний", "Total erase count"),
+    PN(0xA5, PROF_SEM_ERASE,      PROF_ENC_MAX,     "Макс. стираний", "Max erase count"),
+    PN(0xA6, PROF_SEM_ERASE,      PROF_ENC_MIN,     "Мин. стираний", "Min erase count"),
+    PN(0xA7, PROF_SEM_ERASE,      PROF_ENC_AVG,     "Среднее стираний", "Average erase count"),
+    PN(0xA8, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Макс. стираний по спецификации", "Specified max erase count"),
+    PN(0xA9, PROF_SEM_ENDURANCE,  PROF_ENC_PERCENT, "Остаток ресурса SSD", "SSD life remaining"),
+    PN(0xAF, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Ошибки программирования", "Program fail count"),
+    PN(0xB0, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Ошибки стирания", "Erase fail count"),
+    PN(0xB1, PROF_SEM_WEAR,       PROF_ENC_COUNTER, "Выравнивание износа", "Wear leveling delta"),
+    PN(0xB2, PROF_SEM_MEDIA,      PROF_ENC_COUNTER, "Использованные резервные блоки", "Used reserve blocks"),
+    PN(0xC0, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Небезопасные отключения питания", "Unsafe power loss count"),
+    PN(0xC2, PROF_SEM_THERMAL,    PROF_ENC_COUNTER, "Температура", "Temperature"),
+    PHN(0xC7, PROF_SEM_INTERFACE, PROF_ENC_COUNTER,
+        "Ошибки CRC", "CRC errors",
+        PROF_RULE_WORSE, PROF_SLOT_CRC, PROF_SCOPE_ANY, 0, 1, 100, 0),
+    PN(0xE8, PROF_SEM_NONE,       PROF_ENC_PERCENT, "Резервное пространство", "Available reserved space"),
+    PN(0xF1, PROF_SEM_HOST_WRITE, PROF_ENC_GIB,     "Записано хостом (ГиБ)", "Host written (GiB)"),
+    PN(0xF2, PROF_SEM_HOST_READ,  PROF_ENC_GIB,     "Прочитано хостом (ГиБ)", "Host read (GiB)"),
+    PN(0xF5, PROF_SEM_NAND_WRITE, PROF_ENC_GIB,     "Записи Flash (ГиБ)", "Flash writes (GiB)"),
     PA(0, 0, 0)
 };
 
@@ -246,6 +312,33 @@ static const PROF_ATTR kToshibaHdd[] = {
     PA(0, 0, 0)
 };
 
+/* Toshiba / Kioxia SATA SSD (SG5, HG6, HG5, KSG60 etc. THNSN*, THNSF*, KSG60*)
+ * 167: SSD Protect Mode (raw > 0 means write-protected / panic mode).
+ * 173: Normalized Value 200..100 is life remaining (Value - 100 = %).
+ * 241/242: 32 MiB blocks written/read by host. */
+static const PROF_ATTR kToshibaSsd[] = {
+    PHN(0xA7, PROF_SEM_MEDIA,      PROF_ENC_COUNTER,
+        "Режим защиты SSD", "SSD protect mode",
+        PROF_RULE_WORSE, PROF_SLOT_PROTECT, PROF_SCOPE_ANY, 0, 0, 1, 0),
+    PN(0xA8, PROF_SEM_INTERFACE,  PROF_ENC_COUNTER,
+       "Ошибки SATA PHY", "SATA PHY errors"),
+    PN(0xA9, PROF_SEM_MEDIA,      PROF_ENC_COUNTER,
+       "Плохие блоки", "Bad blocks"),
+    PH(0xAA, PROF_SEM_MEDIA,      PROF_ENC_COUNTER,
+       PROF_RULE_OFF, PROF_SLOT_NONE, PROF_SCOPE_ANY, 0, 0, 0, 0),
+    PN(0xAD, PROF_SEM_ENDURANCE,  PROF_ENC_VALUE_OFFSET100,
+       "Остаток ресурса", "Life remaining"),
+    PH(0xAF, PROF_SEM_MEDIA,      PROF_ENC_COUNTER,
+       PROF_RULE_OFF, PROF_SLOT_NONE, PROF_SCOPE_ANY, 0, 0, 0, 0),
+    PN(0xC0, PROF_SEM_NONE,       PROF_ENC_COUNTER,
+       "Аварийные отключения питания", "Unsafe power-off events"),
+    PN(0xF1, PROF_SEM_HOST_WRITE, PROF_ENC_BLOCK32,
+       "Записано хостом", "Host written"),
+    PN(0xF2, PROF_SEM_HOST_READ,  PROF_ENC_BLOCK32,
+       "Прочитано хостом", "Host read"),
+    PA(0, 0, 0)
+};
+
 /* nvme: -1 any, 0 ATA, 1 NVMe. hdd: -1 any, 0 not HDD, 1 HDD.
  * flags and origin are last. NULL origin means builtin. */
 static const DRIVE_PROFILE kProfiles[] = {
@@ -263,6 +356,13 @@ static const DRIVE_PROFILE kProfiles[] = {
     /* NVMe life is Percentage Used. kSamsungSsd stays on ATA. */
     { "samsung-nvme", NULL, PROF_KIND_CONTROLLER, NULL, NULL, PROF_FW_NONE,
       VENDOR_UNKNOWN, CONTROLLER_SAMSUNG, 1, 0, NULL, NULL, NULL, 0, NULL },
+    /* Standard NVMe log. The row does not invent vendor attributes. */
+    { "kioxia-nvme", NULL, PROF_KIND_CONTROLLER, NULL, NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_KIOXIA, 1, 0, NULL, NULL, NULL, 0, NULL },
+    /* BG4. The model substring assigns Kioxia when the bridge omits PCI VID.
+     * It does not reinterpret the NVMe health log. */
+    { "kioxia-bg4", NULL, PROF_KIND_EXACT, "KBG40ZNV", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_KIOXIA, 1, 0, NULL, NULL, NULL, 0, NULL },
     { "intel-ssd", NULL, PROF_KIND_CONTROLLER, NULL, NULL, PROF_FW_NONE,
       VENDOR_UNKNOWN, CONTROLLER_INTEL, -1, 0, NULL, NULL, kIntel, 0, NULL },
     { "micron-ssd", NULL, PROF_KIND_CONTROLLER, NULL, NULL, PROF_FW_NONE,
@@ -293,8 +393,53 @@ static const DRIVE_PROFILE kProfiles[] = {
       VENDOR_UNKNOWN, CONTROLLER_MAXIO, 0, 0, "Maxio", NULL, kMaxioSata,
       0, NULL },
     { "maxio-sata", NULL, PROF_KIND_CONTROLLER, NULL, NULL, PROF_FW_NONE,
-      VENDOR_UNKNOWN, CONTROLLER_MAXIO, 0, 0, NULL, NULL, NULL,
+      VENDOR_UNKNOWN, CONTROLLER_MAXIO, 0, 0, "Maxio MAS0902/MAS1102", NULL, kMaxioSata,
       0, NULL },
+    { "maxio-nvme", NULL, PROF_KIND_CONTROLLER, NULL, NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_MAXIO, 1, 0, "Maxio", NULL, NULL, 0, NULL },
+    { "map1602", NULL, PROF_KIND_FAMILY, "MAP1602", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_MAXIO, 1, 0, "Maxio MAP1602", "2.0.0", NULL, 0, NULL },
+    { "map1202", NULL, PROF_KIND_FAMILY, "MAP1202", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_MAXIO, 1, 0, "Maxio MAP1202", "1.4.0", NULL, 0, NULL },
+    { "lexar-nm790", "map1602", PROF_KIND_EXACT, "NM790", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_MAXIO, 1, 0, "Maxio MAP1602", "2.0.0", NULL, 0, NULL },
+    { "predator-gm7", "map1602", PROF_KIND_EXACT, "Predator GM7", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_MAXIO, 1, 0, "Maxio MAP1602", "2.0.0", NULL, 0, NULL },
+    { "netac-nv7000-t", "map1602", PROF_KIND_EXACT, "NV7000-t", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_MAXIO, 1, 0, "Maxio MAP1602", "2.0.0", NULL, 0, NULL },
+
+    { "innogrit-nvme", NULL, PROF_KIND_CONTROLLER, NULL, NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_INNOGRIT, 1, 0, "Innogrit", NULL, NULL, 0, NULL },
+    { "ig5236", NULL, PROF_KIND_FAMILY, "IG5236", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_INNOGRIT, 1, 0, "Innogrit IG5236", "1.4.0", NULL, 0, NULL },
+    { "ig5216", NULL, PROF_KIND_FAMILY, "IG5216", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_INNOGRIT, 1, 0, "Innogrit IG5216", "1.4.0", NULL, 0, NULL },
+    { "vp4300", "ig5236", PROF_KIND_EXACT, "VP4300", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_INNOGRIT, 1, 0, "Innogrit IG5236", "1.4.0", NULL, 0, NULL },
+    { "predator-gm7000", "ig5236", PROF_KIND_EXACT, "GM7000", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_INNOGRIT, 1, 0, "Innogrit IG5236", "1.4.0", NULL, 0, NULL },
+    { "adata-falcon", "ig5216", PROF_KIND_EXACT, "FALCON", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_INNOGRIT, 1, 0, "Innogrit IG5216", "1.4.0", NULL, 0, NULL },
+
+    { "realtek-sata", NULL, PROF_KIND_CONTROLLER, NULL, NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_REALTEK, 0, 0, "Realtek RTS5732", NULL, kRealtekSata, 0, NULL },
+    { "realtek-nvme", NULL, PROF_KIND_CONTROLLER, NULL, NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_REALTEK, 1, 0, "Realtek", NULL, NULL, 0, NULL },
+    { "rts5765dl", NULL, PROF_KIND_FAMILY, "RTS5765", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_REALTEK, 1, 0, "Realtek RTS5765DL", "1.4.0", NULL, 0, NULL },
+    { "rts5766dl", NULL, PROF_KIND_FAMILY, "RTS5766", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_REALTEK, 1, 0, "Realtek RTS5766DL", "1.4.0", NULL, 0, NULL },
+    { "legend-710", "rts5766dl", PROF_KIND_EXACT, "LEGEND 710", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_REALTEK, 1, 0, "Realtek RTS5766DL", "1.4.0", NULL, 0, NULL },
+
+    { "yeestor-sata", NULL, PROF_KIND_CONTROLLER, NULL, NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_YEESTOR, 0, 0, "Yeestor YS9082", NULL, kYeestorSata, 0, NULL },
+    { "yeestor-nvme", NULL, PROF_KIND_CONTROLLER, NULL, NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_YEESTOR, 1, 0, "Yeestor YS9203", "1.3.0", NULL, 0, NULL },
+    { "ys9082", "yeestor-sata", PROF_KIND_FAMILY, "YS9082", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_YEESTOR, 0, 0, "Yeestor YS9082", NULL, kYeestorSata, 0, NULL },
+    { "ys9083", "yeestor-sata", PROF_KIND_FAMILY, "YS9083", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_YEESTOR, 0, 0, "Yeestor YS9083", NULL, kYeestorSata, 0, NULL },
 
     { "crucial-micron", NULL, PROF_KIND_VENDOR, NULL, NULL, PROF_FW_NONE,
       VENDOR_MICRON, CONTROLLER_UNKNOWN, 0, 0, NULL, NULL, kCrucialMicron, 0, NULL },
@@ -302,6 +447,14 @@ static const DRIVE_PROFILE kProfiles[] = {
       VENDOR_SEAGATE, CONTROLLER_UNKNOWN, 0, 1, NULL, NULL, kSeagateHdd, 0, NULL },
     { "toshiba-hdd", NULL, PROF_KIND_VENDOR, NULL, NULL, PROF_FW_NONE,
       VENDOR_TOSHIBA, CONTROLLER_UNKNOWN, 0, 1, NULL, NULL, kToshibaHdd, 0, NULL },
+    { "toshiba-sata-ssd", NULL, PROF_KIND_CONTROLLER, NULL, NULL, PROF_FW_NONE,
+      VENDOR_TOSHIBA, CONTROLLER_TOSHIBA, 0, 0, "Toshiba / Kioxia SATA SSD", NULL, kToshibaSsd, 0, NULL },
+    { "thnsn", "toshiba-sata-ssd", PROF_KIND_FAMILY, "THNSN", NULL, PROF_FW_NONE,
+      VENDOR_TOSHIBA, CONTROLLER_TOSHIBA, 0, 0, "Toshiba SG5", NULL, NULL, 0, NULL },
+    { "thnsf", "toshiba-sata-ssd", PROF_KIND_FAMILY, "THNSF", NULL, PROF_FW_NONE,
+      VENDOR_TOSHIBA, CONTROLLER_TOSHIBA, 0, 0, "Toshiba HG6", NULL, NULL, 0, NULL },
+    { "ksg60", "toshiba-sata-ssd", PROF_KIND_FAMILY, "KSG60", NULL, PROF_FW_NONE,
+      VENDOR_TOSHIBA, CONTROLLER_TOSHIBA, 0, 0, "Toshiba SG6", NULL, NULL, 0, NULL },
 
     { "samsung-870", "samsung-ssd", PROF_KIND_FAMILY, "870", NULL, PROF_FW_NONE,
       VENDOR_UNKNOWN, CONTROLLER_SAMSUNG, 0, 0, NULL, NULL, NULL, 0, NULL },
@@ -326,6 +479,10 @@ static const DRIVE_PROFILE kProfiles[] = {
     { "gammix-s11", NULL, PROF_KIND_EXACT, "GAMMIX S11", NULL, PROF_FW_NONE,
       VENDOR_UNKNOWN, CONTROLLER_SMI, -1, 0,
       "Silicon Motion SM2262EN/SM2262ENG/SM2262G", "1.3.0", NULL, 0, NULL },
+    /* S50 Lite is SM2267XT. The non-Lite S50 is a different controller.
+     * The row names the chip and does not reinterpret the NVMe log. */
+    { "gammix-s50-lite", NULL, PROF_KIND_EXACT, "GAMMIX S50 LITE", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 1, 0, "Silicon Motion SM2267XT", "1.4.0", NULL, 0, NULL },
     { "xpg-s11", NULL, PROF_KIND_EXACT, "XPG S11", NULL, PROF_FW_NONE,
       VENDOR_UNKNOWN, CONTROLLER_SMI, -1, 0,
       "Silicon Motion SM2262EN/SM2262ENG/SM2262G", "1.3.0", NULL, 0, NULL },
@@ -363,7 +520,9 @@ static const DRIVE_PROFILE kProfiles[] = {
     { "a400-sbfm", "phison", PROF_KIND_EXACT, "A400", "SBFM", PROF_FW_SUBSTR,
       VENDOR_UNKNOWN, CONTROLLER_PHISON, 0, 0, "Phison PS3111-S11", NULL, NULL, 0, NULL },
     { "m450", "phison", PROF_KIND_EXACT, "M450", NULL, PROF_FW_NONE,
-      VENDOR_UNKNOWN, CONTROLLER_PHISON, -1, 0, "Phison PS5019-E19T", NULL, NULL, 0, NULL }
+      VENDOR_UNKNOWN, CONTROLLER_PHISON, -1, 0, "Phison PS5019-E19T", NULL, NULL, 0, NULL },
+    { "spcc-m2", "phison", PROF_KIND_EXACT, "SPCC M.2 SSD", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_PHISON, 0, 0, "Phison PS3111-S11", NULL, NULL, 0, NULL }
 };
 
 enum { PROF_EXTRA_MAX = 8, PROF_TOP_MAX = 64 };
@@ -969,6 +1128,12 @@ BOOL ProfileHealthRule(const DRIVE_INFO* p, BYTE id, PROF_HEALTH* out)
         out->sem = PROF_SEM_INTERFACE;
         out->slot = PROF_SLOT_CRC;
     }
+    if (DriveDbAttrIsProtect(p, id) && enc == PROF_ENC_COUNTER) {
+        out->sem = PROF_SEM_MEDIA;
+        out->slot = PROF_SLOT_PROTECT;
+        out->bad = 1;
+        out->fallback = 0;
+    }
     NormalizeHealth(out);
     return TRUE;
 }
@@ -1028,6 +1193,7 @@ int ProfileDecodeRaw(int enc, unsigned __int64 raw, unsigned __int64* out)
         *out = raw;
         return 1;
     case PROF_ENC_VALUE:
+    case PROF_ENC_VALUE_OFFSET100:
     case PROF_ENC_PACKED:
     case PROF_ENC_SCALE:
     case PROF_ENC_NONE:

@@ -29,6 +29,13 @@ extern "C" BOOL DriveDbAttrIsCrc(const DRIVE_INFO* p, BYTE id)
     return FALSE;
 }
 
+extern "C" BOOL DriveDbAttrIsProtect(const DRIVE_INFO* p, BYTE id)
+{
+    (void)p;
+    (void)id;
+    return FALSE;
+}
+
 extern "C" BOOL DriveDbLookup(const DRIVE_INFO* p, BYTE id, int* sem, int* enc)
 {
     (void)p;
@@ -854,6 +861,206 @@ static void TestAttrTier(void)
     ProfileClearRegistered();
 }
 
+static void TestNewControllers(void)
+{
+    int sem = 0, enc = 0;
+
+    /* 1. Maxio */
+    Blank(DRIVE_TYPE_NVME, TRUE);
+    Name("Lexar SSD NM790 2TB", "");
+    Go();
+    ExpectId("lexar-nm790", 98, "Lexar NM790 model");
+    Expect(g.eController == CONTROLLER_MAXIO, "Lexar NM790 Maxio");
+    Expect(strcmp(g.szControllerChip, "Maxio MAP1602") == 0, "NM790 chip");
+    Expect(strcmp(g.szProtocol, "NVMe 2.0.0") == 0, "NM790 NVMe 2.0");
+
+    Blank(DRIVE_TYPE_NVME, TRUE);
+    Name("MAP1602 NVMe SSD", "");
+    Go();
+    ExpectId("map1602", 90, "MAP1602 family");
+    Expect(strcmp(g.szControllerChip, "Maxio MAP1602") == 0, "MAP1602 family chip");
+    Expect(strcmp(g.szProtocol, "NVMe 2.0.0") == 0, "MAP1602 family NVMe 2.0");
+
+    Blank(DRIVE_TYPE_NVME, TRUE);
+    Name("MAP1202 PCIe SSD", "");
+    Go();
+    ExpectId("map1202", 90, "MAP1202 family");
+    Expect(strcmp(g.szControllerChip, "Maxio MAP1202") == 0, "MAP1202 family chip");
+    Expect(strcmp(g.szProtocol, "NVMe 1.4.0") == 0, "MAP1202 family NVMe 1.4");
+
+    Blank(DRIVE_TYPE_NVME, TRUE);
+    g.eController = CONTROLLER_MAXIO;
+    Name("UNKNOWN-MAXIO-NVME", "");
+    Go();
+    ExpectId("maxio-nvme", 80, "Generic Maxio NVMe");
+    Expect(strcmp(g.szControllerChip, "Maxio") == 0, "Generic Maxio NVMe chip");
+
+    Blank(DRIVE_TYPE_SSD_SATA, FALSE);
+    g.eController = CONTROLLER_MAXIO;
+    Name("UNKNOWN-MAXIO-SATA", "");
+    Go();
+    ExpectId("maxio-sata", 80, "Generic Maxio SATA");
+    Expect(strcmp(g.szControllerChip, "Maxio MAS0902/MAS1102") == 0, "MAS SATA chip");
+    Expect(Lookup(0xE7, &sem, &enc) && sem == PROF_SEM_ENDURANCE && enc == PROF_ENC_VALUE, "MAS E7 endurance value");
+    Expect(Lookup(0xA9, &sem, &enc) && enc == PROF_ENC_PAIR, "MAS A9 pair");
+
+    /* 2. InnoGrit */
+    Blank(DRIVE_TYPE_NVME, TRUE);
+    Name("Netac NV7000 IG5236", "");
+    Go();
+    ExpectId("ig5236", 90, "IG5236 family");
+    Expect(g.eController == CONTROLLER_INNOGRIT, "IG5236 InnoGrit");
+    Expect(strcmp(g.szControllerChip, "Innogrit IG5236") == 0, "IG5236 chip");
+    Expect(strcmp(g.szProtocol, "NVMe 1.4.0") == 0, "IG5236 NVMe 1.4");
+
+    Blank(DRIVE_TYPE_NVME, TRUE);
+    Name("Patriot Viper VP4300 2TB", "");
+    Go();
+    ExpectId("vp4300", 98, "VP4300 exact");
+    Expect(strcmp(g.szControllerChip, "Innogrit IG5236") == 0, "VP4300 chip");
+
+    Blank(DRIVE_TYPE_NVME, TRUE);
+    Name("ADATA FALCON 1TB", "");
+    Go();
+    ExpectId("adata-falcon", 98, "Falcon exact");
+    Expect(strcmp(g.szControllerChip, "Innogrit IG5216") == 0, "Falcon chip");
+    Expect(strcmp(g.szProtocol, "NVMe 1.4.0") == 0, "Falcon NVMe 1.4");
+
+    Blank(DRIVE_TYPE_NVME, TRUE);
+    g.eController = CONTROLLER_INNOGRIT;
+    Name("UNKNOWN-INNOGRIT-NVME", "");
+    Go();
+    ExpectId("innogrit-nvme", 80, "Generic InnoGrit NVMe");
+    Expect(strcmp(g.szControllerChip, "Innogrit") == 0, "Generic InnoGrit chip");
+
+    /* 3. Realtek */
+    Blank(DRIVE_TYPE_NVME, TRUE);
+    Name("ADATA LEGEND 710", "");
+    Go();
+    ExpectId("legend-710", 98, "Legend 710 exact");
+    Expect(g.eController == CONTROLLER_REALTEK, "Legend 710 Realtek");
+    Expect(strcmp(g.szControllerChip, "Realtek RTS5766DL") == 0, "Legend 710 chip");
+    Expect(strcmp(g.szProtocol, "NVMe 1.4.0") == 0, "Legend 710 NVMe 1.4");
+
+    Blank(DRIVE_TYPE_NVME, TRUE);
+    Name("RTS5765DL SSD", "");
+    Go();
+    ExpectId("rts5765dl", 90, "RTS5765DL family");
+    Expect(strcmp(g.szControllerChip, "Realtek RTS5765DL") == 0, "RTS5765DL chip");
+
+    Blank(DRIVE_TYPE_NVME, TRUE);
+    g.eController = CONTROLLER_REALTEK;
+    Name("UNKNOWN-REALTEK-NVME", "");
+    Go();
+    ExpectId("realtek-nvme", 80, "Generic Realtek NVMe");
+    Expect(strcmp(g.szControllerChip, "Realtek") == 0, "Generic Realtek chip");
+
+    Blank(DRIVE_TYPE_SSD_SATA, FALSE);
+    g.eController = CONTROLLER_REALTEK;
+    Name("UNKNOWN-REALTEK-SATA", "");
+    Go();
+    ExpectId("realtek-sata", 80, "Generic Realtek SATA");
+    Expect(strcmp(g.szControllerChip, "Realtek RTS5732") == 0, "Realtek RTS5732 chip");
+    Expect(Lookup(0xA9, &sem, &enc) && sem == PROF_SEM_ENDURANCE && enc == PROF_ENC_PERCENT, "Realtek A9 endurance");
+    Expect(Lookup(0xA7, &sem, &enc) && sem == PROF_SEM_ERASE && enc == PROF_ENC_AVG, "Realtek A7 avg erase");
+    Expect(Lookup(0xF1, &sem, &enc) && sem == PROF_SEM_HOST_WRITE && enc == PROF_ENC_GIB, "Realtek F1 GiB");
+
+    /* 4. Yeestor */
+    Blank(DRIVE_TYPE_SSD_SATA, FALSE);
+    Name("Netac SA500 YS9082", "");
+    Go();
+    ExpectId("ys9082", 90, "YS9082 family");
+    Expect(g.eController == CONTROLLER_YEESTOR, "YS9082 Yeestor");
+    Expect(strcmp(g.szControllerChip, "Yeestor YS9082") == 0, "YS9082 chip");
+    Expect(Lookup(0xA9, &sem, &enc) && sem == PROF_SEM_ENDURANCE && enc == PROF_ENC_PERCENT, "Yeestor A9 endurance");
+    Expect(Lookup(0xA4, &sem, &enc) && sem == PROF_SEM_ERASE && enc == PROF_ENC_COUNTER, "Yeestor A4 erase count");
+    Expect(Lookup(0xF5, &sem, &enc) && sem == PROF_SEM_NAND_WRITE && enc == PROF_ENC_GIB, "Yeestor F5 NAND write");
+
+    Blank(DRIVE_TYPE_SSD_SATA, FALSE);
+    g.eController = CONTROLLER_YEESTOR;
+    Name("GENERIC-YEESTOR-SATA", "");
+    Go();
+    ExpectId("yeestor-sata", 80, "Generic Yeestor SATA");
+
+    Blank(DRIVE_TYPE_NVME, TRUE);
+    g.eController = CONTROLLER_YEESTOR;
+    Name("GENERIC-YEESTOR-NVME", "");
+    Go();
+    ExpectId("yeestor-nvme", 80, "Generic Yeestor NVMe");
+    Expect(strcmp(g.szControllerChip, "Yeestor YS9203") == 0, "YS9203 chip");
+    Expect(strcmp(g.szProtocol, "NVMe 1.3.0") == 0, "YS9203 NVMe 1.3");
+
+    /* Kioxia BG4 is an exact NVMe model. No attribute table. */
+    Blank(DRIVE_TYPE_NVME, TRUE);
+    Name("KBG40ZNV512G KIOXIA", "HP00AE00");
+    Go();
+    ExpectId("kioxia-bg4", 98, "Kioxia BG4 model");
+    Expect(g.eController == CONTROLLER_KIOXIA, "BG4 controller from model");
+    Expect(g.szControllerChip[0] == '\0', "BG4 invents no chip");
+
+    Blank(DRIVE_TYPE_NVME, TRUE);
+    g.eController = CONTROLLER_KIOXIA;
+    Name("KIOXIA OTHER NVME", "");
+    Go();
+    ExpectId("kioxia-nvme", 80, "Generic Kioxia NVMe");
+
+    Blank(DRIVE_TYPE_SSD_SATA, FALSE);
+    Name("KBG40ZNV512G KIOXIA", "HP00AE00");
+    Go();
+    ExpectId("ata-generic", 50, "BG4 name is not a SATA profile");
+}
+
+static void TestToshibaSsd(void)
+{
+    int sem = PROF_SEM_NONE, enc = PROF_ENC_NONE;
+    PROF_HEALTH h;
+
+    /* Toshiba SG5 SATA SSD */
+    Blank(DRIVE_TYPE_SSD_SATA, FALSE);
+    Name("TOSHIBA THNSNK128GVN8", "51021020");
+    g.eVendor = VENDOR_TOSHIBA;
+    Go();
+    ExpectId("thnsn", 90, "Toshiba SG5 matches thnsn");
+    Expect(Lookup(0xA7, &sem, &enc) && sem == PROF_SEM_MEDIA && enc == PROF_ENC_COUNTER,
+           "Toshiba 0xA7 is media protect mode");
+    Expect(ProfileHealthRule(&g, 0xA7, &h) && h.slot == PROF_SLOT_PROTECT && h.bad == 1,
+           "Toshiba 0xA7 has protect mode rule with bad=1");
+    Expect(Lookup(0xAD, &sem, &enc) && sem == PROF_SEM_ENDURANCE && enc == PROF_ENC_VALUE_OFFSET100,
+           "Toshiba 0xAD is endurance with offset100");
+    Expect(Lookup(0xF1, &sem, &enc) && sem == PROF_SEM_HOST_WRITE && enc == PROF_ENC_BLOCK32,
+           "Toshiba 0xF1 is host write with block32");
+    Expect(ProfileWriteVolume(sem, enc) == 1, "Toshiba 0xF1 is write volume");
+
+    /* Toshiba HG6 SATA SSD */
+    Blank(DRIVE_TYPE_SSD_SATA, FALSE);
+    Name("THNSFJ256GCSU", "JU001020");
+    g.eVendor = VENDOR_TOSHIBA;
+    Go();
+    ExpectId("thnsf", 90, "Toshiba HG6 matches thnsf");
+
+    /* Toshiba SG6 SATA SSD */
+    Blank(DRIVE_TYPE_SSD_SATA, FALSE);
+    Name("KSG60ZMV256G TOSHIBA", "10021020");
+    g.eVendor = VENDOR_TOSHIBA;
+    Go();
+    ExpectId("ksg60", 90, "Toshiba SG6 matches ksg60");
+
+    /* Maxio 0xA7 has protect mode health rule */
+    Blank(DRIVE_TYPE_SSD_SATA, FALSE);
+    Name("P3-512", "SN08123");
+    g.eController = CONTROLLER_MAXIO;
+    Go();
+    Expect(ProfileHealthRule(&g, 0xA7, &h) && h.slot == PROF_SLOT_PROTECT && h.bad == 1,
+           "Maxio 0xA7 has protect mode rule with bad=1");
+
+    /* PROF_ENC_VALUE_OFFSET100 does not decode raw */
+    {
+        unsigned __int64 out = 0;
+        Expect(ProfileDecodeRaw(PROF_ENC_VALUE_OFFSET100, 175, &out) == 0,
+               "offset100 is normalized, not raw");
+    }
+}
+
 int main(void)
 {
     ProfileClearRegistered();
@@ -866,6 +1073,8 @@ int main(void)
     TestDecodeAndUsb();
     TestHealthRule();
     TestAttrTier();
+    TestNewControllers();
+    TestToshibaSsd();
     ProfileClearRegistered();
     if (g_fail) {
         fprintf(stderr, "%d failed, %d checks\n", g_fail, g_check);

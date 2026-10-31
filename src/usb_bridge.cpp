@@ -57,9 +57,13 @@ BOOL IsRealtekNvmeUsbBridge(const DRIVE_INFO* p)
     for (i = 0; hay[i]; i++)
         hay[i] = (char)toupper((unsigned char)hay[i]);
     if (strstr(hay, "RTL9210") || strstr(hay, "RTL9211") ||
-        strstr(hay, "RTL921"))
+        strstr(hay, "RTL921") || strstr(hay, "RTL9220") ||
+        strstr(hay, "RTL9201") || strstr(hay, "RTL9202") ||
+        strstr(hay, "RTL9203") || strstr(hay, "RTL920"))
         return TRUE;
-    if (strstr(hay, "REALTEK") && strstr(hay, "9210"))
+    if (strstr(hay, "REALTEK") && (strstr(hay, "9210") || strstr(hay, "9211") ||
+        strstr(hay, "9201") || strstr(hay, "9202") || strstr(hay, "9203") ||
+        strstr(hay, "9220")))
         return TRUE;
     return FALSE;
 }
@@ -702,6 +706,99 @@ BOOL GetSMARTReturnStatusSAT(HANDLE hDrive, BOOL* pbFail)
     return FALSE;
 }
 
+static int SATSensePowerMode(const BYTE* sense, DWORD nSense)
+{
+    BYTE rc;
+    DWORD add, off, end, step;
+    if (!sense || nSense < 14)
+        return -1;
+    rc = (BYTE)(sense[0] & 0x7F);
+    if (rc == 0x72 || rc == 0x73) {
+        add = sense[7];
+        off = 8;
+        end = 8 + add;
+        if (end > nSense) end = nSense;
+        while (off + 14 <= end) {
+            if (sense[off] == 0x09 && sense[off + 1] >= 0x0C) {
+                BYTE status = sense[off + 13];
+                if (status & 0x01) return -1; /* ERR */
+                return (int)sense[off + 5];   /* Sector count register */
+            }
+            step = (DWORD)sense[off + 1] + 2;
+            if (step < 2) break;
+            off += step;
+        }
+        return -1;
+    }
+    return -1;
+}
+
+static int SATCheckPowerModeOnce(HANDLE hDrive, BOOL bDirect, BOOL b16)
+{
+    BYTE flags = (BYTE)SAT_FLAGS_CK_COND;
+    DWORD dwBytes = 0;
+
+    if (bDirect) {
+        SAT_PASSTHROUGH_BUF sb;
+        ZeroMemory(&sb, sizeof(sb));
+        sb.sptd.Length             = sizeof(SCSI_PASS_THROUGH_DIRECT);
+        sb.sptd.CdbLength          = b16 ? 16 : 12;
+        sb.sptd.SenseInfoLength    = sizeof(sb.SenseBuf);
+        sb.sptd.SenseInfoOffset    = offsetof(SAT_PASSTHROUGH_BUF, SenseBuf);
+        sb.sptd.DataIn             = SCSI_IOCTL_DATA_UNSPECIFIED;
+        sb.sptd.DataTransferLength = 0;
+        sb.sptd.DataBuffer         = NULL;
+        sb.sptd.TimeOutValue       = 5;
+        SATFillCdb(sb.sptd.Cdb, b16, SAT_PROTO_NON_DATA, flags,
+                   0, 0, 0, 0, 0, 0xE5);
+        if (!DeviceIoControl(hDrive, IOCTL_SCSI_PASS_THROUGH_DIRECT,
+                &sb, sizeof(sb), &sb, sizeof(sb), &dwBytes, NULL))
+            return -1;
+        if (SATStatusStops(sb.sptd.ScsiStatus))
+            return -1;
+        return SATSensePowerMode(sb.SenseBuf, sizeof(sb.SenseBuf));
+    }
+
+    {
+        CDI_SAT_PASSTHROUGH_BUF sptwb;
+        DWORD dwInLen;
+        ZeroMemory(&sptwb, sizeof(sptwb));
+        sptwb.spt.Length          = sizeof(SCSI_PASS_THROUGH);
+        sptwb.spt.CdbLength       = b16 ? 16 : 12;
+        sptwb.spt.SenseInfoLength = sizeof(sptwb.SenseBuf);
+        sptwb.spt.SenseInfoOffset = offsetof(CDI_SAT_PASSTHROUGH_BUF, SenseBuf);
+        sptwb.spt.DataIn          = SCSI_IOCTL_DATA_UNSPECIFIED;
+        sptwb.spt.DataTransferLength = 0;
+        sptwb.spt.DataBufferOffset   = 0;
+        sptwb.spt.TimeOutValue    = 5;
+        SATFillCdb(sptwb.spt.Cdb, b16, SAT_PROTO_NON_DATA, flags,
+                   0, 0, 0, 0, 0, 0xE5);
+        dwInLen = offsetof(CDI_SAT_PASSTHROUGH_BUF, DataBuf);
+        if (!DeviceIoControl(hDrive, IOCTL_SCSI_PASS_THROUGH,
+                &sptwb, dwInLen, &sptwb, sizeof(sptwb), &dwBytes, NULL))
+            return -1;
+        if (SATStatusStops(sptwb.spt.ScsiStatus))
+            return -1;
+        return SATSensePowerMode(sptwb.SenseBuf, sizeof(sptwb.SenseBuf));
+    }
+}
+
+int SATCheckPowerMode(HANDLE hDrive)
+{
+    int m;
+    if (!DriveAllowsScsiPassthrough(hDrive))
+        return -1;
+    m = SATCheckPowerModeOnce(hDrive, TRUE,  TRUE);
+    if (m >= 0) return m;
+    m = SATCheckPowerModeOnce(hDrive, TRUE,  FALSE);
+    if (m >= 0) return m;
+    m = SATCheckPowerModeOnce(hDrive, FALSE, TRUE);
+    if (m >= 0) return m;
+    m = SATCheckPowerModeOnce(hDrive, FALSE, FALSE);
+    return m;
+}
+
+
 BOOL EnableSMARTSAT(HANDLE hDrive)
 {
     SMART_ACCESS_METHOD m = SMART_ACCESS_NONE;
@@ -917,12 +1014,13 @@ static BOOL ReadSMARTLogSAT(HANDLE hDrive, BYTE bLogAddr,
 
 BOOL GetSMARTErrorLogSAT(HANDLE hDrive, DRIVE_INFO* pInfo)
 {
+    BYTE page[512];
+    ZeroMemory(page, sizeof(page));
     ZeroMemory(&pInfo->errorLog, sizeof(pInfo->errorLog));
 
-    if (ReadSMARTLogSAT(hDrive, SMART_LOG_COMP_ERROR,
-                     (BYTE*)&pInfo->errorLog, sizeof(pInfo->errorLog))) {
-        pInfo->bGotErrorLog = TRUE;
-        pInfo->nErrorLogCount = pInfo->errorLog.bErrorLogIndex;
+    if (ReadSMARTLogSAT(hDrive, SMART_LOG_COMP_ERROR, page, 512)) {
+        memcpy(&pInfo->errorLog, page, sizeof(pInfo->errorLog));
+        ApplyAtaErrorLog(pInfo, page, 512);
         return TRUE;
     }
     return FALSE;
@@ -971,7 +1069,7 @@ USB_BRIDGE_TYPE DetectUsbBridgeType(HANDLE hDrive, DRIVE_INFO* pInfo)
 
     /* ASMedia bridges */
     if (vid == 0x174C) {
-        if (pid == 0x2362 || pid == 0x2364)
+        if (pid == 0x2362 || pid == 0x2364 || pid == 0x2464 || pid == 0x2462)
             return USB_BRIDGE_NVME_ASMEDIA;
         if (pid == 0x1352 || pid == 0x1351)
             return USB_BRIDGE_ASM1352R;
@@ -980,8 +1078,9 @@ USB_BRIDGE_TYPE DetectUsbBridgeType(HANDLE hDrive, DRIVE_INFO* pInfo)
 
     /* Realtek bridges (RTL9210/B dual-mode and other USB-SATA) */
     if (vid == 0x0BDA) {
-        if ((pid & 0xFF00) == 0x9200 || pid == 0x9210 || pid == 0x9211 ||
-            pid == 0x9220 || pid == 0x9221)
+        if (pid == 0x9220 || pid == 0x9221)
+            return USB_BRIDGE_NVME_FMA;
+        if ((pid & 0xFF00) == 0x9200 || pid == 0x9210 || pid == 0x9211)
             return USB_BRIDGE_NVME_REALTEK;
         return USB_BRIDGE_SAT;
     }
@@ -1015,15 +1114,6 @@ USB_BRIDGE_TYPE DetectUsbBridgeType(HANDLE hDrive, DRIVE_INFO* pInfo)
 
     /* Seagate bridges */
     if (vid == 0x0BC2) return USB_BRIDGE_SAT;
-
-    /* FMA NL6221 NVMe bridge */
-    if (vid == 0x0BDA) {
-        /* Already handled above for Realtek NVMe bridges, but
-         * additional PIDs for FMA-branded NVMe bridges */
-        if (pid == 0x9220 || pid == 0x9221)
-            return USB_BRIDGE_NVME_FMA;
-        return USB_BRIDGE_NVME_REALTEK;
-    }
 
     /* Default: try standard SAT */
     return USB_BRIDGE_SAT;

@@ -26,6 +26,8 @@ using namespace Gdiplus;
 #include "utf8ui.h"
 #include "safestr.h"
 #include "lang.h"
+#include "latency_probe.h"
+#include "dram_verify.h"
 
 #define DONATE_URL "https://boosty.to/chuikoff"
 
@@ -557,6 +559,7 @@ HACCEL UiCreateAccelTable(void)
         { (BYTE)(FVIRTKEY | FCONTROL),           (WORD)'0',           IDM_ZOOM_100 },
         { (BYTE)(FVIRTKEY | FCONTROL),           (WORD)VK_NUMPAD0,    IDM_ZOOM_100 },
         { (BYTE)(FVIRTKEY | FCONTROL),           (WORD)'M',           IDM_MONITOR },
+        { (BYTE)(FVIRTKEY | FCONTROL),           (WORD)'D',           IDM_DRAM_VERIFY },
     };
     return CreateAcceleratorTable(a, (int)(sizeof(a) / sizeof(a[0])));
 }
@@ -988,8 +991,8 @@ static void DoSaveDriveReport(HWND hWnd)
     GetLocalTime(&st);
 
     ReportCat(buf, kCap, &len, Tr(STR_REPORT_HD));
-    safe_snprintf(szLine, TN("**Версия:** %s  \r\n", "**Version:** %s  \r\n"),
-                  DRIVEMONITOR_FILEVERSION_STR);
+    safe_snprintf(szLine, TN("**Версия:** %s (сборка %s)  \r\n", "**Version:** %s (build %s)  \r\n"),
+                  DRIVEMONITOR_FILEVERSION_STR, DRIVEMONITOR_BUILD_STR);
     ReportCat(buf, kCap, &len, szLine);
     safe_snprintf(szLine, TN("**Дата:** %04d-%02d-%02d %02d:%02d:%02d\r\n\r\n",
                              "**Date:** %04d-%02d-%02d %02d:%02d:%02d\r\n\r\n"),
@@ -1018,6 +1021,14 @@ static void DoSaveDriveReport(HWND hWnd)
         if (pInfo->eVendor == VENDOR_UNKNOWN || pInfo->eVendor == VENDOR_OTHER)
             brand = "—";
         ReportMdKv(buf, kCap, &len, Tr(STR_BRAND), brand);
+    }
+    if (pInfo->bCounterfeitSuspected) {
+        ReportMdKv(buf, kCap, &len,
+                   TN("⚠️ Подлинность", "⚠️ Authenticity"),
+                   TN("ОБНАРУЖЕНЫ ПРИЗНАКИ ПОДДЕЛКИ / РЕМАРКИРОВАНИЯ", "SUSPECTED COUNTERFEIT / RELABELED"));
+        ReportMdKv(buf, kCap, &len,
+                   TN("Причина несоответствия", "Mismatch reason"),
+                   GetCounterfeitReason(pInfo));
     }
     ReportMdKv(buf, kCap, &len, Tr(STR_CONTROLLER), DriveControllerLabel(pInfo));
     ReportMdKv(buf, kCap, &len, Tr(STR_SERIAL), ReportDash(pInfo->szSerial));
@@ -1112,6 +1123,97 @@ static void DoSaveDriveReport(HWND hWnd)
         }
     }
 
+    if (pInfo->eventStats.bQueried) {
+        ReportCat(buf, kCap, &len, TN("\r\n## Системные события Windows (Event Log, 30 дней)\r\n\r\n",
+                                     "\r\n## Windows Storage Events (Event Log, 30 days)\r\n\r\n"));
+        if (pInfo->eventStats.nEvent153Count == 0 &&
+            pInfo->eventStats.nEvent129Count == 0 &&
+            pInfo->eventStats.nEvent51Count == 0 &&
+            pInfo->eventStats.nEventHwErrCount == 0) {
+            ReportCat(buf, kCap, &len, TN("Аппаратных сбоев ввода-вывода (Event 153, 129, 51, 7) не зафиксировано.\r\n",
+                                         "No hardware IO faults (Event 153, 129, 51, 7) recorded.\r\n"));
+        } else {
+            char szEvtLine[256];
+            safe_snprintf(szEvtLine, "- **Event 153 (IO Retries / таймауты)**: %d\r\n", pInfo->eventStats.nEvent153Count);
+            ReportCat(buf, kCap, &len, szEvtLine);
+            safe_snprintf(szEvtLine, "- **Event 129 (Controller Resets / сбросы шины)**: %d\r\n", pInfo->eventStats.nEvent129Count);
+            ReportCat(buf, kCap, &len, szEvtLine);
+            safe_snprintf(szEvtLine, "- **Event 51 (Paging Errors / ошибки страничного обмена)**: %d\r\n", pInfo->eventStats.nEvent51Count);
+            ReportCat(buf, kCap, &len, szEvtLine);
+            safe_snprintf(szEvtLine, "- **Event 7/154 (Bad Blocks / аппаратные сбои блоков)**: %d\r\n", pInfo->eventStats.nEventHwErrCount);
+            ReportCat(buf, kCap, &len, szEvtLine);
+            if (pInfo->eventStats.szLastEventTime[0]) {
+                safe_snprintf(szEvtLine, "- **Последнее событие / Latest event**: %s (%s)\r\n",
+                              pInfo->eventStats.szLastEventTime, pInfo->eventStats.szLastEventDesc);
+                ReportCat(buf, kCap, &len, szEvtLine);
+            }
+        }
+    }
+
+    {
+        const LATENCY_PROBE_RESULT* pLat = GetDriveLatencyResult(pInfo->nDriveIndex);
+        if (pLat && pLat->nSamplesTested > 0) {
+            char szLatMd[4096];
+            FormatLatencyMarkdown(pLat, szLatMd, sizeof(szLatMd));
+            ReportCat(buf, kCap, &len, "\r\n");
+            ReportCat(buf, kCap, &len, szLatMd);
+        }
+    }
+
+    if (pInfo->trimInfo.bQueried) {
+        char szTrimLine[256];
+        ReportCat(buf, kCap, &len, TN("\r\n## Статус TRIM и логические разделы\r\n\r\n",
+                                     "\r\n## TRIM Status & Logical Volumes\r\n\r\n"));
+        safe_snprintf(szTrimLine, TN("- **TRIM в Windows (DisableDeleteNotify)**: %s\r\n",
+                                     "- **Windows TRIM (DisableDeleteNotify)**: %s\r\n"),
+                      pInfo->trimInfo.bOsTrimEnabled ? TN("Включен (0)", "Enabled (0)")
+                                                     : TN("ОТКЛЮЧЕН (1) ⚠️", "DISABLED (1) ⚠️"));
+        ReportCat(buf, kCap, &len, szTrimLine);
+        safe_snprintf(szTrimLine, TN("- **Поддержка TRIM накопителем**: %s\r\n",
+                                     "- **Drive TRIM Support**: %s\r\n"),
+                      pInfo->trimInfo.bDeviceTrimSupported ? TN("Поддерживается", "Supported")
+                                                           : TN("Не заявлена / неизвестно", "Not reported / unknown"));
+        ReportCat(buf, kCap, &len, szTrimLine);
+
+        if (pInfo->trimInfo.nVolumeCount > 0) {
+            int vi;
+            ReportCat(buf, kCap, &len, TN("\r\n### Логические разделы\r\n\r\n",
+                                         "\r\n### Logical Volumes\r\n\r\n"));
+            ReportCat(buf, kCap, &len, TN("| Том | Файловая система | TRIM раздела | Свободно | Всего | Свободно % |\r\n| --- | --- | --- | --- | --- | --- |\r\n",
+                                         "| Volume | File System | Volume TRIM | Free | Total | Free % |\r\n| --- | --- | --- | --- | --- | --- |\r\n"));
+            for (vi = 0; vi < pInfo->trimInfo.nVolumeCount; vi++) {
+                const VOLUME_INFO_ENTRY* v = &pInfo->trimInfo.volumes[vi];
+                char szFree[32], szTot[32], szPct[32];
+                double flFreeGb = (double)v->qwFreeBytes / (1024.0 * 1024.0 * 1024.0);
+                double flTotGb = (double)v->qwTotalBytes / (1024.0 * 1024.0 * 1024.0);
+                if (flTotGb < 1.0) {
+                    double flFreeMb = (double)v->qwFreeBytes / (1024.0 * 1024.0);
+                    double flTotMb = (double)v->qwTotalBytes / (1024.0 * 1024.0);
+                    safe_snprintf(szFree, "%.0f MB", flFreeMb);
+                    safe_snprintf(szTot, "%.0f MB", flTotMb);
+                } else {
+                    safe_snprintf(szFree, "%.1f GB", flFreeGb);
+                    safe_snprintf(szTot, "%.1f GB", flTotGb);
+    
+                }
+
+                safe_snprintf(szPct, "%.1f%%", (double)v->fFreePercent);
+                safe_snprintf(szTrimLine, "| %s | %s | %s | %s | %s | %s |\r\n",
+                              v->szLetter, v->szFileSystem,
+                              v->bTrimSupportedFs ? TN("Да", "Yes") : TN("НЕТ ⚠️", "NO ⚠️"),
+                              szFree, szTot, szPct);
+                ReportCat(buf, kCap, &len, szTrimLine);
+            }
+        }
+    }
+
+    {
+        char szDramMd[4096];
+        FormatDramVerifyMarkdown(GetDriveDramVerifyResult(pInfo->nDriveIndex), szDramMd, sizeof(szDramMd));
+        ReportCat(buf, kCap, &len, "\r\n");
+        ReportCat(buf, kCap, &len, szDramMd);
+    }
+
     szDocDir[0] = '\0';
     if (!SHGetSpecialFolderPathA(NULL, szDocDir, CSIDL_PERSONAL, TRUE)) {
         GetModuleFileNameA(NULL, szDocDir, MAX_PATH);
@@ -1199,12 +1301,14 @@ static void SetActionButtonsEnabled(HWND hWnd, BOOL on)
     HWND hReread = GetDlgItem(hWnd, IDC_REREAD_BTN);
     HWND hReport = GetDlgItem(hWnd, IDC_REPORT_BTN);
     HWND hEject  = GetDlgItem(hWnd, IDC_EJECT_BTN);
+    HWND hTest   = GetDlgItem(hWnd, IDC_LATENCY_BTN);
     BOOL usb = FALSE;
     if (on && g_nSelectedDrive >= 0 && g_nSelectedDrive < g_nDriveCount)
         usb = g_Drives[g_nSelectedDrive].bIsUSB;
     if (hReread) EnableWindow(hReread, on);
     if (hReport) EnableWindow(hReport, on);
     if (hEject)  EnableWindow(hEject, on && usb);
+    if (hTest)   EnableWindow(hTest, on);
 }
 
 static void DoSafeEject(HWND hWnd)
@@ -2340,7 +2444,13 @@ void UpdateDriveInfo(HWND hWnd, int nDriveIdx)
         const char* brand = GetVendorName(pInfo->eVendor);
         if (pInfo->eVendor == VENDOR_UNKNOWN || pInfo->eVendor == VENDOR_OTHER)
             brand = "—";
-        SetDlgItemTextU8(hWnd, IDC_BRAND_STATIC, brand);
+        if (pInfo->bCounterfeitSuspected) {
+            char szBrandAlert[128];
+            safe_snprintf(szBrandAlert, "%s %s", brand, TN("⚠️ [ПОДДЕЛКА / РЕМАРК]", "⚠️ [FAKE / RELABELED]"));
+            SetDlgItemTextU8(hWnd, IDC_BRAND_STATIC, szBrandAlert);
+        } else {
+            SetDlgItemTextU8(hWnd, IDC_BRAND_STATIC, brand);
+        }
     }
     SetDlgItemTextU8(hWnd, IDC_CONTROLLER_STATIC, DriveControllerLabel(pInfo));
 
@@ -2353,8 +2463,30 @@ void UpdateDriveInfo(HWND hWnd, int nDriveIdx)
     {
         char szSize[32];
         FormatSize(pInfo->dwCapacityMB, szSize, sizeof(szSize));
-        safe_snprintf(szBuf, TN("%s   Тип: %s", "%s   Type: %s"),
-                  szSize, GetDriveTypeName(pInfo->eType));
+        if (pInfo->trimInfo.bQueried && (pInfo->bIsNVMe || pInfo->eType == DRIVE_TYPE_SSD_SATA || pInfo->eType == DRIVE_TYPE_M2_SATA)) {
+            char szTrimBrief[96];
+            if (!pInfo->trimInfo.bOsTrimEnabled) {
+                safe_snprintf(szTrimBrief, "%s", TN("TRIM: ВЫКЛЮЧЕН В ОС ⚠️", "TRIM: DISABLED IN OS ⚠️"));
+            } else if (pInfo->trimInfo.bPanicLowSpace) {
+                safe_snprintf(szTrimBrief, "%s", TN("TRIM: ОК · <5% своб. ⚠️", "TRIM: OK · <5% free ⚠️"));
+            } else if (pInfo->trimInfo.bCriticallyLowSpace) {
+                safe_snprintf(szTrimBrief, "%s", TN("TRIM: ОК · <7% своб. !", "TRIM: OK · <7% free !"));
+            } else if (pInfo->trimInfo.bHasNonTrimVolume) {
+                safe_snprintf(szTrimBrief, "%s", TN("TRIM: тома без TRIM (FAT) ⚠️", "TRIM: non-TRIM vols (FAT) ⚠️"));
+            } else if (pInfo->trimInfo.nVolumeCount > 0 && pInfo->trimInfo.fMinFreePercent >= 0.0f) {
+                safe_snprintf(szTrimBrief, TN("TRIM: активен (своб. %.0f%%)", "TRIM: active (%.0f%% free)"),
+                              (double)pInfo->trimInfo.fMinFreePercent);
+            } else {
+                safe_snprintf(szTrimBrief, "%s", TN("TRIM: активен", "TRIM: active"));
+            }
+            safe_snprintf(szBuf, TN("%s · %s · %s", "%s · %s · %s"),
+                          szSize, GetDriveTypeName(pInfo->eType), szTrimBrief);
+        } else {
+            safe_snprintf(szBuf, TN("%s · %s", "%s · %s"),
+                          szSize, GetDriveTypeName(pInfo->eType));
+        }
+
+
         SetDlgItemTextU8(hWnd, IDC_SIZE_STATIC, szBuf);
     }
 
@@ -3569,7 +3701,9 @@ static const char* AtaRowStatus(const DRIVE_INFO* p, const SMART_ATTRIBUTE* a,
     }
     if (id == 0xC0 && DriveTreatsC0AsPowerLoss(p))
         return (GetRawValue(a->bRawValue) > 0) ? "журнал питания" : "ОК";
-    if ((id == 0xA0 || id == 0xAE) && GetRawValue(a->bRawValue) > 0)
+    if (ssd && id == 0xAE && GetRawValue(a->bRawValue) > 0)
+        return "журнал питания";
+    if (ssd && id == 0xA0 && p->eController == CONTROLLER_PHISON && GetRawValue(a->bRawValue) > 0)
         return "журнал питания";
     /* 189 high-fly writes are vibration context. 188 is a profile rule. */
     if (id == 0xBD && !ssd && GetRawValue(a->bRawValue) > 0)
@@ -4114,8 +4248,13 @@ static LRESULT CALLBACK AboutDlgProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM
 
             HFONT hFontBold = UiMakeFont(15, FW_BOLD, FALSE);
             SetPropA(hDlg, PROP_ABOUT_FONT_BOLD, (HANDLE)hFontBold);
+            char szAboutName[128];
+            safe_snprintf(szAboutName, "DriveMonitor %s (%s %s)",
+                DRIVEMONITOR_FILEVERSION_STR,
+                TN("сборка", "build"),
+                DRIVEMONITOR_BUILD_STR);
             HWND hName = CreateWindowExU8(0, "STATIC",
-                "DriveMonitor " DRIVEMONITOR_FILEVERSION_STR,
+                szAboutName,
                 WS_CHILD | WS_VISIBLE | SS_CENTER,
                 UiScale(20), UiScale(58), cx - UiScale(40), UiScale(22),
                 hDlg, (HMENU)0, g_hInst, NULL);
@@ -4298,7 +4437,7 @@ void ShowAboutDialog(HWND hWndParent)
     HWND hDlg = CreateWindowExU8(
         WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
         "LLHDAboutDlg",
-        "О программе — DriveMonitor",
+        TN("О программе — DriveMonitor", "About — DriveMonitor"),
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
         nX, nY, nWinW, nWinH,
         hWndParent, NULL, g_hInst, NULL
@@ -4482,6 +4621,9 @@ static void CreateMenuBar(HWND hWnd)
     HMENU hHelp;
 
     AppendMenuU8(hFile, MF_STRING, IDM_REPORT,     Tr(STR_SAVE_REPORT));
+    AppendMenuU8(hFile, MF_STRING, IDM_LATENCY_TEST, TN("Экспресс-тест отклика...", "Express Latency Probe..."));
+    AppendMenuU8(hFile, MF_STRING, IDM_FULL_READ_TEST, TN("Полный тест скорости чтения...", "Full Read Speed Benchmark..."));
+    AppendMenuU8(hFile, MF_STRING, IDM_DRAM_VERIFY, TN("Тест буфера DRAM (Read-After-Write)...\tCtrl+D", "DRAM Buffer Test (Read-After-Write)...\tCtrl+D"));
     AppendMenuU8(hFile, MF_STRING, IDM_EJECT,      Tr(STR_EJECT_USB));
     AppendMenuU8(hFile, MF_STRING, IDM_SCREENSHOT, Tr(STR_SAVE_SHOT));
     AppendMenuU8(hFile, MF_SEPARATOR, 0, NULL);
@@ -4521,28 +4663,39 @@ static void CreateMenuBar(HWND hWnd)
     if (hOld) DestroyMenu(hOld);
 }
 
-/* szProtocol is filled at scan time. Swap the speed unit when the UI language changes. */
+static void ReplaceSubstringAll(char* s, int maxLen, const char* from, const char* to)
+{
+    char tmp[128];
+    char* p;
+    size_t flen, tlen;
+    if (!s || !from || !to || maxLen <= 0) return;
+    flen = strlen(from);
+    tlen = strlen(to);
+    if (flen == 0) return;
+    while ((p = strstr(s, from)) != NULL) {
+        size_t prefixLen = (size_t)(p - s);
+        size_t restLen = strlen(p + flen);
+        if (prefixLen + tlen + restLen + 1 > sizeof(tmp) ||
+            prefixLen + tlen + restLen + 1 > (size_t)maxLen)
+            break;
+        memcpy(tmp, s, prefixLen);
+        memcpy(tmp + prefixLen, to, tlen);
+        memcpy(tmp + prefixLen + tlen, p + flen, restLen + 1);
+        lstrcpynA(s, tmp, maxLen);
+    }
+}
+
+/* szProtocol is filled at scan time. Swap the speed unit and max qualifiers when the UI language changes. */
 static void RefitProtocolLang(char* s, int n)
 {
-    const char* from;
-    const char* to;
-    char tmp[64];
-    char* p;
-    size_t flen;
     if (!s || !s[0] || n <= 0) return;
     if (UiLangIsEn()) {
-        from = "Гбит/с";
-        to = "Gb/s";
+        ReplaceSubstringAll(s, n, "Гбит/с", "Gb/s");
+        ReplaceSubstringAll(s, n, "макс.", "max");
     } else {
-        from = "Gb/s";
-        to = "Гбит/с";
+        ReplaceSubstringAll(s, n, "Gb/s", "Гбит/с");
+        ReplaceSubstringAll(s, n, "max", "макс.");
     }
-    lstrcpynA(tmp, s, (int)sizeof(tmp));
-    p = strstr(tmp, from);
-    if (!p) return;
-    flen = strlen(from);
-    *p = '\0';
-    safe_snprintf_n(s, n, "%s%s%s", tmp, to, p + flen);
 }
 
 static void ApplyUiLanguage(HWND hWnd)
@@ -4557,6 +4710,7 @@ static void ApplyUiLanguage(HWND hWnd)
     SetDlgItemTextU8(hWnd, IDC_REREAD_BTN, Tr(STR_REREAD));
     SetDlgItemTextU8(hWnd, IDC_REPORT_BTN, Tr(STR_REPORT_BTN));
     SetDlgItemTextU8(hWnd, IDC_EJECT_BTN, Tr(STR_EJECT_BTN));
+    SetDlgItemTextU8(hWnd, IDC_LATENCY_BTN, TN("Тест чтения", "Read Test"));
     SetDlgItemTextU8(hWnd, IDC_AXIS_MEDIA_L, Tr(STR_MEDIA));
     SetDlgItemTextU8(hWnd, IDC_AXIS_IFACE_L, Tr(STR_INTERFACE));
     SetDlgItemTextU8(hWnd, IDC_AXIS_TEMPA_L, Tr(STR_TEMPERATURE));
@@ -4649,10 +4803,15 @@ void CreateControls(HWND hWnd)
       SendMessage(h, WM_SETFONT, (WPARAM)g_hFontSmall, TRUE); }
     { HWND h = CreateWindowExU8(0, "BUTTON", Tr(STR_EJECT_BTN),
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        nRightX, 138, nBarsW, 24,
+        nRightX, 138, 90, 24,
         hWnd, (HMENU)IDC_EJECT_BTN, g_hInst, NULL);
       SendMessage(h, WM_SETFONT, (WPARAM)g_hFontSmall, TRUE);
       EnableWindow(h, FALSE); }
+    { HWND h = CreateWindowExU8(0, "BUTTON", TN("Тест чтения", "Read Test"),
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        nRightX + 100, 138, 90, 24,
+        hWnd, (HMENU)IDC_LATENCY_BTN, g_hInst, NULL);
+      SendMessage(h, WM_SETFONT, (WPARAM)g_hFontSmall, TRUE); }
 
     {
         static const struct { int idL; int idV; int sid; } ax[] = {
@@ -4914,9 +5073,11 @@ static void LayoutMainWindow(HWND hWnd)
         HWND hReread = GetDlgItem(hWnd, IDC_REREAD_BTN);
         HWND hReport = GetDlgItem(hWnd, IDC_REPORT_BTN);
         HWND hEject  = GetDlgItem(hWnd, IDC_EJECT_BTN);
+        HWND hTest   = GetDlgItem(hWnd, IDC_LATENCY_BTN);
         if (hReread) SetWindowPos(hReread, NULL, nRightX, UiScale(110), UiScale(90), UiScale(24), SWP_NOZORDER);
         if (hReport) SetWindowPos(hReport, NULL, nRightX + UiScale(100), UiScale(110), UiScale(90), UiScale(24), SWP_NOZORDER);
-        if (hEject)  SetWindowPos(hEject,  NULL, nRightX, UiScale(138), nBarsW, UiScale(24), SWP_NOZORDER);
+        if (hEject)  SetWindowPos(hEject,  NULL, nRightX, UiScale(138), UiScale(90), UiScale(24), SWP_NOZORDER);
+        if (hTest)   SetWindowPos(hTest,   NULL, nRightX + UiScale(100), UiScale(138), UiScale(90), UiScale(24), SWP_NOZORDER);
         {
             int axL[] = { IDC_AXIS_MEDIA_L, IDC_AXIS_IFACE_L,
                           IDC_AXIS_TEMPA_L, IDC_AXIS_ROW4_L };
@@ -5257,6 +5418,18 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             else if (nCtrl == IDC_EJECT_BTN || nCtrl == IDM_EJECT) {
                 DoSafeEject(hWnd);
             }
+            else if (nCtrl == IDC_LATENCY_BTN || nCtrl == IDM_LATENCY_TEST) {
+                ShowLatencyProbeDialogEx(hWnd, g_nSelectedDrive, LATENCY_MODE_EXPRESS);
+            }
+            else if (nCtrl == IDM_FULL_READ_TEST) {
+                ShowLatencyProbeDialogEx(hWnd, g_nSelectedDrive, LATENCY_MODE_FULL);
+            }
+            else if (nCtrl == IDM_DRAM_VERIFY) {
+                ShowDramVerifyDialog(hWnd, g_nSelectedDrive);
+            }
+
+
+
             else if (nCtrl == IDM_SCREENSHOT) {
                 DoSaveScreenshot(hWnd);
             }
@@ -5391,4 +5564,1497 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         return 0;
     }
     return DefWindowProc(hWnd, uMsg, wParam, lParam);
+}
+
+/* ============================================================================
+ * Latency Probe and Full Read Speed Benchmark Dialog
+ * ============================================================================ */
+
+#define IDC_LAT_BANNER         5001
+#define IDC_LAT_GRP            5002
+#define IDC_LAT_MODE_EXPRESS   5003
+#define IDC_LAT_MODE_FULL      5004
+#define IDC_LAT_PROGRESS_BAR   5005
+#define IDC_LAT_STATUS_STATIC  5006
+#define IDC_LAT_GRID           5007
+#define IDC_LAT_LEGEND         5008
+#define IDC_LAT_VERDICT        5009
+#define IDC_LAT_START_BTN      5010
+#define IDC_LAT_STOP_BTN       5011
+#define IDC_LAT_COPY_BTN       5012
+#define IDC_LAT_CLOSE_BTN      5013
+
+#define WM_LAT_PROGRESS        (WM_APP + 21)
+#define WM_LAT_FINISHED        (WM_APP + 22)
+
+typedef struct _LATENCY_DLG_STATE {
+    HWND                  hDlg;
+    int                   nDriveIndex;
+    uint64_t              nCapacityBytes;
+    bool                  bIsSsd;
+    char                  szModel[128];
+    char                  szSerial[64];
+    LATENCY_PROBE_MODE    eMode;
+    volatile bool         bRunning;
+    volatile bool         bCancel;
+    HANDLE                hThread;
+    int                   nCurrentActiveCell;
+    LATENCY_PROBE_RESULT  result;
+    DWORD                 dwLastProgressTick;
+} LATENCY_DLG_STATE;
+
+static void CopyTextToClipboard(HWND hWnd, const char* pszUtf8)
+{
+    if (!pszUtf8 || !pszUtf8[0]) return;
+    int cchW = MultiByteToWideChar(CP_UTF8, 0, pszUtf8, -1, NULL, 0);
+    if (cchW <= 0) return;
+    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, (SIZE_T)cchW * sizeof(WCHAR));
+    if (!hMem) return;
+    WCHAR* pW = (WCHAR*)GlobalLock(hMem);
+    if (!pW) { GlobalFree(hMem); return; }
+    MultiByteToWideChar(CP_UTF8, 0, pszUtf8, -1, pW, cchW);
+    GlobalUnlock(hMem);
+    if (OpenClipboard(hWnd)) {
+        EmptyClipboard();
+        SetClipboardData(CF_UNICODETEXT, hMem);
+        CloseClipboard();
+    } else {
+        GlobalFree(hMem);
+    }
+}
+
+static LRESULT CALLBACK LatencyGridWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
+    (void)wParam; (void)lParam;
+    switch (uMsg) {
+    case WM_PAINT:
+    {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hWnd, &ps);
+        RECT rc;
+        GetClientRect(hWnd, &rc);
+        int w = rc.right - rc.left;
+        int h = rc.bottom - rc.top;
+
+        HDC memDC = CreateCompatibleDC(hdc);
+        HBITMAP memBM = CreateCompatibleBitmap(hdc, w, h);
+        HGDIOBJ oldBM = SelectObject(memDC, memBM);
+
+        HBRUSH hBg = CreateSolidBrush(RGB(246, 248, 250));
+        FillRect(memDC, &rc, hBg);
+        DeleteObject(hBg);
+
+        LATENCY_DLG_STATE* pState = (LATENCY_DLG_STATE*)GetPropA(hWnd, "DM_LAT_STATE");
+        const LATENCY_PROBE_RESULT* pRes = pState ? &pState->result : NULL;
+
+        int cols = 16;
+        int rows = 8;
+        int padX = UiScale(6);
+        int padY = UiScale(6);
+        int availW = w - 2 * padX;
+        int availH = h - 2 * padY;
+        int gap = UiScale(2);
+
+        int cellW = (availW - (cols - 1) * gap) / cols;
+        int cellH = (availH - (rows - 1) * gap) / rows;
+
+        HPEN hEmptyPen = CreatePen(PS_SOLID, 1, RGB(220, 224, 230));
+        HBRUSH hEmptyBrush = CreateSolidBrush(RGB(236, 239, 242));
+
+        for (int r = 0; r < rows; r++) {
+            for (int c = 0; c < cols; c++) {
+                int idx = r * cols + c;
+                int x1 = padX + c * (cellW + gap);
+                int y1 = padY + r * (cellH + gap);
+                int x2 = x1 + cellW;
+                int y2 = y1 + cellH;
+
+                if (pRes && idx < pRes->nSamplesTested) {
+                    COLORREF clr = LatencyBinColor(pRes->samples[idx].bin);
+                    HBRUSH hCellBrush = CreateSolidBrush(clr);
+                    HPEN hCellPen = CreatePen(PS_SOLID, 1, clr);
+                    HGDIOBJ oB = SelectObject(memDC, hCellBrush);
+                    HGDIOBJ oP = SelectObject(memDC, hCellPen);
+                    Rectangle(memDC, x1, y1, x2, y2);
+                    SelectObject(memDC, oP);
+                    SelectObject(memDC, oB);
+                    DeleteObject(hCellPen);
+                    DeleteObject(hCellBrush);
+                } else {
+                    HGDIOBJ oB = SelectObject(memDC, hEmptyBrush);
+                    HGDIOBJ oP = SelectObject(memDC, hEmptyPen);
+                    Rectangle(memDC, x1, y1, x2, y2);
+                    SelectObject(memDC, oP);
+                    SelectObject(memDC, oB);
+                }
+
+                if (pState && pState->bRunning && idx == pState->nCurrentActiveCell) {
+                    HPEN hActivePen = CreatePen(PS_SOLID, 2, RGB(30, 130, 240));
+                    HGDIOBJ oP = SelectObject(memDC, hActivePen);
+                    HGDIOBJ oB = SelectObject(memDC, GetStockObject(NULL_BRUSH));
+                    Rectangle(memDC, x1 - 1, y1 - 1, x2 + 1, y2 + 1);
+                    SelectObject(memDC, oB);
+                    SelectObject(memDC, oP);
+                    DeleteObject(hActivePen);
+                }
+            }
+        }
+
+        DeleteObject(hEmptyPen);
+        DeleteObject(hEmptyBrush);
+
+        BitBlt(hdc, 0, 0, w, h, memDC, 0, 0, SRCCOPY);
+        SelectObject(memDC, oldBM);
+        DeleteObject(memBM);
+        DeleteDC(memDC);
+        EndPaint(hWnd, &ps);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    }
+    return DefWindowProcW(hWnd, uMsg, wParam, lParam);
+}
+
+static LRESULT CALLBACK LatencyLegendWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
+    (void)wParam; (void)lParam;
+    switch (uMsg) {
+    case WM_PAINT:
+    {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hWnd, &ps);
+        RECT rc;
+        GetClientRect(hWnd, &rc);
+        int w = rc.right - rc.left;
+        int h = rc.bottom - rc.top;
+
+        HDC memDC = CreateCompatibleDC(hdc);
+        HBITMAP memBM = CreateCompatibleBitmap(hdc, w, h);
+        HGDIOBJ oldBM = SelectObject(memDC, memBM);
+
+        HBRUSH hBg = CreateSolidBrush(GetSysColor(COLOR_BTNFACE));
+        FillRect(memDC, &rc, hBg);
+        DeleteObject(hBg);
+
+        LATENCY_DLG_STATE* pState = (LATENCY_DLG_STATE*)GetPropA(hWnd, "DM_LAT_STATE");
+        const LATENCY_PROBE_RESULT* pRes = pState ? &pState->result : NULL;
+
+        SetBkMode(memDC, TRANSPARENT);
+        SelectObject(memDC, g_hFontSmall);
+
+        int cols = 6;
+        int colW = w / cols;
+        int boxSize = UiScale(12);
+        int yBox = (h - boxSize) / 2;
+
+        for (int i = 0; i < LATENCY_BIN_COUNT; i++) {
+            LATENCY_BIN b = (LATENCY_BIN)i;
+            int xBox = i * colW + UiScale(4);
+
+            HBRUSH hBoxBrush = CreateSolidBrush(LatencyBinColor(b));
+            HPEN hBoxPen = CreatePen(PS_SOLID, 1, RGB(160, 160, 160));
+            HGDIOBJ oB = SelectObject(memDC, hBoxBrush);
+            HGDIOBJ oP = SelectObject(memDC, hBoxPen);
+            Rectangle(memDC, xBox, yBox, xBox + boxSize, yBox + boxSize);
+            SelectObject(memDC, oP);
+            SelectObject(memDC, oB);
+            DeleteObject(hBoxPen);
+            DeleteObject(hBoxBrush);
+
+            char szLabel[64];
+            int count = pRes ? pRes->nBins[i] : 0;
+            safe_snprintf(szLabel, "%s: %d", LatencyBinRange(b), count);
+
+            WCHAR wzLabel[64];
+            U8ToW(szLabel, wzLabel, 64);
+            RECT textRc = { xBox + boxSize + UiScale(4), 0, (i + 1) * colW - UiScale(2), h };
+            SetTextColor(memDC, (b >= LATENCY_BIN_SLOW && count > 0) ? LatencyBinColor(b) : RGB(40, 44, 48));
+            DrawTextW(memDC, wzLabel, -1, &textRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        }
+
+        BitBlt(hdc, 0, 0, w, h, memDC, 0, 0, SRCCOPY);
+        SelectObject(memDC, oldBM);
+        DeleteObject(memBM);
+        DeleteDC(memDC);
+        EndPaint(hWnd, &ps);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    }
+    return DefWindowProcW(hWnd, uMsg, wParam, lParam);
+}
+
+static LRESULT CALLBACK LatencyVerdictWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
+    (void)wParam; (void)lParam;
+    switch (uMsg) {
+    case WM_PAINT:
+    {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hWnd, &ps);
+        RECT rc;
+        GetClientRect(hWnd, &rc);
+        int w = rc.right - rc.left;
+        int h = rc.bottom - rc.top;
+
+        HDC memDC = CreateCompatibleDC(hdc);
+        HBITMAP memBM = CreateCompatibleBitmap(hdc, w, h);
+        HGDIOBJ oldBM = SelectObject(memDC, memBM);
+
+        LATENCY_DLG_STATE* pState = (LATENCY_DLG_STATE*)GetPropA(hWnd, "DM_LAT_STATE");
+        const LATENCY_PROBE_RESULT* pRes = pState ? &pState->result : NULL;
+
+        COLORREF bgClr = RGB(255, 255, 255);
+        COLORREF borderClr = RGB(218, 222, 228);
+        COLORREF badgeBg = RGB(240, 243, 246);
+        COLORREF badgeTextClr = RGB(60, 64, 67);
+
+        if (pRes && pRes->szVerdictBadge[0] != '\0') {
+            switch (pRes->eVerdictLevel) {
+            case LATENCY_VERDICT_EXCELLENT:
+                bgClr = RGB(250, 255, 250);
+                borderClr = RGB(163, 230, 184);
+                badgeBg = RGB(230, 248, 235);
+                badgeTextClr = RGB(20, 108, 48);
+                break;
+            case LATENCY_VERDICT_GOOD:
+                bgClr = RGB(250, 253, 255);
+                borderClr = RGB(179, 212, 255);
+                badgeBg = RGB(235, 245, 255);
+                badgeTextClr = RGB(24, 100, 171);
+                break;
+            case LATENCY_VERDICT_CAUTION:
+                bgClr = RGB(255, 254, 248);
+                borderClr = RGB(249, 226, 150);
+                badgeBg = RGB(254, 249, 231);
+                badgeTextClr = RGB(183, 121, 31);
+                break;
+            case LATENCY_VERDICT_WARNING:
+                bgClr = RGB(255, 250, 249);
+                borderClr = RGB(252, 194, 178);
+                badgeBg = RGB(254, 237, 232);
+                badgeTextClr = RGB(192, 57, 43);
+                break;
+            case LATENCY_VERDICT_BAD:
+                bgClr = RGB(253, 248, 255);
+                borderClr = RGB(218, 185, 235);
+                badgeBg = RGB(245, 235, 250);
+                badgeTextClr = RGB(120, 40, 150);
+                break;
+            }
+        }
+
+        HBRUSH hBgBrush = CreateSolidBrush(bgClr);
+        FillRect(memDC, &rc, hBgBrush);
+        DeleteObject(hBgBrush);
+
+        HPEN hPen = CreatePen(PS_SOLID, 1, borderClr);
+        HGDIOBJ oldPen = SelectObject(memDC, hPen);
+        HGDIOBJ oldBrush = SelectObject(memDC, GetStockObject(NULL_BRUSH));
+        Rectangle(memDC, 0, 0, w, h);
+        SelectObject(memDC, oldBrush);
+        SelectObject(memDC, oldPen);
+        DeleteObject(hPen);
+
+        SetBkMode(memDC, TRANSPARENT);
+
+        if (pRes && pRes->szVerdictBadge[0] != '\0') {
+            RECT badgeRc = { UiScale(14), UiScale(12), UiScale(210), UiScale(38) };
+            HBRUSH hBadgeBrush = CreateSolidBrush(badgeBg);
+            HPEN hBadgePen = CreatePen(PS_SOLID, 1, borderClr);
+            HGDIOBJ p1 = SelectObject(memDC, hBadgeBrush);
+            HGDIOBJ p2 = SelectObject(memDC, hBadgePen);
+            RoundRect(memDC, badgeRc.left, badgeRc.top, badgeRc.right, badgeRc.bottom, UiScale(6), UiScale(6));
+            SelectObject(memDC, p2);
+            SelectObject(memDC, p1);
+            DeleteObject(hBadgeBrush);
+            DeleteObject(hBadgePen);
+
+            SetTextColor(memDC, badgeTextClr);
+            SelectObject(memDC, g_hFontNormal);
+            WCHAR wzBadge[64];
+            U8ToW(pRes->szVerdictBadge, wzBadge, 64);
+            DrawTextW(memDC, wzBadge, -1, &badgeRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+            RECT textRc = { UiScale(14), UiScale(46), w - UiScale(14), h - UiScale(8) };
+            SetTextColor(memDC, RGB(40, 44, 48));
+            SelectObject(memDC, g_hFontNormal);
+            WCHAR wzText[1024];
+            U8ToW(pRes->szVerdictText, wzText, 1024);
+            DrawTextW(memDC, wzText, -1, &textRc, DT_LEFT | DT_WORDBREAK);
+        } else {
+            RECT textRc = { UiScale(16), UiScale(14), w - UiScale(16), h - UiScale(12) };
+            SetTextColor(memDC, RGB(110, 115, 122));
+            SelectObject(memDC, g_hFontNormal);
+            const char* szPrompt = TN(
+                "Диагностический вердикт и физическая оценка состояния диска появятся здесь после запуска теста.\r\n\r\n"
+                "• Экспресс-тест (128 точек) быстро выявляет деградацию Flash-памяти (утечку заряда, LDPC Soft Decision) или износ пластин/головок HDD.\r\n"
+                "• Полный тест (100% поверхности) выполняет поблочное линейное чтение, измеряет скорость в МБ/с и вычисляет оставшееся время.",
+                "Diagnostic verdict and physical drive health assessment will appear here after the test starts.\r\n\r\n"
+                "• Express probe (128 samples) rapidly detects NAND flash charge loss, LDPC Soft Decision latency, or HDD platter/head wear.\r\n"
+                "• Full test (100% surface) performs sequential block reading, measures true MB/s transfer rate, and tracks ETA."
+            );
+            WCHAR wzPrompt[1024];
+            U8ToW(szPrompt, wzPrompt, 1024);
+            DrawTextW(memDC, wzPrompt, -1, &textRc, DT_LEFT | DT_WORDBREAK);
+        }
+
+        BitBlt(hdc, 0, 0, w, h, memDC, 0, 0, SRCCOPY);
+        SelectObject(memDC, oldBM);
+        DeleteObject(memBM);
+        DeleteDC(memDC);
+        EndPaint(hWnd, &ps);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    }
+    return DefWindowProcW(hWnd, uMsg, wParam, lParam);
+}
+
+static bool LatencyProbeDlgCallback(int nCurrentSample, int nTotalSamples,
+                                    const LATENCY_SAMPLE* pSample, void* pUserData)
+{
+    LATENCY_DLG_STATE* pState = (LATENCY_DLG_STATE*)pUserData;
+    if (!pState || pState->bCancel) return false;
+
+    pState->nCurrentActiveCell = nCurrentSample;
+
+    DWORD now = GetTickCount();
+    bool bAbnormal = (pSample && pSample->bin >= LATENCY_BIN_SLOW);
+    if (bAbnormal || (now - pState->dwLastProgressTick >= 60) || nCurrentSample == nTotalSamples - 1) {
+        pState->dwLastProgressTick = now;
+        PostMessage(pState->hDlg, WM_LAT_PROGRESS, (WPARAM)nCurrentSample, (LPARAM)nTotalSamples);
+    }
+    return !pState->bCancel;
+}
+
+static DWORD WINAPI LatencyProbeThreadProc(LPVOID lpParam)
+{
+    LATENCY_DLG_STATE* pState = (LATENCY_DLG_STATE*)lpParam;
+    if (!pState) return 0;
+
+    RunLatencyProbeEx(pState->nDriveIndex,
+                       pState->nCapacityBytes,
+                       pState->eMode,
+                       128,
+                       &pState->result,
+                       LatencyProbeDlgCallback,
+                       pState,
+                       &pState->bCancel);
+
+    LatencyProbeAssessVerdict(&pState->result, pState->bIsSsd);
+    PostMessage(pState->hDlg, WM_LAT_FINISHED, 0, 0);
+    return 0;
+}
+
+static LRESULT CALLBACK LatencyDlgProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
+    switch (uMsg) {
+    case WM_CREATE:
+    {
+        CREATESTRUCTW* cs = (CREATESTRUCTW*)lParam;
+        LATENCY_DLG_STATE* pState = (LATENCY_DLG_STATE*)cs->lpCreateParams;
+        if (!pState) return -1;
+        pState->hDlg = hDlg;
+        SetPropA(hDlg, "DM_LAT_STATE", (HANDLE)pState);
+
+        RECT rc;
+        GetClientRect(hDlg, &rc);
+        int cx = rc.right - rc.left;
+        int cy = rc.bottom - rc.top;
+
+        int margin = UiScale(14);
+        int w = cx - 2 * margin;
+
+        char szBanner[512];
+        double capGb = (double)pState->nCapacityBytes / (1024.0 * 1024.0 * 1024.0);
+        safe_snprintf(szBanner, "%s: %s  ·  SN: %s  ·  %.1f GB (%s)",
+            TN("Диск", "Drive"), pState->szModel,
+            pState->szSerial[0] ? pState->szSerial : "—",
+            capGb, pState->bIsSsd ? "SSD" : "HDD");
+        HWND hBanner = CreateWindowExU8(0, "STATIC", szBanner,
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+            margin, UiScale(12), w, UiScale(24),
+            hDlg, (HMENU)IDC_LAT_BANNER, g_hInst, NULL);
+        SendMessage(hBanner, WM_SETFONT, (WPARAM)g_hFontTitle, TRUE);
+
+        HWND hGrp = CreateWindowExU8(0, "BUTTON", TN("Режим тестирования", "Benchmark Mode"),
+            WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+            margin, UiScale(42), w, UiScale(58),
+            hDlg, (HMENU)IDC_LAT_GRP, g_hInst, NULL);
+        SendMessage(hGrp, WM_SETFONT, (WPARAM)g_hFontSmall, TRUE);
+
+        int radW = (w - UiScale(28)) / 2;
+        HWND hRad1 = CreateWindowExU8(0, "BUTTON",
+            TN("Экспресс-тест отклика (128 точек, ~1-2 сек)", "Express latency probe (128 samples, ~1-2 s)"),
+            WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_GROUP,
+            margin + UiScale(14), UiScale(64), radW, UiScale(24),
+            hDlg, (HMENU)IDC_LAT_MODE_EXPRESS, g_hInst, NULL);
+        SendMessage(hRad1, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+
+        HWND hRad2 = CreateWindowExU8(0, "BUTTON",
+            TN("Полный тест скорости (100% поверхности, по 1 МиБ)", "Full read speed test (100% surface, 1 MiB blocks)"),
+            WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON,
+            margin + UiScale(14) + radW + UiScale(10), UiScale(64), radW, UiScale(24),
+            hDlg, (HMENU)IDC_LAT_MODE_FULL, g_hInst, NULL);
+        SendMessage(hRad2, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+
+        if (pState->eMode == LATENCY_MODE_FULL) {
+            CheckRadioButton(hDlg, IDC_LAT_MODE_EXPRESS, IDC_LAT_MODE_FULL, IDC_LAT_MODE_FULL);
+        } else {
+            CheckRadioButton(hDlg, IDC_LAT_MODE_EXPRESS, IDC_LAT_MODE_FULL, IDC_LAT_MODE_EXPRESS);
+        }
+
+        HWND hProgress = CreateWindowExW(0, PROGRESS_CLASSW, L"",
+            WS_CHILD | WS_VISIBLE,
+            margin, UiScale(108), w, UiScale(16),
+            hDlg, (HMENU)IDC_LAT_PROGRESS_BAR, g_hInst, NULL);
+        SendMessage(hProgress, PBM_SETRANGE32, 0, 1000);
+
+        HWND hStatus = CreateWindowExU8(0, "STATIC",
+            TN("Готов к запуску. Выберите режим и нажмите «Запустить тест».",
+               "Ready. Select mode and click 'Start Test'."),
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            margin, UiScale(130), w, UiScale(20),
+            hDlg, (HMENU)IDC_LAT_STATUS_STATIC, g_hInst, NULL);
+        SendMessage(hStatus, WM_SETFONT, (WPARAM)g_hFontSmall, TRUE);
+
+        HWND hGrid = CreateWindowExW(WS_EX_CLIENTEDGE, L"DriveMonitorLatencyGrid", L"",
+            WS_CHILD | WS_VISIBLE,
+            margin, UiScale(154), w, UiScale(176),
+            hDlg, (HMENU)IDC_LAT_GRID, g_hInst, NULL);
+        SetPropA(hGrid, "DM_LAT_STATE", (HANDLE)pState);
+
+        HWND hLegend = CreateWindowExW(0, L"DriveMonitorLatencyLegend", L"",
+            WS_CHILD | WS_VISIBLE,
+            margin, UiScale(336), w, UiScale(32),
+            hDlg, (HMENU)IDC_LAT_LEGEND, g_hInst, NULL);
+        SetPropA(hLegend, "DM_LAT_STATE", (HANDLE)pState);
+
+        HWND hVerdict = CreateWindowExW(WS_EX_CLIENTEDGE, L"DriveMonitorLatencyVerdict", L"",
+            WS_CHILD | WS_VISIBLE,
+            margin, UiScale(374), w, UiScale(186),
+            hDlg, (HMENU)IDC_LAT_VERDICT, g_hInst, NULL);
+        SetPropA(hVerdict, "DM_LAT_STATE", (HANDLE)pState);
+
+        int btnY = cy - UiScale(46);
+        int btnH = UiScale(32);
+        HWND hStart = CreateWindowExU8(0, "BUTTON", TN("Запустить тест", "Start Test"),
+            WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON | WS_TABSTOP,
+            margin, btnY, UiScale(140), btnH,
+            hDlg, (HMENU)IDC_LAT_START_BTN, g_hInst, NULL);
+        SendMessage(hStart, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+
+        HWND hStop = CreateWindowExU8(0, "BUTTON", TN("Остановить", "Stop"),
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+            margin + UiScale(150), btnY, UiScale(110), btnH,
+            hDlg, (HMENU)IDC_LAT_STOP_BTN, g_hInst, NULL);
+        SendMessage(hStop, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+        EnableWindow(hStop, FALSE);
+
+        HWND hCopy = CreateWindowExU8(0, "BUTTON", TN("Копировать отчёт", "Copy Report"),
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+            cx - margin - UiScale(250), btnY, UiScale(140), btnH,
+            hDlg, (HMENU)IDC_LAT_COPY_BTN, g_hInst, NULL);
+        SendMessage(hCopy, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+
+        HWND hClose = CreateWindowExU8(0, "BUTTON", TN("Закрыть", "Close"),
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+            cx - margin - UiScale(100), btnY, UiScale(100), btnH,
+            hDlg, (HMENU)IDC_LAT_CLOSE_BTN, g_hInst, NULL);
+        SendMessage(hClose, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+
+        if (pState->result.nSamplesTested > 0) {
+            PostMessage(hDlg, WM_LAT_FINISHED, 0, 0);
+        }
+        return 0;
+    }
+
+    case WM_LAT_PROGRESS:
+    {
+        LATENCY_DLG_STATE* pState = (LATENCY_DLG_STATE*)GetPropA(hDlg, "DM_LAT_STATE");
+        if (!pState) return 0;
+        HWND hProgress = GetDlgItem(hDlg, IDC_LAT_PROGRESS_BAR);
+        HWND hGrid     = GetDlgItem(hDlg, IDC_LAT_GRID);
+        HWND hLegend   = GetDlgItem(hDlg, IDC_LAT_LEGEND);
+
+        if (pState->result.eMode == LATENCY_MODE_FULL) {
+            double pct = 0.0;
+            if (pState->result.nTotalCapacityBytes > 0) {
+                pct = (double)pState->result.nBytesTested * 100.0 / (double)pState->result.nTotalCapacityBytes;
+            }
+            if (pct > 100.0) pct = 100.0;
+            if (hProgress) SendMessage(hProgress, PBM_SETPOS, (WPARAM)(int)(pct * 10.0), 0);
+
+            double curGb = (double)pState->result.nBytesTested / (1024.0 * 1024.0 * 1024.0);
+            double totGb = (double)pState->result.nTotalCapacityBytes / (1024.0 * 1024.0 * 1024.0);
+            int etaSec = (int)pState->result.fEtaSeconds;
+            if (etaSec < 0) etaSec = 0;
+            int etaMin = etaSec / 60;
+            int etaS   = etaSec % 60;
+
+            char szStatus[512];
+            safe_snprintf(szStatus,
+                "%s: %.1f %s (Avg: %.1f | Min: %.1f | Max: %.1f)  ·  %s: %.1f / %.1f GB (%.1f%%)  ·  ETA: %02d:%02d",
+                TN("Скорость", "Speed"), pState->result.fCurrentSpeedMBs, TN("МБ/с", "MB/s"),
+                pState->result.fAvgSpeedMBs, pState->result.fMinSpeedMBs, pState->result.fMaxSpeedMBs,
+                TN("Прогресс", "Progress"), curGb, totGb, pct,
+                etaMin, etaS);
+            SetDlgItemTextU8(hDlg, IDC_LAT_STATUS_STATIC, szStatus);
+        } else {
+            int total = pState->result.nTotalSamples > 0 ? pState->result.nTotalSamples : 128;
+            double pct = (double)pState->result.nSamplesTested * 100.0 / (double)total;
+            if (pct > 100.0) pct = 100.0;
+            if (hProgress) SendMessage(hProgress, PBM_SETPOS, (WPARAM)(int)(pct * 10.0), 0);
+
+            char szStatus[512];
+            safe_snprintf(szStatus,
+                "%s: %d / %d (%.0f%%)  ·  %s: Min: %.2f ms | Avg: %.2f ms | Max: %.2f ms  ·  %s: %.2f s",
+                TN("Проверено", "Tested"), pState->result.nSamplesTested, total, pct,
+                TN("Отклик", "Latency"), pState->result.fMinMs, pState->result.fAvgMs, pState->result.fMaxMs,
+                TN("Время", "Time"), pState->result.fTotalTimeSec);
+            SetDlgItemTextU8(hDlg, IDC_LAT_STATUS_STATIC, szStatus);
+        }
+
+        if (hGrid) InvalidateRect(hGrid, NULL, FALSE);
+        if (hLegend) InvalidateRect(hLegend, NULL, FALSE);
+        return 0;
+    }
+
+    case WM_LAT_FINISHED:
+    {
+        LATENCY_DLG_STATE* pState = (LATENCY_DLG_STATE*)GetPropA(hDlg, "DM_LAT_STATE");
+        if (!pState) return 0;
+        pState->bRunning = false;
+        if (pState->hThread) {
+            CloseHandle(pState->hThread);
+            pState->hThread = NULL;
+        }
+
+        EnableWindow(GetDlgItem(hDlg, IDC_LAT_START_BTN), TRUE);
+        EnableWindow(GetDlgItem(hDlg, IDC_LAT_STOP_BTN), FALSE);
+        EnableWindow(GetDlgItem(hDlg, IDC_LAT_COPY_BTN), TRUE);
+        EnableWindow(GetDlgItem(hDlg, IDC_LAT_MODE_EXPRESS), TRUE);
+        EnableWindow(GetDlgItem(hDlg, IDC_LAT_MODE_FULL), TRUE);
+
+        SetDriveLatencyResult(pState->nDriveIndex, &pState->result);
+
+        HWND hProgress = GetDlgItem(hDlg, IDC_LAT_PROGRESS_BAR);
+        if (hProgress) SendMessage(hProgress, PBM_SETPOS, 1000, 0);
+
+        char szStatus[512];
+        if (pState->result.bAborted) {
+            safe_snprintf(szStatus, "%s (%s: %.2f s)",
+                TN("Тестирование остановлено пользователем", "Test stopped by user"),
+                TN("Время", "Duration"), pState->result.fTotalTimeSec);
+        } else if (pState->result.eMode == LATENCY_MODE_FULL) {
+            double totGb = (double)pState->result.nTotalCapacityBytes / (1024.0 * 1024.0 * 1024.0);
+            safe_snprintf(szStatus,
+                "%s (%.1f GB)  ·  %s: %.1f %s (Min: %.1f | Max: %.1f)  ·  %s: %.1f s",
+                TN("Полный тест завершен", "Full test complete"), totGb,
+                TN("Ср. скорость", "Avg speed"), pState->result.fAvgSpeedMBs, TN("МБ/с", "MB/s"),
+                pState->result.fMinSpeedMBs, pState->result.fMaxSpeedMBs,
+                TN("Время", "Duration"), pState->result.fTotalTimeSec);
+        } else {
+            safe_snprintf(szStatus,
+                "%s (%d %s)  ·  %s: Min: %.2f ms | Avg: %.2f ms | Max: %.2f ms  ·  %s: %.2f s",
+                TN("Экспресс-тест завершен", "Express test complete"), pState->result.nSamplesTested, TN("точек", "points"),
+                TN("Отклик", "Latency"), pState->result.fMinMs, pState->result.fAvgMs, pState->result.fMaxMs,
+                TN("Время", "Duration"), pState->result.fTotalTimeSec);
+        }
+        SetDlgItemTextU8(hDlg, IDC_LAT_STATUS_STATIC, szStatus);
+
+        HWND hGrid    = GetDlgItem(hDlg, IDC_LAT_GRID);
+        HWND hLegend  = GetDlgItem(hDlg, IDC_LAT_LEGEND);
+        HWND hVerdict = GetDlgItem(hDlg, IDC_LAT_VERDICT);
+        if (hGrid) InvalidateRect(hGrid, NULL, FALSE);
+        if (hLegend) InvalidateRect(hLegend, NULL, FALSE);
+        if (hVerdict) InvalidateRect(hVerdict, NULL, FALSE);
+        return 0;
+    }
+
+    case WM_COMMAND:
+    {
+        int id = LOWORD(wParam);
+        LATENCY_DLG_STATE* pState = (LATENCY_DLG_STATE*)GetPropA(hDlg, "DM_LAT_STATE");
+        if (!pState) return 0;
+
+        if (id == IDC_LAT_MODE_EXPRESS) {
+            pState->eMode = LATENCY_MODE_EXPRESS;
+        }
+        else if (id == IDC_LAT_MODE_FULL) {
+            pState->eMode = LATENCY_MODE_FULL;
+        }
+        else if (id == IDC_LAT_START_BTN) {
+            if (pState->bRunning) return 0;
+
+            pState->eMode = IsDlgButtonChecked(hDlg, IDC_LAT_MODE_FULL) ? LATENCY_MODE_FULL : LATENCY_MODE_EXPRESS;
+
+            EnableWindow(GetDlgItem(hDlg, IDC_LAT_START_BTN), FALSE);
+            EnableWindow(GetDlgItem(hDlg, IDC_LAT_STOP_BTN), TRUE);
+            EnableWindow(GetDlgItem(hDlg, IDC_LAT_MODE_EXPRESS), FALSE);
+            EnableWindow(GetDlgItem(hDlg, IDC_LAT_MODE_FULL), FALSE);
+
+            ZeroMemory(&pState->result, sizeof(pState->result));
+            pState->result.eMode = pState->eMode;
+            pState->result.nTotalSamples = 128;
+            pState->nCurrentActiveCell = -1;
+            pState->bRunning = true;
+            pState->bCancel = false;
+            pState->dwLastProgressTick = 0;
+
+            HWND hProgress = GetDlgItem(hDlg, IDC_LAT_PROGRESS_BAR);
+            if (hProgress) SendMessage(hProgress, PBM_SETPOS, 0, 0);
+
+            SetDlgItemTextU8(hDlg, IDC_LAT_STATUS_STATIC,
+                pState->eMode == LATENCY_MODE_FULL
+                    ? TN("Запуск последовательного тестирования скорости по всей поверхности...",
+                         "Starting full sequential surface read benchmark...")
+                    : TN("Запуск экспресс-проверки времени отклика ячеек...",
+                         "Starting express cell latency probe..."));
+
+            InvalidateRect(GetDlgItem(hDlg, IDC_LAT_GRID), NULL, FALSE);
+            InvalidateRect(GetDlgItem(hDlg, IDC_LAT_LEGEND), NULL, FALSE);
+            InvalidateRect(GetDlgItem(hDlg, IDC_LAT_VERDICT), NULL, FALSE);
+
+            DWORD dwThreadId = 0;
+            pState->hThread = CreateThread(NULL, 0, LatencyProbeThreadProc, pState, 0, &dwThreadId);
+            if (!pState->hThread) {
+                pState->bRunning = false;
+                EnableWindow(GetDlgItem(hDlg, IDC_LAT_START_BTN), TRUE);
+                EnableWindow(GetDlgItem(hDlg, IDC_LAT_STOP_BTN), FALSE);
+                EnableWindow(GetDlgItem(hDlg, IDC_LAT_MODE_EXPRESS), TRUE);
+                EnableWindow(GetDlgItem(hDlg, IDC_LAT_MODE_FULL), TRUE);
+                MessageBoxU8(hDlg, TN("Не удалось создать рабочий поток теста.", "Failed to create benchmark thread."),
+                             "DriveMonitor", MB_OK | MB_ICONERROR);
+            }
+        }
+        else if (id == IDC_LAT_STOP_BTN) {
+            pState->bCancel = true;
+            EnableWindow(GetDlgItem(hDlg, IDC_LAT_STOP_BTN), FALSE);
+            SetDlgItemTextU8(hDlg, IDC_LAT_STATUS_STATIC, TN("Остановка теста...", "Stopping benchmark..."));
+        }
+        else if (id == IDC_LAT_COPY_BTN) {
+            char szSummary[8192];
+            FormatLatencySummary(&pState->result, pState->szModel, pState->szSerial,
+                                 pState->nCapacityBytes, pState->bIsSsd,
+                                 szSummary, sizeof(szSummary));
+            CopyTextToClipboard(hDlg, szSummary);
+            MessageBoxU8(hDlg,
+                TN("Отчёт о тестировании успешно скопирован в буфер обмена.",
+                   "Benchmark report successfully copied to clipboard."),
+                "DriveMonitor", MB_OK | MB_ICONINFORMATION);
+        }
+        else if (id == IDC_LAT_CLOSE_BTN || id == IDCANCEL) {
+            SendMessage(hDlg, WM_CLOSE, 0, 0);
+        }
+        return 0;
+    }
+
+    case WM_CLOSE:
+    {
+        LATENCY_DLG_STATE* pState = (LATENCY_DLG_STATE*)GetPropA(hDlg, "DM_LAT_STATE");
+        if (pState && pState->bRunning) {
+            pState->bCancel = true;
+            if (pState->hThread) {
+                WaitForSingleObject(pState->hThread, 500);
+            }
+        }
+        DestroyWindow(hDlg);
+        return 0;
+    }
+
+    case WM_DESTROY:
+    {
+        LATENCY_DLG_STATE* pState = (LATENCY_DLG_STATE*)GetPropA(hDlg, "DM_LAT_STATE");
+        if (pState) {
+            if (pState->hThread) {
+                CloseHandle(pState->hThread);
+                pState->hThread = NULL;
+            }
+            RemovePropA(hDlg, "DM_LAT_STATE");
+            free(pState);
+        }
+        return 0;
+    }
+    }
+
+    return DefWindowProcW(hDlg, uMsg, wParam, lParam);
+}
+
+BOOL DrivePanelOnMouseWheel(const MSG* msg)
+{
+    (void)msg;
+    return FALSE;
+}
+
+void ShowLatencyProbeDialogEx(HWND hParent, int nDriveIndex, int initialMode)
+{
+    static BOOL bClassesRegistered = FALSE;
+
+    if (g_nDriveCount <= 0 || nDriveIndex < 0 || nDriveIndex >= g_nDriveCount) {
+        MessageBoxU8(hParent, Tr(STR_NO_DRIVE), "DriveMonitor", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    const DRIVE_INFO* pInfo = &g_Drives[nDriveIndex];
+
+    if (!bClassesRegistered) {
+        WNDCLASSW wc;
+        ZeroMemory(&wc, sizeof(wc));
+        wc.style         = CS_HREDRAW | CS_VREDRAW;
+        wc.hInstance     = g_hInst;
+        wc.hCursor       = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
+
+        wc.lpfnWndProc   = LatencyGridWndProc;
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"DriveMonitorLatencyGrid";
+        RegisterClassW(&wc);
+
+        wc.lpfnWndProc   = LatencyLegendWndProc;
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"DriveMonitorLatencyLegend";
+        RegisterClassW(&wc);
+
+        wc.lpfnWndProc   = LatencyVerdictWndProc;
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"DriveMonitorLatencyVerdict";
+        RegisterClassW(&wc);
+
+        wc.lpfnWndProc   = LatencyDlgProc;
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.hIcon         = LoadIconW(g_hInst, MAKEINTRESOURCEW(IDI_APPICON));
+        wc.lpszClassName = L"DriveMonitorLatencyDlg";
+        RegisterClassW(&wc);
+
+        bClassesRegistered = TRUE;
+    }
+
+    HWND hExist = FindWindowW(L"DriveMonitorLatencyDlg", NULL);
+    if (hExist) {
+        SetForegroundWindow(hExist);
+        return;
+    }
+
+    LATENCY_DLG_STATE* pState = (LATENCY_DLG_STATE*)calloc(1, sizeof(LATENCY_DLG_STATE));
+    if (!pState) return;
+
+    pState->nDriveIndex = nDriveIndex;
+    pState->nCapacityBytes = (uint64_t)pInfo->dwCapacityMB * 1024ULL * 1024ULL;
+    pState->bIsSsd = (pInfo->bIsNVMe ||
+                      pInfo->eType == DRIVE_TYPE_SSD_SATA ||
+                      pInfo->eType == DRIVE_TYPE_M2_SATA ||
+                      pInfo->eType == DRIVE_TYPE_NVME ||
+                      pInfo->eType == DRIVE_TYPE_EMMC);
+    lstrcpynA(pState->szModel, pInfo->szModel[0] ? pInfo->szModel : "Drive", (int)sizeof(pState->szModel));
+    lstrcpynA(pState->szSerial, pInfo->szSerial, (int)sizeof(pState->szSerial));
+    pState->eMode = (initialMode == LATENCY_MODE_FULL) ? LATENCY_MODE_FULL : LATENCY_MODE_EXPRESS;
+
+    const LATENCY_PROBE_RESULT* pCached = GetDriveLatencyResult(nDriveIndex);
+    if (pCached && pCached->nSamplesTested > 0) {
+        pState->result = *pCached;
+    } else {
+        pState->result.eMode = pState->eMode;
+        pState->result.nTotalSamples = 128;
+    }
+
+    int dlgW = UiScale(720);
+    int dlgH = UiScale(620);
+    int nX, nY;
+
+    if (hParent) {
+        RECT rcP;
+        GetWindowRect(hParent, &rcP);
+        nX = rcP.left + (rcP.right - rcP.left - dlgW) / 2;
+        nY = rcP.top + (rcP.bottom - rcP.top - dlgH) / 2;
+    } else {
+        nX = (GetSystemMetrics(SM_CXSCREEN) - dlgW) / 2;
+        nY = (GetSystemMetrics(SM_CYSCREEN) - dlgH) / 2;
+    }
+
+    char szTitle[256];
+    safe_snprintf(szTitle, "%s — %s (%s)",
+        TN("Тестирование чтения и отклика ячеек", "Read Speed & Latency Benchmark"),
+        pState->szModel,
+        pState->bIsSsd ? "SSD" : "HDD");
+
+    WCHAR wzTitle[256];
+    U8ToW(szTitle, wzTitle, 256);
+
+    RECT rcAdj;
+    rcAdj.left = 0; rcAdj.top = 0; rcAdj.right = dlgW; rcAdj.bottom = dlgH;
+    AdjustWindowRectEx(&rcAdj, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE, 0);
+
+    HWND hDlg = CreateWindowExW(
+        0,
+        L"DriveMonitorLatencyDlg",
+        wzTitle,
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        nX, nY,
+        rcAdj.right - rcAdj.left,
+        rcAdj.bottom - rcAdj.top,
+        hParent,
+        NULL,
+        g_hInst,
+        (LPVOID)pState
+    );
+
+    if (hDlg) {
+        ShowWindow(hDlg, SW_SHOW);
+        UpdateWindow(hDlg);
+    }
+}
+
+void ShowLatencyProbeDialog(HWND hParent, int nDriveIndex)
+{
+    ShowLatencyProbeDialogEx(hParent, nDriveIndex, LATENCY_MODE_EXPRESS);
+}
+
+
+
+/* ============================================================================
+ * DRAM Buffer Integrity & Silent Data Corruption (Bit Flip) Dialog
+ * ============================================================================ */
+
+#define IDC_DRAM_BANNER         6001
+#define IDC_DRAM_VOL_LBL        6002
+#define IDC_DRAM_VOL_COMBO      6003
+#define IDC_DRAM_MODE_GRP       6004
+#define IDC_DRAM_MODE_EXP       6005
+#define IDC_DRAM_MODE_STD       6006
+#define IDC_DRAM_MODE_STR       6007
+#define IDC_DRAM_PROGRESS       6008
+#define IDC_DRAM_STATUS         6009
+#define IDC_DRAM_VERDICT        6010
+#define IDC_DRAM_LOG            6011
+#define IDC_DRAM_START_BTN      6012
+#define IDC_DRAM_STOP_BTN       6013
+#define IDC_DRAM_COPY_BTN       6014
+#define IDC_DRAM_CLOSE_BTN      6015
+
+#define WM_DRAM_PROGRESS        (WM_APP + 31)
+#define WM_DRAM_DONE            (WM_APP + 32)
+
+typedef struct _DRAM_DLG_STATE {
+    HWND                hDlg;
+    int                 nDriveIndex;
+    char                szModel[64];
+    char                szSerial[64];
+    bool                bIsSsd;
+    char                szVolume[32];
+    DRAM_VERIFY_MODE    eMode;
+    DRAM_VERIFY_RESULT  result;
+    HANDLE              hThread;
+    volatile bool       bRunning;
+    volatile bool       bCancel;
+    DWORD               dwLastProgressTick;
+} DRAM_DLG_STATE;
+
+static LRESULT CALLBACK DramVerdictWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
+    switch (uMsg) {
+    case WM_PAINT:
+    {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hWnd, &ps);
+        RECT rc;
+        GetClientRect(hWnd, &rc);
+        int w = rc.right - rc.left;
+        int h = rc.bottom - rc.top;
+
+        HDC memDC = CreateCompatibleDC(hdc);
+        HBITMAP memBM = CreateCompatibleBitmap(hdc, w, h);
+        HGDIOBJ oldBM = SelectObject(memDC, memBM);
+
+        DRAM_DLG_STATE* pState = (DRAM_DLG_STATE*)GetPropA(hWnd, "DM_DRAM_STATE");
+        const DRAM_VERIFY_RESULT* pRes = pState ? &pState->result : NULL;
+
+        COLORREF bgClr = RGB(255, 255, 255);
+        COLORREF borderClr = RGB(218, 222, 228);
+        COLORREF badgeBg = RGB(240, 243, 246);
+        COLORREF badgeTextClr = RGB(60, 64, 67);
+
+        if (pRes && pRes->szVerdictBadge[0] != '\0') {
+            if (pRes->bPassed) {
+                bgClr = RGB(250, 255, 250);
+                borderClr = RGB(163, 230, 184);
+                badgeBg = RGB(230, 248, 235);
+                badgeTextClr = RGB(20, 108, 48);
+            } else if (pRes->bAborted) {
+                bgClr = RGB(255, 254, 248);
+                borderClr = RGB(249, 226, 150);
+                badgeBg = RGB(254, 249, 231);
+                badgeTextClr = RGB(183, 121, 31);
+            } else {
+                bgClr = RGB(255, 248, 248);
+                borderClr = RGB(252, 180, 180);
+                badgeBg = RGB(254, 232, 232);
+                badgeTextClr = RGB(190, 30, 30);
+            }
+        }
+
+        HBRUSH hBgBrush = CreateSolidBrush(bgClr);
+        FillRect(memDC, &rc, hBgBrush);
+        DeleteObject(hBgBrush);
+
+        HPEN hPen = CreatePen(PS_SOLID, 1, borderClr);
+        HGDIOBJ oldPen = SelectObject(memDC, hPen);
+        HGDIOBJ oldBrush = SelectObject(memDC, GetStockObject(NULL_BRUSH));
+        Rectangle(memDC, 0, 0, w, h);
+        SelectObject(memDC, oldBrush);
+        SelectObject(memDC, oldPen);
+        DeleteObject(hPen);
+
+        SetBkMode(memDC, TRANSPARENT);
+
+        if (pRes && pRes->szVerdictBadge[0] != '\0') {
+            RECT badgeRc = { UiScale(14), UiScale(10), UiScale(240), UiScale(36) };
+            HBRUSH hBadgeBrush = CreateSolidBrush(badgeBg);
+            HPEN hBadgePen = CreatePen(PS_SOLID, 1, borderClr);
+            HGDIOBJ p1 = SelectObject(memDC, hBadgeBrush);
+            HGDIOBJ p2 = SelectObject(memDC, hBadgePen);
+            RoundRect(memDC, badgeRc.left, badgeRc.top, badgeRc.right, badgeRc.bottom, UiScale(6), UiScale(6));
+            SelectObject(memDC, p2);
+            SelectObject(memDC, p1);
+            DeleteObject(hBadgeBrush);
+            DeleteObject(hBadgePen);
+
+            SetTextColor(memDC, badgeTextClr);
+            SelectObject(memDC, g_hFontNormal);
+            WCHAR wzBadge[64];
+            U8ToW(pRes->szVerdictBadge, wzBadge, 64);
+            DrawTextW(memDC, wzBadge, -1, &badgeRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+            RECT textRc = { UiScale(14), UiScale(44), w - UiScale(14), h - UiScale(6) };
+            SetTextColor(memDC, RGB(40, 44, 48));
+            SelectObject(memDC, g_hFontNormal);
+            WCHAR wzText[1024];
+            U8ToW(pRes->szVerdictText, wzText, 1024);
+            DrawTextW(memDC, wzText, -1, &textRc, DT_LEFT | DT_WORDBREAK);
+        } else {
+            RECT textRc = { UiScale(14), UiScale(12), w - UiScale(14), h - UiScale(8) };
+            SetTextColor(memDC, RGB(110, 115, 122));
+            SelectObject(memDC, g_hFontNormal);
+            const char* szPrompt = TN(
+                "Диагностический вердикт буфера DRAM появится здесь после запуска проверки.\r\n\r\n"
+                "• Тест выполняет прямую запись стресс-паттернов в обход кэша Windows (Write-Through / No-Buffering).\r\n"
+                "• Затем данные вычитываются и побитово сверяются с эталоном для выявления скрытых битовых сбоев (Bit Flip).",
+                "Diagnostic DRAM buffer verdict will appear here after the test starts.\r\n\r\n"
+                "• Direct unbuffered write-through patterns bypass Windows host RAM cache.\r\n"
+                "• Read-After-Write loopback verification detects silent data corruption and bit-flips."
+            );
+            WCHAR wzPrompt[1024];
+            U8ToW(szPrompt, wzPrompt, 1024);
+            DrawTextW(memDC, wzPrompt, -1, &textRc, DT_LEFT | DT_WORDBREAK);
+        }
+
+        BitBlt(hdc, 0, 0, w, h, memDC, 0, 0, SRCCOPY);
+        SelectObject(memDC, oldBM);
+        DeleteObject(memBM);
+        DeleteDC(memDC);
+        EndPaint(hWnd, &ps);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    }
+    return DefWindowProcW(hWnd, uMsg, wParam, lParam);
+}
+
+static bool DramVerifyDlgCallback(const DRAM_VERIFY_RESULT* pResult, void* pUserData)
+{
+    DRAM_DLG_STATE* pState = (DRAM_DLG_STATE*)pUserData;
+    if (!pState || pState->bCancel) return false;
+
+    DWORD now = GetTickCount();
+    if ((now - pState->dwLastProgressTick >= 80) ||
+        pResult->eStage == DRAM_STAGE_COMPLETED ||
+        pResult->eStage == DRAM_STAGE_FAILED) {
+        pState->dwLastProgressTick = now;
+        pState->result = *pResult;
+        PostMessage(pState->hDlg, WM_DRAM_PROGRESS, 0, 0);
+    }
+    return !pState->bCancel;
+}
+
+static DWORD WINAPI DramVerifyWorkerThread(LPVOID lpParam)
+{
+    DRAM_DLG_STATE* pState = (DRAM_DLG_STATE*)lpParam;
+    if (!pState) return 0;
+
+    pState->bRunning = true;
+    pState->bCancel = false;
+
+    RunDramVerification(pState->szVolume,
+                        pState->eMode,
+                        &pState->result,
+                        DramVerifyDlgCallback,
+                        pState,
+                        &pState->bCancel);
+
+    SetDriveDramVerifyResult(pState->nDriveIndex, &pState->result);
+
+    if (pState->nDriveIndex >= 0 && pState->nDriveIndex < g_nDriveCount) {
+        DRIVE_INFO* pD = &g_Drives[pState->nDriveIndex];
+        pD->bDramTested = TRUE;
+        pD->bDramCorruption = (pState->result.nCorruptedBytes > 0);
+        pD->nDramCorruptedBytes = pState->result.nCorruptedBytes;
+        pD->nDramBitFlips = pState->result.nTotalBitFlips;
+        AssessDriveHealth(pD);
+    }
+
+    pState->bRunning = false;
+    PostMessage(pState->hDlg, WM_DRAM_DONE, 0, 0);
+    return 0;
+}
+
+static LRESULT CALLBACK DramDlgProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
+    switch (uMsg) {
+    case WM_CREATE:
+    {
+        CREATESTRUCTW* cs = (CREATESTRUCTW*)lParam;
+        DRAM_DLG_STATE* pState = (DRAM_DLG_STATE*)cs->lpCreateParams;
+        SetPropA(hDlg, "DM_DRAM_STATE", (HANDLE)pState);
+        pState->hDlg = hDlg;
+
+        RECT rcC;
+        GetClientRect(hDlg, &rcC);
+        int w = rcC.right - rcC.left;
+
+        HWND hBanner = CreateWindowExU8(0, "STATIC",
+            TN("Аппаратная проверка буфера памяти DRAM (Read-After-Write)",
+               "DRAM Buffer Integrity & Silent Bit Flip Verification"),
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            UiScale(20), UiScale(14), w - UiScale(40), UiScale(24),
+            hDlg, (HMENU)IDC_DRAM_BANNER, g_hInst, NULL);
+        SendMessage(hBanner, WM_SETFONT, (WPARAM)g_hFontTitle, TRUE);
+
+        /* Volume selection */
+        HWND hVolLbl = CreateWindowExU8(0, "STATIC",
+            TN("Целевой том:", "Target volume:"),
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            UiScale(20), UiScale(46), UiScale(110), UiScale(22),
+            hDlg, (HMENU)IDC_DRAM_VOL_LBL, g_hInst, NULL);
+        SendMessage(hVolLbl, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+
+        HWND hCombo = CreateWindowExU8(0, "COMBOBOX", "",
+            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+            UiScale(130), UiScale(42), UiScale(280), UiScale(160),
+            hDlg, (HMENU)IDC_DRAM_VOL_COMBO, g_hInst, NULL);
+        SendMessage(hCombo, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+
+        /* Populate volume combo */
+        const DRIVE_INFO* pInfo = (pState->nDriveIndex >= 0 && pState->nDriveIndex < g_nDriveCount)
+                                  ? &g_Drives[pState->nDriveIndex] : NULL;
+        int nAdded = 0;
+        if (pInfo && pInfo->trimInfo.bQueried && pInfo->trimInfo.nVolumeCount > 0) {
+            for (int vi = 0; vi < pInfo->trimInfo.nVolumeCount; vi++) {
+                const VOLUME_INFO_ENTRY* v = &pInfo->trimInfo.volumes[vi];
+                char szItem[128];
+                double flFree = (double)v->qwFreeBytes / (1024.0 * 1024.0 * 1024.0);
+                safe_snprintf(szItem, "%s [%s] (%.1f GB %s)",
+                    v->szLetter, v->szFileSystem[0] ? v->szFileSystem : "FS",
+                    flFree, TN("свободно", "free"));
+                WCHAR wzItem[128];
+                U8ToW(szItem, wzItem, 128);
+                SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)wzItem);
+                nAdded++;
+            }
+        }
+        if (nAdded == 0) {
+            SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"C:\\ (Системный том)");
+        }
+        SendMessageW(hCombo, CB_SETCURSEL, 0, 0);
+
+        /* Mode radio buttons */
+        HWND hGrp = CreateWindowExU8(0, "BUTTON",
+            TN("Режим тестирования", "Verification mode"),
+            WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+            UiScale(20), UiScale(74), w - UiScale(40), UiScale(56),
+            hDlg, (HMENU)IDC_DRAM_MODE_GRP, g_hInst, NULL);
+        SendMessage(hGrp, WM_SETFONT, (WPARAM)g_hFontSmall, TRUE);
+
+        HWND hRad1 = CreateWindowExU8(0, "BUTTON",
+            TN("Экспресс (32 МБ)", "Express (32 MB)"),
+            WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_GROUP,
+            UiScale(32), UiScale(94), UiScale(190), UiScale(24),
+            hDlg, (HMENU)IDC_DRAM_MODE_EXP, g_hInst, NULL);
+        SendMessage(hRad1, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+
+        HWND hRad2 = CreateWindowExU8(0, "BUTTON",
+            TN("Стандарт (128 МБ)", "Standard (128 MB)"),
+            WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON,
+            UiScale(230), UiScale(94), UiScale(190), UiScale(24),
+            hDlg, (HMENU)IDC_DRAM_MODE_STD, g_hInst, NULL);
+        SendMessage(hRad2, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+
+        HWND hRad3 = CreateWindowExU8(0, "BUTTON",
+            TN("Полный стресс (512 МБ)", "Full stress (512 MB)"),
+            WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON,
+            UiScale(430), UiScale(94), UiScale(220), UiScale(24),
+            hDlg, (HMENU)IDC_DRAM_MODE_STR, g_hInst, NULL);
+        SendMessage(hRad3, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+
+        CheckRadioButton(hDlg, IDC_DRAM_MODE_EXP, IDC_DRAM_MODE_STR, IDC_DRAM_MODE_EXP);
+
+        /* Progress Bar */
+        HWND hProg = CreateWindowExW(0, PROGRESS_CLASSW, L"",
+            WS_CHILD | WS_VISIBLE | PBS_SMOOTH,
+            UiScale(20), UiScale(140), w - UiScale(40), UiScale(20),
+            hDlg, (HMENU)IDC_DRAM_PROGRESS, g_hInst, NULL);
+        SendMessage(hProg, PBM_SETRANGE32, 0, 1000);
+
+        /* Status static */
+        HWND hStat = CreateWindowExU8(0, "STATIC",
+            TN("Готов к проверке буфера DRAM", "Ready for DRAM buffer verification"),
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            UiScale(20), UiScale(166), w - UiScale(40), UiScale(18),
+            hDlg, (HMENU)IDC_DRAM_STATUS, g_hInst, NULL);
+        SendMessage(hStat, WM_SETFONT, (WPARAM)g_hFontSmall, TRUE);
+
+        /* Verdict custom window */
+        HWND hVerdict = CreateWindowExW(0, L"DriveMonitorDramVerdict", L"",
+            WS_CHILD | WS_VISIBLE,
+            UiScale(20), UiScale(190), w - UiScale(40), UiScale(100),
+            hDlg, (HMENU)IDC_DRAM_VERDICT, g_hInst, NULL);
+        SetPropA(hVerdict, "DM_DRAM_STATE", (HANDLE)pState);
+
+        /* Detail / log window */
+        HWND hLog = CreateWindowExU8(WS_EX_CLIENTEDGE, "EDIT", "",
+            WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL,
+            UiScale(20), UiScale(300), w - UiScale(40), UiScale(210),
+            hDlg, (HMENU)IDC_DRAM_LOG, g_hInst, NULL);
+        SendMessage(hLog, WM_SETFONT, (WPARAM)g_hFontSmall, TRUE);
+
+        /* Buttons */
+        HWND hStart = CreateWindowExU8(0, "BUTTON",
+            TN("Начать тест", "Start Test"),
+            WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+            UiScale(20), UiScale(524), UiScale(140), UiScale(30),
+            hDlg, (HMENU)IDC_DRAM_START_BTN, g_hInst, NULL);
+        SendMessage(hStart, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+
+        HWND hStop = CreateWindowExU8(0, "BUTTON",
+            TN("Остановить", "Stop"),
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            UiScale(170), UiScale(524), UiScale(110), UiScale(30),
+            hDlg, (HMENU)IDC_DRAM_STOP_BTN, g_hInst, NULL);
+        SendMessage(hStop, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+        EnableWindow(hStop, FALSE);
+
+        HWND hCopy = CreateWindowExU8(0, "BUTTON",
+            TN("Копировать отчёт", "Copy Report"),
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            UiScale(290), UiScale(524), UiScale(150), UiScale(30),
+            hDlg, (HMENU)IDC_DRAM_COPY_BTN, g_hInst, NULL);
+        SendMessage(hCopy, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+        EnableWindow(hCopy, FALSE);
+
+        HWND hClose = CreateWindowExU8(0, "BUTTON",
+            TN("Закрыть", "Close"),
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            w - UiScale(130), UiScale(524), UiScale(110), UiScale(30),
+            hDlg, (HMENU)IDC_DRAM_CLOSE_BTN, g_hInst, NULL);
+        SendMessage(hClose, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+
+        return 0;
+    }
+
+    case WM_DRAM_PROGRESS:
+    {
+        DRAM_DLG_STATE* pState = (DRAM_DLG_STATE*)GetPropA(hDlg, "DM_DRAM_STATE");
+        if (!pState) return 0;
+
+        uint64_t tested = pState->result.nBytesTested;
+        uint64_t total  = pState->result.nTotalBytesToTest;
+        if (total == 0) total = 1;
+
+        int nPos = (int)((tested * 1000ULL) / total);
+        if (nPos > 1000) nPos = 1000;
+        SendMessage(GetDlgItem(hDlg, IDC_DRAM_PROGRESS), PBM_SETPOS, (WPARAM)nPos, 0);
+
+        char szStatus[256];
+        double mbDone = (double)tested / (1024.0 * 1024.0);
+        double mbTot  = (double)total  / (1024.0 * 1024.0);
+
+        if (pState->result.eStage == DRAM_STAGE_WRITING) {
+            safe_snprintf(szStatus, "%s... %.1f / %.1f MB (%.1f %s)",
+                TN("Прямая запись проверочных стресс-паттернов (Write-Through)",
+                   "Direct stress pattern writing (Write-Through)"),
+                mbDone, mbTot, pState->result.fWriteSpeedMBs, TN("МБ/с", "MB/s"));
+        } else if (pState->result.eStage == DRAM_STAGE_FLUSHING) {
+            safe_snprintf(szStatus, "%s",
+                TN("Аппаратный сброс буферов контроллера (FlushFileBuffers)...",
+                   "Flushing controller hardware buffers (FlushFileBuffers)..."));
+        } else if (pState->result.eStage == DRAM_STAGE_READING_VERIFYING) {
+            safe_snprintf(szStatus, "%s... %.1f / %.1f MB (%.1f %s)  [Ошибок: %llu]",
+                TN("Побитовая верификация (Read-After-Write)",
+                   "Bitwise verification (Read-After-Write)"),
+                mbDone, mbTot, pState->result.fReadSpeedMBs, TN("МБ/с", "MB/s"),
+                (unsigned long long)pState->result.nCorruptedBytes);
+        } else {
+            safe_snprintf(szStatus, "%s", TN("Тестирование завершено", "Test completed"));
+        }
+        SetDlgItemTextU8(hDlg, IDC_DRAM_STATUS, szStatus);
+        return 0;
+    }
+
+    case WM_DRAM_DONE:
+    {
+        DRAM_DLG_STATE* pState = (DRAM_DLG_STATE*)GetPropA(hDlg, "DM_DRAM_STATE");
+        if (!pState) return 0;
+
+        EnableWindow(GetDlgItem(hDlg, IDC_DRAM_START_BTN), TRUE);
+        EnableWindow(GetDlgItem(hDlg, IDC_DRAM_STOP_BTN), FALSE);
+        EnableWindow(GetDlgItem(hDlg, IDC_DRAM_COPY_BTN), TRUE);
+        EnableWindow(GetDlgItem(hDlg, IDC_DRAM_VOL_COMBO), TRUE);
+        EnableWindow(GetDlgItem(hDlg, IDC_DRAM_MODE_EXP), TRUE);
+        EnableWindow(GetDlgItem(hDlg, IDC_DRAM_MODE_STD), TRUE);
+        EnableWindow(GetDlgItem(hDlg, IDC_DRAM_MODE_STR), TRUE);
+
+        SendMessage(GetDlgItem(hDlg, IDC_DRAM_PROGRESS), PBM_SETPOS, 1000, 0);
+
+        char szStatus[256];
+        if (pState->result.bPassed) {
+            safe_snprintf(szStatus, "%s: %.1f MB (W: %.1f MB/s, R: %.1f MB/s) — 0 %s",
+                TN("Проверка успешно пройдена", "Verification passed"),
+                (double)pState->result.nBytesTested / (1024.0 * 1024.0),
+                pState->result.fWriteSpeedMBs, pState->result.fReadSpeedMBs,
+                TN("ошибок", "errors"));
+        } else if (pState->result.bAborted) {
+            safe_snprintf(szStatus, "%s", TN("Тест остановлен пользователем", "Test aborted by user"));
+        } else {
+            safe_snprintf(szStatus, "%s: %llu %s (%llu %s)!",
+                TN("ОБНАРУЖЕНЫ СБОИ", "FAILURES DETECTED"),
+                (unsigned long long)pState->result.nCorruptedBytes,
+                TN("искажённых байт", "corrupted bytes"),
+                (unsigned long long)pState->result.nTotalBitFlips,
+                TN("битовых инверсий", "bit flips"));
+        }
+        SetDlgItemTextU8(hDlg, IDC_DRAM_STATUS, szStatus);
+
+        InvalidateRect(GetDlgItem(hDlg, IDC_DRAM_VERDICT), NULL, FALSE);
+
+        char szSummary[8192];
+        FormatDramVerifySummary(&pState->result, pState->szModel, pState->szSerial,
+                                szSummary, sizeof(szSummary));
+        SetDlgItemTextU8(hDlg, IDC_DRAM_LOG, szSummary);
+
+        if (g_hMainWnd) {
+            InvalidateRect(g_hMainWnd, NULL, TRUE);
+        }
+        return 0;
+    }
+
+    case WM_COMMAND:
+    {
+        int id = LOWORD(wParam);
+        DRAM_DLG_STATE* pState = (DRAM_DLG_STATE*)GetPropA(hDlg, "DM_DRAM_STATE");
+        if (!pState) return 0;
+
+        if (id == IDC_DRAM_START_BTN) {
+            if (pState->bRunning) return 0;
+
+            if (IsDlgButtonChecked(hDlg, IDC_DRAM_MODE_STR)) {
+                pState->eMode = DRAM_VERIFY_MODE_STRESS;
+            } else if (IsDlgButtonChecked(hDlg, IDC_DRAM_MODE_STD)) {
+                pState->eMode = DRAM_VERIFY_MODE_STANDARD;
+            } else {
+                pState->eMode = DRAM_VERIFY_MODE_EXPRESS;
+            }
+
+            WCHAR wzVol[128] = L"";
+            GetDlgItemTextW(hDlg, IDC_DRAM_VOL_COMBO, wzVol, 128);
+            if (wzVol[0]) {
+                char szTmp[128];
+                WToU8(wzVol, szTmp, 128);
+                char* sp = strchr(szTmp, ' ');
+                if (sp) *sp = '\0';
+                safe_snprintf(pState->szVolume, "%s", szTmp);
+            } else {
+                safe_snprintf(pState->szVolume, "C:\\");
+            }
+
+            EnableWindow(GetDlgItem(hDlg, IDC_DRAM_START_BTN), FALSE);
+            EnableWindow(GetDlgItem(hDlg, IDC_DRAM_STOP_BTN), TRUE);
+            EnableWindow(GetDlgItem(hDlg, IDC_DRAM_VOL_COMBO), FALSE);
+            EnableWindow(GetDlgItem(hDlg, IDC_DRAM_MODE_EXP), FALSE);
+            EnableWindow(GetDlgItem(hDlg, IDC_DRAM_MODE_STD), FALSE);
+            EnableWindow(GetDlgItem(hDlg, IDC_DRAM_MODE_STR), FALSE);
+
+            SendMessage(GetDlgItem(hDlg, IDC_DRAM_PROGRESS), PBM_SETPOS, 0, 0);
+            SetDlgItemTextU8(hDlg, IDC_DRAM_STATUS,
+                TN("Подготовка проверочного файла прямого доступа...",
+                   "Preparing direct unbuffered test file..."));
+            SetDlgItemTextU8(hDlg, IDC_DRAM_LOG, "");
+            InvalidateRect(GetDlgItem(hDlg, IDC_DRAM_VERDICT), NULL, FALSE);
+
+            DWORD dwThreadId = 0;
+            pState->hThread = CreateThread(NULL, 0, DramVerifyWorkerThread, pState, 0, &dwThreadId);
+            if (!pState->hThread) {
+                EnableWindow(GetDlgItem(hDlg, IDC_DRAM_START_BTN), TRUE);
+                EnableWindow(GetDlgItem(hDlg, IDC_DRAM_STOP_BTN), FALSE);
+                MessageBoxU8(hDlg, TN("Не удалось создать поток проверки.", "Failed to create verification thread."),
+                             "DriveMonitor", MB_OK | MB_ICONERROR);
+            }
+        }
+        else if (id == IDC_DRAM_STOP_BTN) {
+            pState->bCancel = true;
+            EnableWindow(GetDlgItem(hDlg, IDC_DRAM_STOP_BTN), FALSE);
+            SetDlgItemTextU8(hDlg, IDC_DRAM_STATUS, TN("Остановка теста...", "Stopping test..."));
+        }
+        else if (id == IDC_DRAM_COPY_BTN) {
+            char szSummary[8192];
+            FormatDramVerifySummary(&pState->result, pState->szModel, pState->szSerial,
+                                    szSummary, sizeof(szSummary));
+            CopyTextToClipboard(hDlg, szSummary);
+            MessageBoxU8(hDlg,
+                TN("Отчёт о тестировании буфера DRAM скопирован в буфер обмена.",
+                   "DRAM buffer test report copied to clipboard."),
+                "DriveMonitor", MB_OK | MB_ICONINFORMATION);
+        }
+        else if (id == IDC_DRAM_CLOSE_BTN || id == IDCANCEL) {
+            SendMessage(hDlg, WM_CLOSE, 0, 0);
+        }
+        return 0;
+    }
+
+    case WM_CLOSE:
+    {
+        DRAM_DLG_STATE* pState = (DRAM_DLG_STATE*)GetPropA(hDlg, "DM_DRAM_STATE");
+        if (pState && pState->bRunning) {
+            pState->bCancel = true;
+            if (pState->hThread) {
+                WaitForSingleObject(pState->hThread, 500);
+            }
+        }
+        DestroyWindow(hDlg);
+        return 0;
+    }
+
+    case WM_DESTROY:
+    {
+        DRAM_DLG_STATE* pState = (DRAM_DLG_STATE*)GetPropA(hDlg, "DM_DRAM_STATE");
+        if (pState) {
+            if (pState->hThread) {
+                CloseHandle(pState->hThread);
+                pState->hThread = NULL;
+            }
+            RemovePropA(hDlg, "DM_DRAM_STATE");
+            free(pState);
+        }
+        return 0;
+    }
+    }
+
+    return DefWindowProcW(hDlg, uMsg, wParam, lParam);
+}
+
+void ShowDramVerifyDialog(HWND hParent, int nDriveIndex)
+{
+    static BOOL bRegistered = FALSE;
+
+    if (g_nDriveCount <= 0 || nDriveIndex < 0 || nDriveIndex >= g_nDriveCount) {
+        MessageBoxU8(hParent, Tr(STR_NO_DRIVE), "DriveMonitor", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    const DRIVE_INFO* pInfo = &g_Drives[nDriveIndex];
+
+    if (!bRegistered) {
+        WNDCLASSW wc;
+        ZeroMemory(&wc, sizeof(wc));
+        wc.style         = CS_HREDRAW | CS_VREDRAW;
+        wc.hInstance     = g_hInst;
+        wc.hCursor       = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
+
+        wc.lpfnWndProc   = DramVerdictWndProc;
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"DriveMonitorDramVerdict";
+        RegisterClassW(&wc);
+
+        wc.lpfnWndProc   = DramDlgProc;
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.hIcon         = LoadIconW(g_hInst, MAKEINTRESOURCEW(IDI_APPICON));
+        wc.lpszClassName = L"DriveMonitorDramVerifyDlg";
+        RegisterClassW(&wc);
+
+        bRegistered = TRUE;
+    }
+
+    HWND hExist = FindWindowW(L"DriveMonitorDramVerifyDlg", NULL);
+    if (hExist) {
+        SetForegroundWindow(hExist);
+        return;
+    }
+
+    DRAM_DLG_STATE* pState = (DRAM_DLG_STATE*)calloc(1, sizeof(DRAM_DLG_STATE));
+    if (!pState) return;
+
+    pState->nDriveIndex = nDriveIndex;
+    pState->bIsSsd = (pInfo->bIsNVMe ||
+                      pInfo->eType == DRIVE_TYPE_SSD_SATA ||
+                      pInfo->eType == DRIVE_TYPE_M2_SATA ||
+                      pInfo->eType == DRIVE_TYPE_NVME ||
+                      pInfo->eType == DRIVE_TYPE_EMMC);
+    lstrcpynA(pState->szModel, pInfo->szModel[0] ? pInfo->szModel : "Drive", (int)sizeof(pState->szModel));
+    lstrcpynA(pState->szSerial, pInfo->szSerial, (int)sizeof(pState->szSerial));
+    pState->eMode = DRAM_VERIFY_MODE_EXPRESS;
+
+    const DRAM_VERIFY_RESULT* pCached = GetDriveDramVerifyResult(nDriveIndex);
+    if (pCached && pCached->nBytesTested > 0) {
+        pState->result = *pCached;
+    } else {
+        pState->result.eMode = pState->eMode;
+    }
+
+    int dlgW = UiScale(720);
+    int dlgH = UiScale(600);
+    int nX, nY;
+
+    if (hParent) {
+        RECT rcP;
+        GetWindowRect(hParent, &rcP);
+        nX = rcP.left + (rcP.right - rcP.left - dlgW) / 2;
+        nY = rcP.top + (rcP.bottom - rcP.top - dlgH) / 2;
+    } else {
+        nX = (GetSystemMetrics(SM_CXSCREEN) - dlgW) / 2;
+        nY = (GetSystemMetrics(SM_CYSCREEN) - dlgH) / 2;
+    }
+
+    char szTitle[256];
+    safe_snprintf(szTitle, "%s — %s (%s)",
+        TN("Тестирование буфера DRAM (Read-After-Write)", "DRAM Buffer Verification (Read-After-Write)"),
+        pState->szModel,
+        pState->bIsSsd ? "SSD" : "HDD");
+
+    WCHAR wzTitle[256];
+    U8ToW(szTitle, wzTitle, 256);
+
+    RECT rcAdj;
+    rcAdj.left = 0; rcAdj.top = 0; rcAdj.right = dlgW; rcAdj.bottom = dlgH;
+    AdjustWindowRectEx(&rcAdj, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE, 0);
+
+    HWND hDlg = CreateWindowExW(
+        0,
+        L"DriveMonitorDramVerifyDlg",
+        wzTitle,
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        nX, nY,
+        rcAdj.right - rcAdj.left,
+        rcAdj.bottom - rcAdj.top,
+        hParent,
+        NULL,
+        g_hInst,
+        (LPVOID)pState
+    );
+
+    if (hDlg) {
+        ShowWindow(hDlg, SW_SHOW);
+        UpdateWindow(hDlg);
+    }
 }

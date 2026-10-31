@@ -23,6 +23,11 @@ SRCS    = $(SRCDIR)/main.cpp \
           $(SRCDIR)/nvme_smart.cpp \
           $(SRCDIR)/usb_bridge.cpp \
           $(SRCDIR)/health_assessment.cpp \
+          $(SRCDIR)/latency_probe.cpp \
+          $(SRCDIR)/storage_event_log.cpp \
+          $(SRCDIR)/volume_trim.cpp \
+          $(SRCDIR)/dram_verify.cpp \
+          $(SRCDIR)/counterfeit_detect.cpp \
           $(SRCDIR)/lang.cpp
 
 OBJS    = $(patsubst $(SRCDIR)/%.cpp, $(OBJDIR)/%.o, $(SRCS))
@@ -49,7 +54,7 @@ LDFLAGS = -mwindows \
           -static -static-libgcc -static-libstdc++ \
           -lcomctl32 -lcomdlg32 -lshell32 \
           -luser32 -lgdi32 -lkernel32 -ladvapi32 -lole32 -luuid \
-          -lgdiplus -lshlwapi -lsetupapi -lcfgmgr32
+          -lgdiplus -lshlwapi -lsetupapi -lcfgmgr32 -lwevtapi
 
 
 .PHONY: all clean test
@@ -64,7 +69,9 @@ DB_TEST_OBJS = $(OBJDIR)/drivedb_test.o $(OBJDIR)/profile.o \
           $(OBJDIR)/drivedb_dmtest.o $(OBJDIR)/smart.o \
           $(OBJDIR)/health_assessment.o $(OBJDIR)/lang.o \
           $(OBJDIR)/ata_smart.o $(OBJDIR)/nvme_smart.o \
-          $(OBJDIR)/usb_bridge.o
+          $(OBJDIR)/usb_bridge.o $(OBJDIR)/latency_probe.o \
+          $(OBJDIR)/storage_event_log.o $(OBJDIR)/volume_trim.o \
+          $(OBJDIR)/dram_verify.o $(OBJDIR)/counterfeit_detect.o
 
 all: $(OUTDIR) $(OBJDIR) $(TARGET)
 	@echo ""
@@ -79,7 +86,7 @@ else
 Q := @
 endif
 
-$(OBJDIR)/%.o: $(SRCDIR)/%.cpp $(SRCDIR)/resource.h | $(OBJDIR)
+$(OBJDIR)/%.o: $(SRCDIR)/%.cpp $(SRCDIR)/smart.h $(SRCDIR)/resource.h | $(OBJDIR)
 	@echo "  CC  $<"
 	$(Q)$(CC) $(CFLAGS) $(CXXFLAGS) -c $< -o $@
 
@@ -87,7 +94,7 @@ $(OBJDIR)/%.o: $(SRCDIR)/%.cpp $(SRCDIR)/resource.h | $(OBJDIR)
 # so the .o depends on all three.
 $(RES_O): $(SRCDIR)/app.rc $(SRCDIR)/app.manifest $(SRCDIR)/app.ico $(SRCDIR)/resource.h | $(OBJDIR)
 	@echo "  RC  $(SRCDIR)/app.rc"
-	$(Q)$(WINDRES) --include-dir=$(SRCDIR) $(SRCDIR)/app.rc -o $(RES_O)
+	$(Q)$(WINDRES) --codepage=65001 --include-dir=$(SRCDIR) $(SRCDIR)/app.rc -o $(RES_O)
 
 $(TARGET): $(OBJS) $(RES_O) | $(OUTDIR)
 	@echo "  LD  $@"
@@ -109,7 +116,7 @@ $(OBJDIR)/drivedb_dmtest.o: $(SRCDIR)/drivedb.cpp $(SRCDIR)/resource.h \
 	@echo "  CC  $(SRCDIR)/drivedb.cpp (DM_TESTS)"
 	$(Q)$(CC) $(CFLAGS) $(CXXFLAGS) -DDM_TESTS -c $(SRCDIR)/drivedb.cpp -o $@
 
-$(OBJDIR)/drivedb_test.o: $(TESTDIR)/drivedb_test.cpp $(SRCDIR)/smart.h | $(OBJDIR)
+$(OBJDIR)/drivedb_test.o: $(TESTDIR)/drivedb_test.cpp $(SRCDIR)/smart.h $(SRCDIR)/latency_probe.h | $(OBJDIR)
 	@echo "  CC  $<"
 	$(Q)$(CC) -O2 -DWIN32 -D_WIN32 -D_WINDOWS -DNDEBUG \
 	    -I$(SRCDIR) -finput-charset=UTF-8 $(CXXFLAGS) -c $< -o $@
@@ -125,7 +132,7 @@ $(DB_TEST_TARGET): $(DB_TEST_OBJS)
 	    -static -static-libgcc -static-libstdc++ \
 	    -lcomctl32 -lcomdlg32 -lshell32 \
 	    -luser32 -lgdi32 -lkernel32 -ladvapi32 -lole32 -luuid \
-	    -lgdiplus -lshlwapi -lsetupapi -lcfgmgr32 -o $@
+	    -lgdiplus -lshlwapi -lsetupapi -lcfgmgr32 -lwevtapi -o $@
 
 $(OBJDIR):
 ifeq ($(OS),Windows_NT)

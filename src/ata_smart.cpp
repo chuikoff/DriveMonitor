@@ -5,31 +5,53 @@ void FillAtaProtocolFromIdent(DRIVE_INFO* pInfo, const WORD* pIdent)
 {
     WORD w76, w77;
     unsigned neg;
+    BYTE maxGen = 0;
     if (!pInfo || !pIdent) return;
     w76 = pIdent[76];
     w77 = pIdent[77];
+
+    /* Word 76: bit1=1.5, bit2=3.0, bit3=6.0 Gb/s supported. */
+    if (w76 != 0 && w76 != 0xFFFF) {
+        if (w76 & 0x0008)
+            maxGen = 3;
+        else if (w76 & 0x0004)
+            maxGen = 2;
+        else if (w76 & 0x0002)
+            maxGen = 1;
+    }
+    pInfo->nSataMaxGen = maxGen;
+
     /* USB: word 77 is the dongle's negotiated speed, not the disk.
      * Use word 76 (supported) for the disk, prefix USB later. */
     neg = pInfo->bIsUSB ? 0 : (unsigned)((w77 >> 1) & 0x7);
+    if (!pInfo->bIsUSB && neg >= 1 && neg <= 3) {
+        pInfo->nSataCurGen = (BYTE)neg;
+        if (maxGen > (BYTE)neg) {
+            pInfo->bLinkDegraded = TRUE;
+            const char* szCurStr = (neg == 2) ? TN("3 Гбит/с", "3 Gb/s") : TN("1.5 Гбит/с", "1.5 Gb/s");
+            const char* szMaxStr = (maxGen == 3) ? TN("6 Гбит/с", "6 Gb/s") : TN("3 Гбит/с", "3 Gb/s");
+            safe_snprintf(pInfo->szProtocol, "SATA %s (%s %s \xE2\x9A\xA0)",
+                          szCurStr, TN("макс.", "max"), szMaxStr);
+            return;
+        }
+    }
+
     if (neg == 3)
         safe_snprintf(pInfo->szProtocol, "%s", TN("SATA 6 Гбит/с", "SATA 6 Gb/s"));
     else if (neg == 2)
         safe_snprintf(pInfo->szProtocol, "%s", TN("SATA 3 Гбит/с", "SATA 3 Gb/s"));
     else if (neg == 1)
         safe_snprintf(pInfo->szProtocol, "%s", TN("SATA 1.5 Гбит/с", "SATA 1.5 Gb/s"));
-    else if (w76 != 0 && w76 != 0xFFFF) {
-        /* Word 76: bit1=1.5, bit2=3.0, bit3=6.0 Gb/s supported. */
-        if (w76 & 0x0008)
-            safe_snprintf(pInfo->szProtocol, "%s", TN("SATA 6 Гбит/с", "SATA 6 Gb/s"));
-        else if (w76 & 0x0004)
-            safe_snprintf(pInfo->szProtocol, "%s", TN("SATA 3 Гбит/с", "SATA 3 Gb/s"));
-        else if (w76 & 0x0002)
-            safe_snprintf(pInfo->szProtocol, "%s", TN("SATA 1.5 Гбит/с", "SATA 1.5 Gb/s"));
-        else
-            safe_snprintf(pInfo->szProtocol, "SATA");
-    } else {
+    else if (maxGen == 3)
+        safe_snprintf(pInfo->szProtocol, "%s", TN("SATA 6 Гбит/с", "SATA 6 Gb/s"));
+    else if (maxGen == 2)
+        safe_snprintf(pInfo->szProtocol, "%s", TN("SATA 3 Гбит/с", "SATA 3 Gb/s"));
+    else if (maxGen == 1)
+        safe_snprintf(pInfo->szProtocol, "%s", TN("SATA 1.5 Гбит/с", "SATA 1.5 Gb/s"));
+    else if (w76 != 0 && w76 != 0xFFFF)
+        safe_snprintf(pInfo->szProtocol, "SATA");
+    else
         safe_snprintf(pInfo->szProtocol, "ATA");
-    }
 }
 
 void SwapATAString(char* szDst, const WORD* pSrc, int nWords)
@@ -306,12 +328,13 @@ static BOOL ReadSMARTLogATAPassthrough(HANDLE hDrive, BYTE bLogAddr,
 
 BOOL GetSMARTErrorLog(HANDLE hDrive, int nDrive, DRIVE_INFO* pInfo)
 {
+    BYTE page[512];
+    ZeroMemory(page, sizeof(page));
     ZeroMemory(&pInfo->errorLog, sizeof(pInfo->errorLog));
 
-    if (ReadSMARTLog(hDrive, nDrive, SMART_LOG_COMP_ERROR,
-                     (BYTE*)&pInfo->errorLog, sizeof(pInfo->errorLog))) {
-        pInfo->bGotErrorLog = TRUE;
-        pInfo->nErrorLogCount = pInfo->errorLog.bErrorLogIndex;
+    if (ReadSMARTLog(hDrive, nDrive, SMART_LOG_COMP_ERROR, page, 512)) {
+        memcpy(&pInfo->errorLog, page, sizeof(pInfo->errorLog));
+        ApplyAtaErrorLog(pInfo, page, 512);
         return TRUE;
     }
     return FALSE;
@@ -319,12 +342,13 @@ BOOL GetSMARTErrorLog(HANDLE hDrive, int nDrive, DRIVE_INFO* pInfo)
 
 BOOL GetSMARTErrorLogATAPassthrough(HANDLE hDrive, DRIVE_INFO* pInfo)
 {
+    BYTE page[512];
+    ZeroMemory(page, sizeof(page));
     ZeroMemory(&pInfo->errorLog, sizeof(pInfo->errorLog));
 
-    if (ReadSMARTLogATAPassthrough(hDrive, SMART_LOG_COMP_ERROR,
-                     (BYTE*)&pInfo->errorLog, sizeof(pInfo->errorLog))) {
-        pInfo->bGotErrorLog = TRUE;
-        pInfo->nErrorLogCount = pInfo->errorLog.bErrorLogIndex;
+    if (ReadSMARTLogATAPassthrough(hDrive, SMART_LOG_COMP_ERROR, page, 512)) {
+        memcpy(&pInfo->errorLog, page, sizeof(pInfo->errorLog));
+        ApplyAtaErrorLog(pInfo, page, 512);
         return TRUE;
     }
     return FALSE;
@@ -338,8 +362,7 @@ BOOL GetSMARTSelfTestLog(HANDLE hDrive, int nDrive, DRIVE_INFO* pInfo)
     if (ReadSMARTLog(hDrive, nDrive, SMART_LOG_COMP_SELF_TEST,
                      (BYTE*)&pInfo->selfTestLog, sizeof(pInfo->selfTestLog))) {
         pInfo->bGotSelfTestLog = TRUE;
-        if (pInfo->selfTestLog.stEntries[0].bStatusByte != 0)
-            pInfo->nSelfTestStatus = pInfo->selfTestLog.stEntries[0].bStatusByte;
+        pInfo->nSelfTestStatus = pInfo->selfTestLog.stEntries[0].bStatusByte;
         return TRUE;
     }
     return FALSE;
@@ -352,8 +375,7 @@ BOOL GetSMARTSelfTestLogATAPassthrough(HANDLE hDrive, DRIVE_INFO* pInfo)
     if (ReadSMARTLogATAPassthrough(hDrive, SMART_LOG_COMP_SELF_TEST,
                      (BYTE*)&pInfo->selfTestLog, sizeof(pInfo->selfTestLog))) {
         pInfo->bGotSelfTestLog = TRUE;
-        if (pInfo->selfTestLog.stEntries[0].bStatusByte != 0)
-            pInfo->nSelfTestStatus = pInfo->selfTestLog.stEntries[0].bStatusByte;
+        pInfo->nSelfTestStatus = pInfo->selfTestLog.stEntries[0].bStatusByte;
         return TRUE;
     }
     return FALSE;
@@ -430,6 +452,49 @@ BOOL GetIdentifyDataATAPassthrough(HANDLE hDrive, DRIVE_INFO* pInfo)
     FillAtaProtocolFromIdent(pInfo, pIdent);
     return TRUE;
 }
+
+/* ATA CHECK POWER MODE (0xE5).
+ * Non-data command: asks drive controller for power state without spinning up the spindle.
+ * Output in Sector Count register (CurrentTaskFile[1]):
+ *   0x00: Standby mode (spindle stopped)
+ *   0x40: NV Cache Standby (spindle stopped)
+ *   0x41: NV Cache Active (spinning)
+ *   0x80: Idle mode (spinning)
+ *   0xFF: Active or Idle mode (spinning)
+ * Returns sector count byte on success, or -1 on error/unsupported. */
+int AtaCheckPowerMode(HANDLE hDrive)
+{
+    BYTE buf[sizeof(MY_ATA_PASS_THROUGH_EX) + 4];
+    if (!DriveAllowsAtaIoctl(hDrive)) return -1;
+    ZeroMemory(buf, sizeof(buf));
+
+    MY_ATA_PASS_THROUGH_EX* pApt = (MY_ATA_PASS_THROUGH_EX*)buf;
+    pApt->Length             = sizeof(MY_ATA_PASS_THROUGH_EX);
+    pApt->AtaFlags           = ATA_FLAGS_DRDY_REQUIRED;
+    pApt->DataTransferLength = 0;
+    pApt->TimeOutValue       = 5;
+    pApt->DataBufferOffset   = 0;
+
+    pApt->CurrentTaskFile[0] = 0;     /* Features */
+    pApt->CurrentTaskFile[1] = 0;     /* Sector count */
+    pApt->CurrentTaskFile[2] = 0;     /* LBA Low */
+    pApt->CurrentTaskFile[3] = 0;     /* LBA Mid */
+    pApt->CurrentTaskFile[4] = 0;     /* LBA High */
+    pApt->CurrentTaskFile[5] = 0xA0;  /* Device */
+    pApt->CurrentTaskFile[6] = 0xE5;  /* Command: CHECK POWER MODE */
+
+    DWORD dwBytes = 0;
+    if (!DeviceIoControl(hDrive, IOCTL_ATA_PASS_THROUGH,
+            buf, sizeof(buf), buf, sizeof(buf), &dwBytes, NULL))
+        return -1;
+
+    /* Status register bit 0 is ERR (error) */
+    if (pApt->CurrentTaskFile[6] & 0x01)
+        return -1;
+
+    return (int)(pApt->CurrentTaskFile[1]);
+}
+
 
 BOOL GetSMARTAttributesATAPassthrough(HANDLE hDrive, DRIVE_INFO* pInfo)
 {

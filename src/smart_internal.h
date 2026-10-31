@@ -213,6 +213,11 @@ static inline unsigned __int64 ReadLE64(const BYTE* p)
     return v;
 }
 
+static inline unsigned __int64 NVMeRead128Lo(const BYTE* p)
+{
+    return ReadLE64(p);
+}
+
 /* IDENTIFY words 100..103: 48-bit LBA. Each WORD is widened before << 32/48. */
 static inline unsigned __int64 IdentLba48(const WORD* pIdent)
 {
@@ -243,11 +248,14 @@ void ToUpperCopy(char* dst, int nDst, const char* src);
 BOOL FirmwareIsSmi225x(const char* fw);
 BOOL HasSmartAttr(const DRIVE_INFO* p, BYTE id);
 BOOL DriveIsHdd(const DRIVE_INFO* p);
+BOOL ModelLooksSeagate(const char* szUpper);
+USHORT NvmeIdentVid(const DRIVE_INFO* p);
 
 void TrimStr(char* sz);
 void CopyDescStr(char* dst, size_t dstSize,
                  const BYTE* buf, DWORD dwBytes, DWORD offset);
 void FillDriveProtocol(DRIVE_INFO* pInfo);
+void QueryPcieLinkProperties(DWORD nDisk, DRIVE_INFO* pInfo);
 BOOL GetCapacityFromGeometry(HANDLE hDrive, DRIVE_INFO* pInfo);
 
 void FillAtaProtocolFromIdent(DRIVE_INFO* pInfo, const WORD* pIdent);

@@ -205,6 +205,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                     ((short)HIWORD(msg.wParam) > 0) ? IDM_ZOOM_IN : IDM_ZOOM_OUT, 0);
                 continue;
             }
+            if (msg.message == WM_MOUSEWHEEL && DrivePanelOnMouseWheel(&msg))
+                continue;
             if (hAcc && TranslateAccelerator(hWnd, hAcc, &msg))
                 continue;
             TranslateMessage(&msg);

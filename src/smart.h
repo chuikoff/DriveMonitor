@@ -7,6 +7,10 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <winioctl.h>
+#include "storage_event_log.h"
+#include "volume_trim.h"
+#include "dram_verify.h"
+#include "counterfeit_detect.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -188,7 +192,8 @@ typedef enum _DRIVE_CONTROLLER {
     CONTROLLER_HITACHI  = 14,
     CONTROLLER_AMAZON   = 15,
     CONTROLLER_MAXIO    = 16,  /* MAP1202/MAP1602 */
-    CONTROLLER_INNOGRIT = 17   /* IG5216/IG5236 */
+    CONTROLLER_INNOGRIT = 17,  /* IG5216/IG5236 */
+    CONTROLLER_YEESTOR  = 18   /* YS9082/YS9083/YS9203 */
 } DRIVE_CONTROLLER;
 
 /* ============================================================
@@ -417,6 +422,7 @@ typedef struct _DRIVE_INFO {
     BOOL        bPredictFailure;
     BOOL        bGotReturnStatus; /* SMART RETURN STATUS / SCSI INFO EXCEPTIONS */
     int         nDriveIndex;
+    char        szDeviceTarget[64]; /* NT device target name, e.g. \\Device\\Harddisk3\\DR28 */
     BOOL        bIsUSB;
     DRIVE_TYPE  eType;
     int         nTemperatureC;
@@ -425,7 +431,7 @@ typedef struct _DRIVE_INFO {
     int         nTempWarnC;      /* Identify WCTEMP °C, -1 if omitted */
     int         nTempCritC;      /* Identify CCTEMP °C = max safe, -1 if omitted */
     BOOL        bIsNVMe;
-    char        szProtocol[64];  /* e.g. "USB SAT · SATA 6 Гбит/с" */
+    char        szProtocol[96];  /* e.g. "USB SAT · SATA 6 Гбит/с" */
     SMART_ACCESS_METHOD eAccessMethod;
     DWORD       dwPowerOnHours;
     DWORD       dwPowerCycleCount;
@@ -454,7 +460,7 @@ typedef struct _DRIVE_INFO {
     int         nConfCompleteness;    /* SMART + thresh + temp + media counters */
     int         nConfTransport;       /* native 100, USB SMART-ok 90, USB-no-SMART 40 */
     int         nConfModelId;         /* controller known 99, firmware-family 90, unknown 70 */
-    int         nConfVendorDecoder;   /* 100 if 0 unknown attrs; else max(40, 100-10*nUnknown) */
+    int         nConfVendorDecoder;   /* 100 if no unknown attrs and not a bare NVMe log; one unknown stays <= 80 */
     int         nConfHealthAssess;    /* how well we can defend GOOD/CAUTION/BAD */
     int         nEndurancePercent;    /* remaining life 0-100, -1 if N/A */
     DRIVE_HEALTH_STATUS eReliability; /* media channel after profile rules and prefail */
@@ -482,6 +488,8 @@ typedef struct _DRIVE_INFO {
     int         nRemapEvents;         /* REMAP slot, -1 if absent */
     int         nCrcErrors;           /* CRC slot, -1 if absent */
     int         nReportedUncorrect;   /* REPORTED slot, -1 if absent */
+    int         nProtectMode;         /* PROTECT slot, -1 if absent */
+    BOOL        bWriteProtected;      /* hardware/driver write-protect or read-only mode */
     BOOL        bThresholdViolation;  /* prefail Value<=thresh now (ATA-3); same as bPrefailNow */
     BOOL        bPrefailNow;          /* prefail current <= thresh, thresh != 0 */
     BOOL        bPrefailPast;         /* prefail worst <= thresh, current still above */
@@ -508,7 +516,7 @@ typedef struct _DRIVE_INFO {
 
     /* SMART Error Log */
     BOOL        bGotErrorLog;
-    int         nErrorLogCount;          /* Number of entries in error log */
+    int         nErrorLogCount;          /* Device error count, else the log index */
     SMART_ERROR_LOG errorLog;
 
     /* SMART Self-Test Log */
@@ -558,6 +566,31 @@ typedef struct _DRIVE_INFO {
     BOOL        bDriveDbTieUnnamed;
     int         nDriveDbAttrs;
     DRIVEDB_ATTR driveDbAttr[DRIVEDB_ATTR_MAX];
+    /* Standby Awareness: HDD is in Standby/Sleep power mode, skipped in background scan */
+    BOOL        bStandby;
+    /* Bus / Link Speed Degradation */
+    BOOL        bLinkDegraded;
+    BYTE        nSataMaxGen;          /* 1 = Gen1 (1.5Gb/s), 2 = Gen2 (3Gb/s), 3 = Gen3 (6Gb/s) */
+    BYTE        nSataCurGen;          /* Current negotiated Gen */
+    BYTE        nPcieMaxLinkSpeed;    /* PCIe Gen 1..5 */
+    BYTE        nPcieCurLinkSpeed;    /* PCIe Gen 1..5 */
+    BYTE        nPcieMaxLinkWidth;    /* PCIe x1, x2, x4, x8, x16 */
+    BYTE        nPcieCurLinkWidth;    /* PCIe x1, x2, x4, x8, x16 */
+    /* SCSI / Miniport port number (corresponds to \Device\RaidPortN), -1 if unknown */
+    int         nScsiPort;
+    /* Windows Storage Event Log statistics (last 30 days) */
+    STORAGE_EVENT_STATS eventStats;
+    /* Filesystem volume partitions and TRIM status */
+    DRIVE_FS_TRIM_INFO  trimInfo;
+    /* DRAM buffer verification (Silent Data Corruption / Bit Flip test) */
+    BOOL                bDramTested;
+    BOOL                bDramCorruption;
+    uint64_t            nDramCorruptedBytes;
+    uint64_t            nDramBitFlips;
+    /* Counterfeit / Relabeled drive detection */
+    BOOL                bCounterfeitSuspected;
+    char                szCounterfeitReason[256];
+    char                szCounterfeitReasonEn[256];
 } DRIVE_INFO;
 
 /* ATA attributes were rejected and nothing valid replaced them. */
@@ -637,6 +670,7 @@ const char* GetHealthStatusName(DRIVE_HEALTH_STATUS eStatus);
 const char* GetHealthStatusNameShort(DRIVE_HEALTH_STATUS eStatus);
 const char* GetDiskStatusName(const DRIVE_INFO* p);
 const char* GetVendorName(DRIVE_VENDOR eVendor);
+const char* VendorLabel(const DRIVE_INFO* p);
 const char* GetControllerName(DRIVE_CONTROLLER eController);
 const char* DriveControllerLabel(const DRIVE_INFO* p);
 DRIVE_VENDOR DetectDriveVendor(const char* szModel);
@@ -710,6 +744,9 @@ const char* GetTempBandName(TEMP_BAND eBand, BOOL bLowercase);
 /* Identify WCTEMP/CCTEMP (Kelvin) → °C, or -1 if the drive omitted the field. */
 int NvmeIdentifyTempC(USHORT kelvin);
 void  FormatPowerOnHours(DWORD dwHours, char* szBuf, int nBufLen);
+void  FormatDriveSummary(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen);
+void  FillDriveProtocol(DRIVE_INFO* pInfo);
+void  FillAtaProtocolFromIdent(DRIVE_INFO* pInfo, const WORD* pIdent);
 BOOL  DriveTreatsC0AsPowerLoss(const DRIVE_INFO* pInfo);
 BOOL  IsShockSensorAttr(BYTE bID);
 
@@ -717,6 +754,15 @@ BOOL  IsShockSensorAttr(BYTE bID);
 void  ExtractSSDIndicators(DRIVE_INFO* pInfo);
 
 int   ScanDrives(DRIVE_INFO* pDrives, int nMaxDrives);
+int   ScanDrivesEx(DRIVE_INFO* pDrives, int nMaxDrives,
+                   const DRIVE_INFO* pPrevDrives, int nPrevCount,
+                   BOOL bBackground);
+
+/* Power mode queries (ATA CHECK POWER MODE 0xE5) and Standby Awareness */
+int   AtaCheckPowerMode(HANDLE hDrive);
+int   SATCheckPowerMode(HANDLE hDrive);
+int   DriveCheckPowerMode(HANDLE hDrive, const DRIVE_INFO* pInfo);
+BOOL  DriveIsSleeping(int nPowerMode);
 
 /* USB flash (UFD) heuristic: USB bus + flash-like product name, and not a
  * known NVMe/SATA enclosure bridge. Used to skip SAT/vendor SMART retries. */
@@ -729,6 +775,8 @@ DWORD GetRawValue(const BYTE* pRaw);
 unsigned __int64 GetRawValue48(const BYTE* pRaw);
 /* 187 Reported Uncorrect. -1 = absent or vendor packing (do not score). */
 int DecodeReportedUncorrect(const BYTE* pRaw, DRIVE_VENDOR vendor);
+/* G-Sense 191/14/221. -1 = Hitachi packing, not an event count. */
+int DecodeShockCount(const BYTE* pRaw, DRIVE_VENDOR vendor);
 /* 196 reallocation events. >=0 is the count. -1 = not a count: the 48-bit
  * RAW is a copy of head-flying hours (240), or it does not fit in a counter.
  * Never clamps that RAW to INT_MAX. */
@@ -745,6 +793,30 @@ BOOL     UseSeagateRateRaw(const DRIVE_INFO* pInfo);
 void     PhisonMaxAvgHalves(unsigned raw32, unsigned* mx, unsigned* avg);
 /* drivedb -v name for this id contains "crc" (199 or Phison 218). */
 BOOL     DriveDbAttrIsCrc(const DRIVE_INFO* p, BYTE id);
+/* drivedb -v name contains "protect" or "protect_mode". */
+BOOL     DriveDbAttrIsProtect(const DRIVE_INFO* p, BYTE id);
+/* ============================================================
+ * SMART Self-Test Log status decoding (ATA-8 ACS / ACS-2)
+ * ============================================================ */
+typedef enum {
+    SELFTEST_ST_OK = 0,         /* Routine completed without error (bits 7:4 == 0) */
+    SELFTEST_ST_ABORTED,        /* Aborted by the host (bits 7:4 == 1) */
+    SELFTEST_ST_INTERRUPTED,    /* Interrupted by host reset (bits 7:4 == 2) */
+    SELFTEST_ST_FATAL_ERROR,    /* Fatal or unknown test error (bits 7:4 == 3) */
+    SELFTEST_ST_FAILED_UNKNOWN, /* Completed with unknown failure (bits 7:4 == 4) */
+    SELFTEST_ST_FAILED_ELECTR,  /* Electrical element failed (bits 7:4 == 5) */
+    SELFTEST_ST_FAILED_SERVO,   /* Servo/seek element failed (bits 7:4 == 6) */
+    SELFTEST_ST_FAILED_READ,    /* Read element failed / bad LBA (bits 7:4 == 7) */
+    SELFTEST_ST_FAILED_SHOCK,   /* Handling damage / shock failure (bits 7:4 == 8) */
+    SELFTEST_ST_IN_PROGRESS,    /* In progress (bits 7:4 == 15) */
+    SELFTEST_ST_RESERVED        /* Reserved status codes (bits 7:4 == 9..14) */
+} SELFTEST_STATUS_CODE;
+
+SELFTEST_STATUS_CODE DecodeSelfTestStatus(BYTE bStatusByte, int* pnProgressPct);
+void        GetSelfTestStatusDesc(BYTE bStatusByte, unsigned long dwFailingLBA, char* buf, int nBuf);
+const char* GetSelfTestStatusBadge(BYTE bStatusByte);
+/* Checks IOCTL_DISK_IS_WRITABLE to detect OS/hardware write-protect state. */
+void     CheckDriveWritability(HANDLE hDrive, DRIVE_INFO* pInfo);
 /* Attribute 200 is scored only when a threshold exists and Value is actually low.
  * A lifetime-stuck 1 with threshold 0 is not a failure. */
 BOOL     NormalizedWriteErrorScored(BYTE val, BYTE thresh);
@@ -759,6 +831,10 @@ BOOL     AtaTempPeakTripped(const SMART_ATTRIBUTE* a, BYTE thresh);
  * fixed 32 MiB unit (Smi225xHostGiB), not this heuristic. */
 unsigned __int64 ScaleAtaHostGiB(const DRIVE_INFO* pInfo, unsigned __int64 raw,
                                  BOOL reads);
+/* Log 0x02. Returns the device error count, or -1 when byte 500 is not
+ * a checksummed count. *pIndex is the 16-bit error-log index. */
+int AtaErrorLogCount(const BYTE* page, int nPage, int* pIndex);
+void ApplyAtaErrorLog(DRIVE_INFO* p, const BYTE* page, int nPage);
 unsigned __int64 Smi225xHostGiB(unsigned __int64 raw);
 BOOL IsPhisonFamily(const DRIVE_INFO* p);
 BOOL IsSmi225xFamily(const DRIVE_INFO* p);
@@ -814,6 +890,7 @@ BOOL IsSmi225xFamily(const DRIVE_INFO* p);
 #define PROF_ENC_AVG     14  /* raw counter is the average erase count */
 #define PROF_ENC_MAX     15  /* raw counter is the maximum erase count */
 #define PROF_ENC_MIN     16  /* raw counter is the minimum erase count */
+#define PROF_ENC_VALUE_OFFSET100 17 /* percent is Value - 100 (scale 200..100) */
 
 /* How a decoded count moves a channel. The profile stores the rule.
  * The health engine does not keep a private threshold for an attribute id. */
@@ -828,6 +905,7 @@ BOOL IsSmi225xFamily(const DRIVE_INFO* p);
 #define PROF_SLOT_REMAP    4
 #define PROF_SLOT_CRC      5
 #define PROF_SLOT_REPORTED 6
+#define PROF_SLOT_PROTECT  7
 
 #define PROF_SCOPE_ANY 0
 #define PROF_SCOPE_HDD 1

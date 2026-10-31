@@ -12,6 +12,23 @@ void FillDriveProtocol(DRIVE_INFO* pInfo)
         } else if (pInfo->szProtocol[0] == '\0') {
             safe_snprintf(pInfo->szProtocol, "NVMe");
         }
+        if (!pInfo->bIsUSB && pInfo->nPcieCurLinkSpeed > 0) {
+            char* pciePos = strstr(pInfo->szProtocol, " · PCIe");
+            if (pciePos) *pciePos = '\0';
+            char pcieStr[64];
+            if (pInfo->bLinkDegraded) {
+                safe_snprintf(pcieStr, " · PCIe %u.0 x%u (%s %u.0 x%u \xE2\x9A\xA0)",
+                    (unsigned)pInfo->nPcieCurLinkSpeed, (unsigned)pInfo->nPcieCurLinkWidth,
+                    TN("макс.", "max"),
+                    (unsigned)pInfo->nPcieMaxLinkSpeed, (unsigned)pInfo->nPcieMaxLinkWidth);
+            } else {
+                safe_snprintf(pcieStr, " · PCIe %u.0 x%u",
+                    (unsigned)pInfo->nPcieCurLinkSpeed, (unsigned)pInfo->nPcieCurLinkWidth);
+            }
+            char tmpProto[96];
+            lstrcpynA(tmpProto, pInfo->szProtocol, (int)sizeof(tmpProto));
+            safe_snprintf(pInfo->szProtocol, "%s%s", tmpProto, pcieStr);
+        }
         PrefixUsbProtocol(pInfo);
         return;
     }
@@ -129,6 +146,22 @@ int DecodeReportedUncorrect(const BYTE* pRaw, DRIVE_VENDOR vendor)
     return (int)lo32;
 }
 
+/* Hitachi G-Sense leaves the low 16 bits at 0 and packs other fields
+ * above (000000010000). That is not 65536 shocks. A count that sits
+ * in the low 16 bits still counts. Other vendors keep the 48-bit field. */
+int DecodeShockCount(const BYTE* pRaw, DRIVE_VENDOR vendor)
+{
+    unsigned __int64 q;
+    WORD lo16;
+    if (!pRaw) return -1;
+    q = GetRawValue48(pRaw);
+    lo16 = (WORD)(GetRawValue(pRaw) & 0xFFFFu);
+    if (vendor == VENDOR_HITACHI && lo16 == 0 && q != 0)
+        return -1;
+    if (q > (unsigned __int64)INT_MAX) return INT_MAX;
+    return (int)q;
+}
+
 /* Seagate 240 (and a copy some firmware writes into 196) is msec24hour32:
  * low 32 bits = hours, upper 16 bits = milliseconds. A plain event count
  * keeps those upper bytes at 0. Matching a small integer (both raw == 5)
@@ -243,11 +276,158 @@ BOOL DriveDbAttrIsCrc(const DRIVE_INFO* p, BYTE id)
     return FALSE;
 }
 
+BOOL DriveDbAttrIsProtect(const DRIVE_INFO* p, BYTE id)
+{
+    int i;
+    if (!p || id == 0) return FALSE;
+    for (i = 0; i < p->nDriveDbAttrs && i < DRIVEDB_ATTR_MAX; i++) {
+        if (p->driveDbAttr[i].id == id &&
+            (HasCI(p->driveDbAttr[i].name, "protect") ||
+             HasCI(p->driveDbAttr[i].name, "protect_mode")))
+            return TRUE;
+    }
+    return FALSE;
+}
+
+void CheckDriveWritability(HANDLE hDrive, DRIVE_INFO* pInfo)
+{
+    DWORD dwBytesReturned = 0;
+    if (!pInfo) return;
+    pInfo->bWriteProtected = FALSE;
+    if (hDrive == INVALID_HANDLE_VALUE || hDrive == NULL) return;
+    if (!DeviceIoControl(hDrive, IOCTL_DISK_IS_WRITABLE, NULL, 0, NULL, 0, &dwBytesReturned, NULL)) {
+        DWORD dwErr = GetLastError();
+        if (dwErr == ERROR_WRITE_PROTECT) {
+            pInfo->bWriteProtected = TRUE;
+        }
+    }
+}
+
 BOOL NormalizedWriteErrorScored(BYTE val, BYTE thresh)
 {
     if (thresh == 0 || val == 0 || val == 255)
         return FALSE;
     return val <= 10;
+}
+
+/* ============================================================
+ * SMART Self-Test Log status decoding (ATA-8 ACS / ACS-2)
+ * ============================================================ */
+SELFTEST_STATUS_CODE DecodeSelfTestStatus(BYTE bStatusByte, int* pnProgressPct)
+{
+    int s = (bStatusByte >> 4) & 0x0F;
+    if (pnProgressPct) {
+        if (s == 0x0F) {
+            int rem10 = (bStatusByte & 0x0F) * 10;
+            int done = 100 - rem10;
+            if (done < 0) done = 0;
+            if (done > 100) done = 100;
+            *pnProgressPct = done;
+        } else {
+            *pnProgressPct = (s == 0) ? 100 : 0;
+        }
+    }
+    switch (s) {
+    case 0: return SELFTEST_ST_OK;
+    case 1: return SELFTEST_ST_ABORTED;
+    case 2: return SELFTEST_ST_INTERRUPTED;
+    case 3: return SELFTEST_ST_FATAL_ERROR;
+    case 4: return SELFTEST_ST_FAILED_UNKNOWN;
+    case 5: return SELFTEST_ST_FAILED_ELECTR;
+    case 6: return SELFTEST_ST_FAILED_SERVO;
+    case 7: return SELFTEST_ST_FAILED_READ;
+    case 8: return SELFTEST_ST_FAILED_SHOCK;
+    case 15: return SELFTEST_ST_IN_PROGRESS;
+    default: return SELFTEST_ST_RESERVED;
+    }
+}
+
+const char* GetSelfTestStatusBadge(BYTE bStatusByte)
+{
+    int s = (bStatusByte >> 4) & 0x0F;
+    switch (s) {
+    case 0:
+        return "ОК";
+    case 1:
+    case 2:
+        return "контекст";
+    case 3:
+    case 4:
+    case 5:
+    case 6:
+    case 7:
+        return "ПЛОХО";
+    case 8:
+        return "Внимание";
+    case 15:
+        return "контекст";
+    default:
+        return "контекст";
+    }
+}
+
+void GetSelfTestStatusDesc(BYTE bStatusByte, unsigned long dwFailingLBA, char* buf, int nBuf)
+{
+    int progress = 0;
+    SELFTEST_STATUS_CODE code;
+    if (!buf || nBuf <= 0) return;
+    buf[0] = '\0';
+
+    code = DecodeSelfTestStatus(bStatusByte, &progress);
+    switch (code) {
+    case SELFTEST_ST_OK:
+        safe_snprintf_n(buf, nBuf, "%s",
+                        TN("Пройден без ошибок", "Completed without error"));
+        break;
+    case SELFTEST_ST_ABORTED:
+        safe_snprintf_n(buf, nBuf, "%s",
+                        TN("Прерван хостом", "Aborted by host"));
+        break;
+    case SELFTEST_ST_INTERRUPTED:
+        safe_snprintf_n(buf, nBuf, "%s",
+                        TN("Прерван сбросом", "Interrupted by reset"));
+        break;
+    case SELFTEST_ST_FATAL_ERROR:
+        safe_snprintf_n(buf, nBuf, "%s",
+                        TN("Сбой: фатальная ошибка", "Failed: fatal error"));
+        break;
+    case SELFTEST_ST_FAILED_UNKNOWN:
+        safe_snprintf_n(buf, nBuf, "%s",
+                        TN("Сбой: неизвестный компонент", "Failed: unknown test element"));
+        break;
+    case SELFTEST_ST_FAILED_ELECTR:
+        safe_snprintf_n(buf, nBuf, "%s",
+                        TN("Сбой: электрический компонент", "Failed: electrical element"));
+        break;
+    case SELFTEST_ST_FAILED_SERVO:
+        safe_snprintf_n(buf, nBuf, "%s",
+                        TN("Сбой: сервопривод / механика", "Failed: servo/seek element"));
+        break;
+    case SELFTEST_ST_FAILED_READ:
+        if (dwFailingLBA > 0 && dwFailingLBA != 0xFFFFFFFFUL) {
+            safe_snprintf_n(buf, nBuf,
+                            TN("Сбой: дефект чтения на LBA %lu", "Failed: read element at LBA %lu"),
+                            dwFailingLBA);
+        } else {
+            safe_snprintf_n(buf, nBuf, "%s",
+                            TN("Сбой: ошибка чтения (дефект LBA)", "Failed: read element (bad LBA)"));
+        }
+        break;
+    case SELFTEST_ST_FAILED_SHOCK:
+        safe_snprintf_n(buf, nBuf, "%s",
+                        TN("Сбой: повреждение от удара / тряски", "Failed: handling damage / shock"));
+        break;
+    case SELFTEST_ST_IN_PROGRESS:
+        safe_snprintf_n(buf, nBuf,
+                        TN("Выполняется в фоне (прогресс ~%d%%)", "In progress (~%d%% completed)"),
+                        progress);
+        break;
+    default:
+        safe_snprintf_n(buf, nBuf,
+                        TN("Неизвестный статус (0x%02X)", "Reserved status (0x%02X)"),
+                        (unsigned)bStatusByte);
+        break;
+    }
 }
 
 /* ============================================================
@@ -475,32 +655,114 @@ static int HostGiBPlausible(unsigned __int64 host, unsigned __int64 nandGb,
     return 1;
 }
 
-unsigned __int64 ScaleAtaHostGiB(const DRIVE_INFO* pInfo, unsigned __int64 raw,
-                                 BOOL reads)
+/* 1 = raw already GB, 2 = 32 MiB units, 3 = 512-byte LBA quotient. */
+static int PickHostGiB(unsigned __int64 raw, unsigned __int64 nandGb,
+                       DWORD poh, unsigned __int64 capGb, int reads,
+                       unsigned __int64* out)
 {
-    unsigned __int64 asGb, as32mb, asLba, capGb, nandGb;
-    int erase;
-    DWORD poh;
-    if (!pInfo || raw == 0) return 0;
+    unsigned __int64 asGb, as32mb, asLba;
+    if (!out || raw == 0) return 0;
     asGb = raw;
     as32mb = (raw * 32ULL) / 1024ULL;
     asLba = raw / (1024ULL * 1024ULL * 2ULL);
+    if (HostGiBPlausible(asGb, nandGb, poh, capGb, reads)) {
+        *out = asGb;
+        return 1;
+    }
+    /* 32 MiB units need a NAND figure. Without it a modest LBA count
+     * (Samsung PM871 F1) passes the POH check as tens of thousands of GB. */
+    if (nandGb > 0 && HostGiBPlausible(as32mb, nandGb, poh, capGb, reads)) {
+        *out = as32mb;
+        return 2;
+    }
+    /* Below one GiB of 512-byte sectors the LBA quotient is 0. A rejected
+     * GB reading must not be printed as zero. */
+    if (asLba == 0 && asGb > 0 && asGb <= 4000000ULL) {
+        *out = asGb;
+        return 1;
+    }
+    *out = asLba;
+    return 3;
+}
+
+/* The other half of the Phison host pair. Reads look at 241, else 243. */
+static unsigned __int64 OppositeHostRaw(const DRIVE_INFO* p, int reads)
+{
+    const SMART_ATTRIBUTE* a;
+    if (!p) return 0;
+    if (reads) {
+        a = FindAttr(p, 0xF1);
+        if (!a) a = FindAttr(p, 0xF3);
+    } else {
+        a = FindAttr(p, 0xF2);
+    }
+    if (!a) return 0;
+    return GetRawValue48(a->bRawValue);
+}
+
+unsigned __int64 ScaleAtaHostGiB(const DRIVE_INFO* pInfo, unsigned __int64 raw,
+                                 BOOL reads)
+{
+    unsigned __int64 capGb, nandGb, mine, sibRaw, sibVal, as32;
+    int erase, unit, sibUnit;
+    DWORD poh;
+    if (!pInfo || raw == 0) return 0;
     capGb = (unsigned __int64)(pInfo->dwCapacityMB / 1024u);
     erase = pInfo->nSSDAvgEraseCount;
     if (erase < 0) erase = pInfo->nSSDMaxEraseCount;
     nandGb = (capGb > 0 && erase > 0) ? (unsigned __int64)erase * capGb : 0;
     poh = pInfo->dwPowerOnHours;
-    if (HostGiBPlausible(asGb, nandGb, poh, capGb, reads ? 1 : 0))
-        return asGb;
-    /* 32 MiB units need a NAND figure. Without it a modest LBA count
-     * (Samsung PM871 F1) passes the POH check as tens of thousands of GB. */
-    if (nandGb > 0 && HostGiBPlausible(as32mb, nandGb, poh, capGb, reads ? 1 : 0))
-        return as32mb;
-    /* Below one GiB of 512-byte sectors the LBA quotient is 0. A rejected
-     * GB reading must not be printed as zero. */
-    if (asLba == 0 && asGb > 0 && asGb <= 4000000ULL)
-        return asGb;
-    return asLba;
+    unit = PickHostGiB(raw, nandGb, poh, capGb, reads ? 1 : 0, &mine);
+    if (!unit) return 0;
+    /* Writes often fail the raw-as-GB cap while reads of the same order
+     * still pass it. One sibling that only fits as 32 MiB pulls the other
+     * onto that unit when the unit is also plausible. Not a model branch. */
+    sibRaw = OppositeHostRaw(pInfo, reads ? 1 : 0);
+    if (sibRaw != 0) {
+        sibUnit = PickHostGiB(sibRaw, nandGb, poh, capGb, reads ? 0 : 1, &sibVal);
+        (void)sibVal;
+        if (sibUnit && sibUnit != unit &&
+            (unit == 2 || sibUnit == 2) && nandGb > 0) {
+            as32 = (raw * 32ULL) / 1024ULL;
+            if (HostGiBPlausible(as32, nandGb, poh, capGb, reads ? 1 : 0))
+                return as32;
+        }
+    }
+    return mine;
+}
+
+/* Comprehensive error log, address 0x02. Bytes 2-3 are the error-log
+ * index (0 = no entries). Bytes 500-501 are the device error count when
+ * the page checksum is valid. The index is not a count of bad sectors. */
+int AtaErrorLogCount(const BYTE* page, int nPage, int* pIndex)
+{
+    unsigned sum;
+    int i, index;
+    if (pIndex) *pIndex = -1;
+    if (!page || nPage < 4) return -1;
+    index = (int)page[2] | ((int)page[3] << 8);
+    if (pIndex) *pIndex = index;
+    if (nPage < 512) return -1;
+    sum = 0;
+    for (i = 0; i < 512; i++)
+        sum = (sum + page[i]) & 0xFFu;
+    if (sum != 0) return -1;
+    return (int)page[500] | ((int)page[501] << 8);
+}
+
+void ApplyAtaErrorLog(DRIVE_INFO* p, const BYTE* page, int nPage)
+{
+    int index = -1;
+    int count;
+    if (!p) return;
+    count = AtaErrorLogCount(page, nPage, &index);
+    p->bGotErrorLog = TRUE;
+    if (count >= 0)
+        p->nErrorLogCount = count;
+    else if (index > 0)
+        p->nErrorLogCount = index;
+    else
+        p->nErrorLogCount = 0;
 }
 
 static BOOL IsAtaSsdTypeInfo(const DRIVE_INFO* p)
@@ -644,6 +906,24 @@ static const char* DbDisplayName(const char* name)
         return TN("Не используется", "Not in use");
     if (CiContains(name, "uncorrect"))
         return TN("Неисправимые ошибки", "Uncorrectable errors");
+    /* SLC/TLC before the bare "min erase" substring, which also
+     * matches "SLC Min Erase Count". */
+    if (CiContains(name, "slc") && CiContains(name, "min erase"))
+        return TN("SLC мин. стираний", "SLC min erase count");
+    if (CiContains(name, "slc") && CiContains(name, "max erase"))
+        return TN("SLC макс. стираний", "SLC max erase count");
+    if (CiContains(name, "slc") &&
+        (CiContains(name, "avg erase") || CiContains(name, "average erase") ||
+         CiContains(name, "avgerase")))
+        return TN("SLC среднее стираний", "SLC average erase count");
+    if (CiContains(name, "tlc") && CiContains(name, "min erase"))
+        return TN("TLC мин. стираний", "TLC min erase count");
+    if (CiContains(name, "tlc") && CiContains(name, "max erase"))
+        return TN("TLC макс. стираний", "TLC max erase count");
+    if (CiContains(name, "tlc") &&
+        (CiContains(name, "avg erase") || CiContains(name, "average erase") ||
+         CiContains(name, "avgerase")))
+        return TN("TLC среднее стираний", "TLC average erase count");
     if (CiContains(name, "maxavgerase") || CiContains(name, "max avg"))
         return TN("Макс./средн. стираний", "Max/avg erase");
     if (CiContains(name, "avgerase") || CiContains(name, "average erase") ||
@@ -695,6 +975,9 @@ static RAW_ENC RawEncFromProf(int enc)
     case PROF_ENC_PAIR:    return RAW_ENC_PAIR;
     case PROF_ENC_COUNTER:
     case PROF_ENC_MAXAVG:
+    case PROF_ENC_AVG:
+    case PROF_ENC_MAX:
+    case PROF_ENC_MIN:
     case PROF_ENC_GIB:
     case PROF_ENC_BLOCK32:
     case PROF_ENC_SCALE:
@@ -702,6 +985,11 @@ static RAW_ENC RawEncFromProf(int enc)
     case PROF_ENC_REPORTED:
     case PROF_ENC_REMAP:
         return RAW_ENC_COUNTER48;
+    /* The percent is the normalized Value. RAW is not that percent.
+     * A known encoding still lets the cell print the Value. */
+    case PROF_ENC_VALUE:
+    case PROF_ENC_VALUE_OFFSET100:
+        return RAW_ENC_PERCENT;
     default:
         return RAW_ENC_UNKNOWN;
     }
@@ -783,7 +1071,11 @@ int FormatRawFields(int view, const char* order, const BYTE* raw,
     word[1] = (unsigned)b[2] | ((unsigned)b[3] << 8);
     word[2] = (unsigned)b[4] | ((unsigned)b[5] << 8);
     if (view == PROF_VIEW_RAW16_OPT) {
-        if (word[1] || word[2])
+        /* smartmontools prints low (high mid). A zero high word is not
+         * a third field: 16 (0 64) is 16 and 64. */
+        if (word[2] == 0 && word[1] != 0)
+            safe_snprintf_n(buf, nBuf, "%u (%u)", word[0], word[1]);
+        else if (word[1] || word[2])
             safe_snprintf_n(buf, nBuf, "%u (%u %u)", word[0], word[2], word[1]);
         else
             safe_snprintf_n(buf, nBuf, "%u", word[0]);
@@ -898,10 +1190,6 @@ void GetAttrDecode(BYTE bID, const DRIVE_INFO* pInfo, ATTR_DECODE* out)
     case 0xBE: out->eEnc = RAW_ENC_TEMP_C; break;
     case 0xC4: out->eEnc = RAW_ENC_EVENTS; break;
     case 0xBC: out->eEnc = RAW_ENC_SECTORS_LO16; break;
-    case 0xF1:
-    case 0xF2:
-    case 0xF3:
-    case 0xF4: out->eEnc = RAW_ENC_LBA; break;
     default: break;
     }
 
@@ -1084,6 +1372,33 @@ void GetAttrDecode(BYTE bID, const DRIVE_INFO* pInfo, ATTR_DECODE* out)
         }
     }
 
+    /* 241-244 are LBA only when a profile or a -v line names them.
+     * The generic "Записано LBA" label is not a unit. */
+    if (pInfo && bID >= 0xF1 && bID <= 0xF4) {
+        int semL = PROF_SEM_NONE, encL = PROF_ENC_NONE;
+        const char* ru = NULL;
+        const char* en = NULL;
+        const char* altRu = NULL;
+        const char* altEn = NULL;
+        unsigned char unless = 0;
+        int named = 0;
+        if (ProfileAttrLabel(pInfo, bID, &semL, &encL, &ru, &en,
+                             &unless, &altRu, &altEn))
+            named = 1;
+        else {
+            const char* dbRaw = DriveDbAttrName(pInfo, bID);
+            const char* dbName = DbDisplayName(dbRaw);
+            if (dbName && dbName[0])
+                named = 1;
+        }
+        if (!named) {
+            out->szName = VendorSpecificAttrName(bID);
+            out->eEnc = RAW_ENC_UNKNOWN;
+            out->eCrit = ATTR_CRIT_NONE;
+            out->nSemanticConfidence = 30;
+        }
+    }
+
     /* Samsung 176/181/183/184 stay unnamed. 181 on PM871 is not a fail
      * count, and 183 is not a SATA downshift. */
     if (pInfo && pInfo->eController == CONTROLLER_SAMSUNG && !DriveIsHdd(pInfo) &&
@@ -1191,6 +1506,19 @@ const char* GetVendorName(DRIVE_VENDOR eVendor)
     }
 }
 
+/* The enum is HGST for both. The model string picks the brand on the label. */
+const char* VendorLabel(const DRIVE_INFO* p)
+{
+    char u[48];
+    if (!p) return "Unknown";
+    if (p->eVendor == VENDOR_HITACHI) {
+        ToUpperCopy(u, (int)sizeof(u), p->szModel);
+        if (strstr(u, "HITACHI") && !strstr(u, "HGST"))
+            return "Hitachi";
+    }
+    return GetVendorName(p->eVendor);
+}
+
 const char* GetControllerName(DRIVE_CONTROLLER eController)
 {
     switch (eController) {
@@ -1211,22 +1539,28 @@ const char* GetControllerName(DRIVE_CONTROLLER eController)
     case CONTROLLER_AMAZON:   return "Amazon";
     case CONTROLLER_MAXIO:    return "Maxio";
     case CONTROLLER_INNOGRIT: return "Innogrit";
+    case CONTROLLER_YEESTOR:  return "Yeestor";
     default:                  return "—";
     }
 }
 
 const char* DriveControllerLabel(const DRIVE_INFO* p)
 {
-    if (p && p->szControllerChip[0])
+    if (!p) return "—";
+    if (p->szControllerChip[0])
         return p->szControllerChip;
-    return GetControllerName(p ? p->eController : CONTROLLER_UNKNOWN);
+    /* An HDD controller copied from the brand is not a chip name. */
+    if (p->eType == DRIVE_TYPE_HDD && !p->bIsNVMe &&
+        p->eController != CONTROLLER_UNKNOWN)
+        return "—";
+    return GetControllerName(p->eController);
 }
 
 /* ============================================================
  * Drive vendor detection from model name
  * Identifies vendors for attribute interpretation
  * ============================================================ */
-static BOOL ModelLooksSeagate(const char* szUpper)
+BOOL ModelLooksSeagate(const char* szUpper)
 {
     const char* p;
     if (!szUpper || !szUpper[0])
@@ -1283,6 +1617,7 @@ DRIVE_VENDOR DetectDriveVendor(const char* szModel)
 
     /* MK/MG are two letters and match unrelated models. */
     if (strstr(szUpper, "TOSHIBA") ||
+        strstr(szUpper, "THNS") || strstr(szUpper, "KSG60") ||
         strstr(szUpper, "DT01") || strstr(szUpper, "DT02") ||
         strstr(szUpper, "MQ01") || strstr(szUpper, "MQ02"))
         return VENDOR_TOSHIBA;
@@ -1327,7 +1662,8 @@ DRIVE_VENDOR DetectDriveVendor(const char* szModel)
 
     if (strstr(szUpper, "ADATA") || strstr(szUpper, "SX8") ||
         strstr(szUpper, "SP9") || strstr(szUpper, "SU8") ||
-        strstr(szUpper, "IM2P"))
+        strstr(szUpper, "IM2P") || strstr(szUpper, "XPG") ||
+        strstr(szUpper, "GAMMIX"))
         return VENDOR_ADATA;
 
     /* CS also matches Corsair CSSD, which is checked below. */
@@ -1349,7 +1685,8 @@ DRIVE_VENDOR DetectDriveVendor(const char* szModel)
         strstr(szUpper, "TFORCE"))
         return VENDOR_TEAMGROUP;
 
-    if (strstr(szUpper, "GOODRAM") || strstr(szUpper, "IRDM"))
+    if (strstr(szUpper, "GOODRAM") || strstr(szUpper, "IRDM") ||
+        strstr(szUpper, "SSDPR-"))
         return VENDOR_GOODRAM;
 
     if (strstr(szUpper, "PLEXTOR") || strstr(szUpper, "PX-"))
@@ -1396,7 +1733,7 @@ BOOL HasSmartAttr(const DRIVE_INFO* p, BYTE id)
 
 /* NVMe Identify Controller bytes 0-1 are PCI VID (spec). Named fields of
  * NVME_IDENTIFY_CONTROLLER skip this; read the raw copy. Do not invent a VID. */
-static USHORT NvmeIdentVid(const DRIVE_INFO* p)
+USHORT NvmeIdentVid(const DRIVE_INFO* p)
 {
     const BYTE* id;
     if (!p || !p->bGotNVMeIdent) return 0;
@@ -1427,6 +1764,7 @@ static DRIVE_CONTROLLER ControllerFromNvmeVid(USHORT vid)
     case 0xC0A9: return CONTROLLER_MICRON;
     case 0x1E4B: return CONTROLLER_MAXIO;
     case 0x1DDC: return CONTROLLER_INNOGRIT;
+    case 0x1E49: return CONTROLLER_YEESTOR;
     /* 0x1CC1 is ADATA's OEM PCI VID, not a controller. SX8200 etc. are SMI
      * in the model table below — same as Hard Disk Sentinel. */
     default:     return CONTROLLER_UNKNOWN;
@@ -1491,16 +1829,22 @@ static DRIVE_CONTROLLER DetectDriveController(const DRIVE_INFO* p)
         return CONTROLLER_SMI;
 
     if (strstr(szModelU, "MAP120") || strstr(szModelU, "MAP160") ||
-        strstr(szModelU, "MAP100"))
+        strstr(szModelU, "MAP100") || strstr(szModelU, "MAS090") ||
+        strstr(szModelU, "MAS110"))
         return CONTROLLER_MAXIO;
 
     if (strstr(szModelU, "RTS576") || strstr(szModelU, "RTS577") ||
-        strstr(szFwU, "RTS576"))
+        strstr(szModelU, "RTS573") || strstr(szFwU, "RTS576") ||
+        strstr(szFwU, "RTS573"))
         return CONTROLLER_REALTEK;
 
     if (strstr(szModelU, "IG521") || strstr(szModelU, "IG523") ||
         strstr(szModelU, "INNOGRIT"))
         return CONTROLLER_INNOGRIT;
+
+    if (strstr(szModelU, "YS908") || strstr(szModelU, "YS920") ||
+        strstr(szModelU, "YEESTOR") || strstr(szFwU, "YS908"))
+        return CONTROLLER_YEESTOR;
 
     /* 3. HDD MCU follows the brand. Those makers build the drive.
      * SSD brand is a label: Kingston is not Phison, SanDisk is not one ASIC.
@@ -1542,6 +1886,7 @@ void IdentifyDriveParts(DRIVE_INFO* pInfo)
     pInfo->eController = DetectDriveController(pInfo);
     /* Best profile across every vendor. A miss stays on the generic profile. */
     ResolveDriveProfile(pInfo);
+    DetectCounterfeitMismatch(pInfo);
 }
 
 /* ============================================================
@@ -1654,6 +1999,68 @@ static BOOL FindDiskDevInst(DWORD nDisk, DEVINST* pInst)
     }
     SetupDiDestroyDeviceInfoList(hDevInfo);
     return found;
+}
+
+#ifndef DEVPROPKEY_DEFINED
+#define DEVPROPKEY_DEFINED
+typedef GUID DEVPROPGUID, *PDEVPROPGUID;
+typedef ULONG DEVPROPID, *PDEVPROPID;
+typedef struct _DEVPROPKEY {
+    DEVPROPGUID fmtid;
+    DEVPROPID   pid;
+} DEVPROPKEY, *PDEVPROPKEY;
+#endif
+
+static const DEVPROPKEY kPciCurrentLinkSpeed = {
+    { 0x3ab22e31, 0x8264, 0x4b4e, { 0x9a, 0xf5, 0xa8, 0xd2, 0xd8, 0xe3, 0x3e, 0x62 } }, 9
+};
+static const DEVPROPKEY kPciCurrentLinkWidth = {
+    { 0x3ab22e31, 0x8264, 0x4b4e, { 0x9a, 0xf5, 0xa8, 0xd2, 0xd8, 0xe3, 0x3e, 0x62 } }, 10
+};
+static const DEVPROPKEY kPciMaxLinkSpeed = {
+    { 0x3ab22e31, 0x8264, 0x4b4e, { 0x9a, 0xf5, 0xa8, 0xd2, 0xd8, 0xe3, 0x3e, 0x62 } }, 11
+};
+static const DEVPROPKEY kPciMaxLinkWidth = {
+    { 0x3ab22e31, 0x8264, 0x4b4e, { 0x9a, 0xf5, 0xa8, 0xd2, 0xd8, 0xe3, 0x3e, 0x62 } }, 12
+};
+
+void QueryPcieLinkProperties(DWORD nDisk, DRIVE_INFO* pInfo)
+{
+    DEVINST inst = 0;
+    int walk = 0;
+    if (!pInfo || pInfo->bIsUSB) return;
+
+    if (!FindDiskDevInst(nDisk, &inst)) return;
+
+    while (inst && walk < 8) {
+        DEVPROPTYPE propType;
+        ULONG curSpeed = 0, curWidth = 0, maxSpeed = 0, maxWidth = 0;
+        ULONG sz = sizeof(curSpeed);
+        CONFIGRET cr = CM_Get_DevNode_PropertyW(inst, &kPciCurrentLinkSpeed, &propType, (PBYTE)&curSpeed, &sz, 0);
+        if (cr == CR_SUCCESS && curSpeed > 0) {
+            sz = sizeof(curWidth);
+            CM_Get_DevNode_PropertyW(inst, &kPciCurrentLinkWidth, &propType, (PBYTE)&curWidth, &sz, 0);
+            sz = sizeof(maxSpeed);
+            CM_Get_DevNode_PropertyW(inst, &kPciMaxLinkSpeed, &propType, (PBYTE)&maxSpeed, &sz, 0);
+            sz = sizeof(maxWidth);
+            CM_Get_DevNode_PropertyW(inst, &kPciMaxLinkWidth, &propType, (PBYTE)&maxWidth, &sz, 0);
+
+            pInfo->nPcieCurLinkSpeed = (BYTE)curSpeed;
+            pInfo->nPcieCurLinkWidth = (BYTE)curWidth;
+            pInfo->nPcieMaxLinkSpeed = (BYTE)maxSpeed;
+            pInfo->nPcieMaxLinkWidth = (BYTE)maxWidth;
+
+            if ((maxSpeed > 0 && curSpeed > 0 && curSpeed < maxSpeed) ||
+                (maxWidth > 0 && curWidth > 0 && curWidth < maxWidth)) {
+                pInfo->bLinkDegraded = TRUE;
+            }
+            break;
+        }
+        DEVINST parent = 0;
+        if (CM_Get_Parent(&parent, inst, 0) != CR_SUCCESS) break;
+        inst = parent;
+        walk++;
+    }
 }
 
 static BOOL BufHasI(const char* buf, ULONG len, const char* tok)
@@ -2268,19 +2675,88 @@ DRIVE_TYPE DetectDriveType(HANDLE hDrive, DRIVE_INFO* pInfo)
     return DRIVE_TYPE_HDD;
 }
 
+BOOL DriveIsSleeping(int nPowerMode)
+{
+    return (nPowerMode == 0x00 || nPowerMode == 0x40);
+}
+
+int DriveCheckPowerMode(HANDLE hDrive, const DRIVE_INFO* pInfo)
+{
+    if (!hDrive || hDrive == INVALID_HANDLE_VALUE) return -1;
+    if (pInfo && !DriveIsHdd(pInfo)) return -1;
+    if (DriveAllowsAtaIoctl(hDrive))
+        return AtaCheckPowerMode(hDrive);
+    if (pInfo && pInfo->bIsUSB && DriveAllowsScsiPassthrough(hDrive))
+        return SATCheckPowerMode(hDrive);
+    return -1;
+}
+
 int ScanDrives(DRIVE_INFO* pDrives, int nMaxDrives)
+{
+    return ScanDrivesEx(pDrives, nMaxDrives, NULL, 0, FALSE);
+}
+
+int ScanDrivesEx(DRIVE_INFO* pDrives, int nMaxDrives,
+                 const DRIVE_INFO* pPrevDrives, int nPrevCount,
+                 BOOL bBackground)
 {
     int nFound = 0;
     int nDrive;
-    const int nScanLimit = 32;
+    /* Past MAX_DRIVES so a hole in PhysicalDrive numbering does not hide a later disk. */
+    const int nScanLimit = 64;
 
     for (nDrive = 0; nDrive < nScanLimit && nFound < nMaxDrives; nDrive++) {
         HANDLE hDrive;
         if (!OpenDrive(nDrive, &hDrive)) continue;
 
+        /* Standby Awareness for mechanical HDDs:
+         * In background monitoring mode, check power mode via ATA CHECK POWER MODE (0xE5).
+         * If the drive is in Standby (0x00) or NV Cache Standby (0x40), skip heavy SMART
+         * reading and preserve the previous snapshot to avoid waking up the drive (spin-up noise and wear). */
+        if (bBackground && pPrevDrives && nPrevCount > 0) {
+            const DRIVE_INFO* pPrev = NULL;
+            int pi;
+            for (pi = 0; pi < nPrevCount; pi++) {
+                if (pPrevDrives[pi].nDriveIndex == nDrive) {
+                    pPrev = &pPrevDrives[pi];
+                    break;
+                }
+            }
+            if (pPrev && DriveIsHdd(pPrev)) {
+                int nPowerMode = DriveCheckPowerMode(hDrive, pPrev);
+                if (DriveIsSleeping(nPowerMode)) {
+                    DRIVE_INFO* pInfo = &pDrives[nFound];
+                    *pInfo = *pPrev;
+                    pInfo->bStandby = TRUE;
+                    CloseHandle(hDrive);
+                    nFound++;
+                    continue;
+                }
+            }
+        }
+
         DRIVE_INFO* pInfo = &pDrives[nFound];
         ZeroMemory(pInfo, sizeof(DRIVE_INFO));
         pInfo->nDriveIndex    = nDrive;
+        {
+            wchar_t wszPhys[32];
+            _snwprintf(wszPhys, sizeof(wszPhys)/sizeof(wszPhys[0]), L"PhysicalDrive%d", nDrive);
+            wchar_t wszTarget[64] = {0};
+            if (QueryDosDeviceW(wszPhys, wszTarget, sizeof(wszTarget)/sizeof(wszTarget[0]))) {
+                WideCharToMultiByte(CP_UTF8, 0, wszTarget, -1, pInfo->szDeviceTarget, (int)sizeof(pInfo->szDeviceTarget), NULL, NULL);
+            }
+        }
+        pInfo->nScsiPort      = -1;
+        {
+            SCSI_ADDRESS scsiAddr;
+            DWORD dwRet = 0;
+            ZeroMemory(&scsiAddr, sizeof(scsiAddr));
+            scsiAddr.Length = sizeof(scsiAddr);
+            if (DeviceIoControl(hDrive, IOCTL_SCSI_GET_ADDRESS, NULL, 0, &scsiAddr, sizeof(scsiAddr), &dwRet, NULL)) {
+                pInfo->nScsiPort = (int)scsiAddr.PortNumber;
+            }
+        }
+        pInfo->bStandby       = FALSE;
         pInfo->nTemperatureC  = -1;
         pInfo->nTempMaxC      = -1;
         pInfo->nTempMinC      = -1;
@@ -2297,6 +2773,8 @@ int ScanDrives(DRIVE_INFO* pDrives, int nMaxDrives)
         pInfo->nUncorrectable = -1;
         pInfo->nRemapEvents   = -1;
         pInfo->nCrcErrors     = -1;
+        pInfo->nProtectMode   = -1;
+        pInfo->bWriteProtected = FALSE;
         pInfo->eTempBand      = TEMP_BAND_UNKNOWN;
         pInfo->eNormQuality   = NORM_QUALITY_UNKNOWN;
         pInfo->eRawQuality    = NORM_QUALITY_UNKNOWN;
@@ -2345,6 +2823,8 @@ int ScanDrives(DRIVE_INFO* pDrives, int nMaxDrives)
             }
             /* Confidence is frozen inside Assess; name the chip first. */
             IdentifyDriveParts(pInfo);
+            CheckDriveWritability(hDrive, pInfo);
+            if (pInfo->bIsNVMe) QueryPcieLinkProperties(pInfo->nDriveIndex, pInfo);
             AssessDriveHealth(pInfo);
             FillDriveProtocol(pInfo);
             CloseHandle(hDrive);
@@ -2362,6 +2842,8 @@ int ScanDrives(DRIVE_INFO* pDrives, int nMaxDrives)
             pInfo->eType               = DRIVE_TYPE_NVME;
             pInfo->bIsNVMe             = TRUE;
             IdentifyDriveParts(pInfo);
+            CheckDriveWritability(hDrive, pInfo);
+            QueryPcieLinkProperties(pInfo->nDriveIndex, pInfo);
             AssessDriveHealth(pInfo);
             FillDriveProtocol(pInfo);
 
@@ -2402,6 +2884,8 @@ int ScanDrives(DRIVE_INFO* pDrives, int nMaxDrives)
                 pInfo->eType = DRIVE_TYPE_UNKNOWN;
             }
             IdentifyDriveParts(pInfo);
+            CheckDriveWritability(hDrive, pInfo);
+            if (pInfo->bIsNVMe) QueryPcieLinkProperties(pInfo->nDriveIndex, pInfo);
             AssessDriveHealth(pInfo);
             FillDriveProtocol(pInfo);
             CloseHandle(hDrive);
@@ -2478,12 +2962,17 @@ int ScanDrives(DRIVE_INFO* pDrives, int nMaxDrives)
                     strstr(szUpper, "0583")   || strstr(szUpper, "0586"))
                     pInfo->eUsbBridgeType = USB_BRIDGE_NVME_JMICRON;
 
-                /* ASMedia NVMe bridges show "ASM2362" in product ID */
-                else if (strstr(szUpper, "ASM2362") || strstr(szUpper, "2362"))
+                /* ASMedia NVMe bridges show "ASM2362" / "ASM2364" / "ASM2464" in product ID */
+                else if (strstr(szUpper, "ASM2362") || strstr(szUpper, "2362") ||
+                         strstr(szUpper, "ASM2364") || strstr(szUpper, "2364") ||
+                         strstr(szUpper, "ASM2464") || strstr(szUpper, "2464"))
                     pInfo->eUsbBridgeType = USB_BRIDGE_NVME_ASMEDIA;
 
-                /* Realtek NVMe bridges show "RTL9210" in product ID */
-                else if (strstr(szUpper, "RTL9210") || strstr(szUpper, "9210"))
+                /* Realtek NVMe bridges show "RTL9210", "RTL9211", "RTL9220", "RTL9201" in product ID */
+                else if (strstr(szUpper, "RTL9210") || strstr(szUpper, "9210") ||
+                         strstr(szUpper, "RTL9211") || strstr(szUpper, "9211") ||
+                         strstr(szUpper, "RTL9220") || strstr(szUpper, "9220") ||
+                         strstr(szUpper, "RTL9201") || strstr(szUpper, "9201"))
                     pInfo->eUsbBridgeType = USB_BRIDGE_NVME_REALTEK;
 
                 /* VLI NVMe bridges show "VL716" or "VL717" */
@@ -2548,7 +3037,7 @@ int ScanDrives(DRIVE_INFO* pDrives, int nMaxDrives)
                         pInfo->eType = DRIVE_TYPE_NVME;
                         pInfo->bSMART_Supported = TRUE;
                         got = TRUE;
-                    }
+            }
                 }
 
                 if (!got) {
@@ -2583,7 +3072,7 @@ int ScanDrives(DRIVE_INFO* pDrives, int nMaxDrives)
                         pInfo->eType = DRIVE_TYPE_NVME;
                         pInfo->bSMART_Supported = TRUE;
                         got = TRUE;
-                    }
+            }
                 }
 
                 if (!got) {
@@ -2617,7 +3106,7 @@ int ScanDrives(DRIVE_INFO* pDrives, int nMaxDrives)
                         pInfo->eType = DRIVE_TYPE_NVME;
                         pInfo->bSMART_Supported = TRUE;
                         got = TRUE;
-                    }
+            }
                 }
 
                 if (!got) {
@@ -2633,7 +3122,7 @@ int ScanDrives(DRIVE_INFO* pDrives, int nMaxDrives)
                         ExtractNVMeExtendedInfo(pInfo);
                         pInfo->bIsNVMe = TRUE;
                         pInfo->eType = DRIVE_TYPE_NVME;
-                    }
+            }
                 }
             }
 
@@ -2664,12 +3153,12 @@ int ScanDrives(DRIVE_INFO* pDrives, int nMaxDrives)
                         ExtractSSDIndicators(pInfo);
                         GetSMARTErrorLogSAT(hDrive, pInfo);
                         GetSMARTSelfTestLogSAT(hDrive, pInfo);
-                    } else if (GetSMARTViaStorageProtocol(hDrive, pInfo)) {
+            } else if (GetSMARTViaStorageProtocol(hDrive, pInfo)) {
                         pInfo->bSMART_Supported = TRUE;
                         ExtractTemperatureFromATA(pInfo);
                         ExtractCommonATACounters(pInfo);
                         ExtractSSDIndicators(pInfo);
-                    } else if (GetNVMeHealthLogEx(hDrive, pInfo)) {
+            } else if (GetNVMeHealthLogEx(hDrive, pInfo)) {
                         /* Fallback: detect if this is actually NVMe via USB.
                          * GetNVMeHealthLogEx already refuses bus type 7. */
                         pInfo->bIsNVMe = TRUE;
@@ -2677,13 +3166,13 @@ int ScanDrives(DRIVE_INFO* pDrives, int nMaxDrives)
                         ExtractNVMeExtendedInfo(pInfo);
                         if (pInfo->szModel[0] == '\0' || pInfo->szSerial[0] == '\0')
                             GetNVMeIdentifyController(hDrive, pInfo);
-                    } else if (!pInfo->bSmartDataInvalid &&
+            } else if (!pInfo->bSmartDataInvalid &&
                                GetSMARTViaLogSense(hDrive, pInfo)) {
                         /* Temperature / informational exceptions only.
                          * Not an attribute snapshot, and not a repair
                          * for a sector ValidateSmartData already rejected. */
                         pInfo->bSMART_Supported = TRUE;
-                    }
+            }
                 }
             }
         }
@@ -2694,11 +3183,53 @@ int ScanDrives(DRIVE_INFO* pDrives, int nMaxDrives)
         /* USB NVMe identify (RTL9210 and the other bridges) fills VID
          * after the earlier IdentifyDriveParts. Score only after that. */
         IdentifyDriveParts(pInfo);
+        CheckDriveWritability(hDrive, pInfo);
+        if (pInfo->bIsNVMe && !pInfo->bIsUSB) QueryPcieLinkProperties(pInfo->nDriveIndex, pInfo);
         AssessDriveHealth(pInfo);
         FillDriveProtocol(pInfo);
 
         CloseHandle(hDrive);
         nFound++;
+    }
+
+    if (nFound > 0) {
+        static DWORD s_dwLastEventLogQuery = 0;
+        DWORD dwNow = GetTickCount();
+        BOOL bDoQuery = !bBackground || (s_dwLastEventLogQuery == 0) || (dwNow - s_dwLastEventLogQuery >= 60000);
+        if (bDoQuery) {
+            QueryStorageEventLogs(pDrives, nFound, 30);
+            s_dwLastEventLogQuery = dwNow;
+            for (int i = 0; i < nFound; i++) {
+                if (pDrives[i].eventStats.bQueried &&
+                    (pDrives[i].eventStats.nEvent153Count > 0 ||
+                     pDrives[i].eventStats.nEvent129Count > 0 ||
+                     pDrives[i].eventStats.nEvent51Count > 0 ||
+                     pDrives[i].eventStats.nEventHwErrCount > 0)) {
+                    AssessDriveHealth(&pDrives[i]);
+                }
+            }
+        } else if (pPrevDrives && nPrevCount > 0) {
+            for (int i = 0; i < nFound; i++) {
+                for (int pi = 0; pi < nPrevCount; pi++) {
+                    if (pPrevDrives[pi].nDriveIndex == pDrives[i].nDriveIndex) {
+                        pDrives[i].eventStats = pPrevDrives[pi].eventStats;
+                        break;
+                }
+            }
+            }
+        }
+
+        /* Query TRIM status and filesystem volume capacities */
+        QueryDriveVolumesAndTrim(pDrives, nFound);
+        for (int i = 0; i < nFound; i++) {
+            if (pDrives[i].trimInfo.bQueried &&
+                (pDrives[i].trimInfo.bPanicLowSpace ||
+                 pDrives[i].trimInfo.bCriticallyLowSpace ||
+                 !pDrives[i].trimInfo.bOsTrimEnabled ||
+                 pDrives[i].trimInfo.bHasNonTrimVolume)) {
+                AssessDriveHealth(&pDrives[i]);
+            }
+        }
     }
 
     return nFound;
