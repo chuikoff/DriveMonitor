@@ -1607,7 +1607,6 @@ void AssessDriveHealth(DRIVE_INFO* pInfo)
     DetectCounterfeitMismatch(pInfo);
     if (pInfo->bCounterfeitSuspected) {
         pInfo->eHealthStatus = WorstHealth(pInfo->eHealthStatus, HEALTH_STATUS_CAUTION);
-        pInfo->eReliability  = WorstHealth(pInfo->eReliability, HEALTH_STATUS_CAUTION);
         size_t len = strlen(pInfo->szEvidence);
         if (len < sizeof(pInfo->szEvidence) - 50) {
             safe_snprintf_n(pInfo->szEvidence + len, (int)(sizeof(pInfo->szEvidence) - len),
@@ -1618,13 +1617,30 @@ void AssessDriveHealth(DRIVE_INFO* pInfo)
 
 static void LectureAddF(char* buf, int nBuf, const char* fmt, ...)
 {
-    char tmp[768];
+    char tmp[4096];
     va_list ap;
     if (!buf || nBuf <= 1 || !fmt) return;
     va_start(ap, fmt);
     (void)_vsnprintf(tmp, sizeof(tmp), fmt, ap);
     tmp[sizeof(tmp) - 1] = '\0';
     va_end(ap);
+
+    /* Safe UTF-8 truncation: ensure we never cut a multi-byte sequence in half */
+    size_t len = strlen(tmp);
+    if (len > 0 && ((unsigned char)tmp[len - 1] & 0x80) != 0) {
+        size_t i = len;
+        while (i > 0 && ((unsigned char)tmp[i - 1] & 0xC0) == 0x80) {
+            i--;
+        }
+        if (i > 0 && ((unsigned char)tmp[i - 1] & 0xC0) == 0xC0) {
+            unsigned char lead = (unsigned char)tmp[i - 1];
+            size_t seqLen = (lead < 0xE0) ? 2 : (lead < 0xF0) ? 3 : 4;
+            if (len - (i - 1) < seqLen) {
+                tmp[i - 1] = '\0';
+            }
+        }
+    }
+
     LectureAdd(buf, nBuf, tmp);
 }
 
@@ -1712,10 +1728,18 @@ static void LectureAddTrimAndVolumes(char* szBuf, int nBufLen, const DRIVE_INFO*
                                       "  Logical volumes on drive:\r\n"));
         for (int vi = 0; vi < pInfo->trimInfo.nVolumeCount; vi++) {
             const VOLUME_INFO_ENTRY* v = &pInfo->trimInfo.volumes[vi];
+            char szVolLine[256];
+            if (v->qwTotalBytes == 0) {
+                safe_snprintf(szVolLine, "    [%s] %s — %s\r\n",
+                    v->szLetter[0] ? v->szLetter : "?",
+                    v->szFileSystem[0] ? v->szFileSystem : "RAW",
+                    TN("нет данных о файловой системе", "no filesystem data"));
+                LectureAdd(szBuf, nBufLen, szVolLine);
+                continue;
+            }
             double flFreeGb  = (double)v->qwFreeBytes  / (1024.0 * 1024.0 * 1024.0);
             double flTotalGb = (double)v->qwTotalBytes / (1024.0 * 1024.0 * 1024.0);
 
-            char szVolLine[256];
             if (flTotalGb < 1.0) {
                 double flFreeMb  = (double)v->qwFreeBytes  / (1024.0 * 1024.0);
                 double flTotalMb = (double)v->qwTotalBytes / (1024.0 * 1024.0);
@@ -2046,7 +2070,20 @@ static void FormatHddLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
         break;
     case HEALTH_STATUS_CAUTION:
         LectureAdd(szBuf, nBufLen, TN("Причина:\r\n", "Reason:\r\n"));
-        if (HealthRank(pInfo->eReliability) >= HealthRank(HEALTH_STATUS_CAUTION)) {
+        if (pInfo->bCounterfeitSuspected &&
+            pInfo->eMediaEvidence < HEALTH_STATUS_CAUTION &&
+            pend <= 0 && r <= 0 && u <= 0 &&
+            pInfo->eventStats.nEventHwErrCount <= 0) {
+            LectureAdd(szBuf, nBufLen, TN(
+                "Обнаружены признаки поддельного или перемаркированного накопителя!\r\n",
+                "Suspected counterfeit or relabeled drive detected!\r\n"));
+            LectureAddF(szBuf, nBufLen, TN(
+                "  Несоответствие: %s\r\n",
+                "  Mismatch: %s\r\n"), GetCounterfeitReason(pInfo));
+            LectureAdd(szBuf, nBufLen, TN(
+                "Носитель не имеет подтверждённых дефектов поверхности, но подлинность накопителя вызывает сомнения.\r\n\r\nРекомендация: Проверить подлинность по серийному номеру и провести тест поверхности (Ctrl+P).\r\n",
+                "Media has no confirmed surface defects, but drive authenticity is doubtful.\r\n\r\nRecommendation: Verify serial number and run surface test (Ctrl+P).\r\n"));
+        } else if (HealthRank(pInfo->eReliability) >= HealthRank(HEALTH_STATUS_CAUTION)) {
             LectureAdd(szBuf, nBufLen, TN(
                 "Есть реальные признаки деградации носителя.\r\n\r\n",
                 "There are real signs of media degradation.\r\n\r\n"));
@@ -2337,7 +2374,20 @@ static void FormatSsdLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
         break;
     case HEALTH_STATUS_CAUTION:
         LectureAdd(szBuf, nBufLen, TN("Причина:\r\n", "Reason:\r\n"));
-        if (HealthRank(pInfo->eReliability) < HealthRank(HEALTH_STATUS_CAUTION) &&
+        if (pInfo->bCounterfeitSuspected &&
+            pInfo->eMediaEvidence < HEALTH_STATUS_CAUTION &&
+            pInfo->nPendingSectors <= 0 && pInfo->nReallocated <= 0 &&
+            pInfo->eventStats.nEventHwErrCount <= 0) {
+            LectureAdd(szBuf, nBufLen, TN(
+                "Обнаружены признаки поддельного или перемаркированного накопителя!\r\n",
+                "Suspected counterfeit or relabeled drive detected!\r\n"));
+            LectureAddF(szBuf, nBufLen, TN(
+                "  Несоответствие: %s\r\n",
+                "  Mismatch: %s\r\n"), GetCounterfeitReason(pInfo));
+            LectureAdd(szBuf, nBufLen, TN(
+                "Носитель не имеет подтверждённых дефектов ячеек, но подлинность накопителя вызывает сомнения.\r\n\r\nРекомендация: Проверить подлинность и провести тест поверхности (Ctrl+P) и DRAM (Ctrl+D).\r\n",
+                "Media has no confirmed flash defects, but drive authenticity is doubtful.\r\n\r\nRecommendation: Verify drive authenticity and run surface test (Ctrl+P) and DRAM test (Ctrl+D).\r\n"));
+        } else if (HealthRank(pInfo->eReliability) < HealthRank(HEALTH_STATUS_CAUTION) &&
             HealthRank(pInfo->eInterface) >= HealthRank(HEALTH_STATUS_CAUTION)) {
             int n188 = AttrRawOrNeg1(pInfo, 0xBC);
             BOOL bCrc = pInfo->nCrcErrors > 0;

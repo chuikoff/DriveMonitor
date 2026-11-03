@@ -82,7 +82,7 @@ void EvaluateDriveTrimAndCapacity(DRIVE_INFO* pInfo)
 
     for (int i = 0; i < pInfo->trimInfo.nVolumeCount; i++) {
         const VOLUME_INFO_ENTRY* v = &pInfo->trimInfo.volumes[i];
-        if (!v->bTrimSupportedFs) {
+        if (v->qwTotalBytes > 0 && !v->bTrimSupportedFs) {
             pInfo->trimInfo.bHasNonTrimVolume = TRUE;
         }
         if (v->fFreePercent >= 0.0f) {
@@ -224,7 +224,7 @@ void QueryDriveVolumesAndTrim(DRIVE_INFO* pDrives, int nNumDrives)
                     pEntry->fFreePercent = fFreePct;
                     pEntry->bTrimSupportedFs = bTrimFs;
 
-                    if (!bTrimFs && pDrives[d].eType != DRIVE_TYPE_HDD) {
+                    if (totalBytes.QuadPart > 0 && !bTrimFs && pDrives[d].eType != DRIVE_TYPE_HDD) {
                         pTrim->bHasNonTrimVolume = TRUE;
                     }
 

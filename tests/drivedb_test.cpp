@@ -2680,6 +2680,19 @@ static void TestVolumeTrimMonitoring(void)
     Expect(strstr(szExpert, "DisableDeleteNotify") != NULL, "Expert lecture mentions DisableDeleteNotify");
     Expect(strstr(szExpert, "C:") != NULL, "Expert lecture lists volume C:");
 
+    /* Case G: RAW / 0-byte volume (unformatted or unallocated) should not trigger non-TRIM warning */
+    ssd.trimInfo.bOsTrimEnabled = TRUE;
+    ssd.trimInfo.bHasNonTrimVolume = FALSE;
+    ssd.trimInfo.volumes[0].qwTotalBytes = 0;
+    ssd.trimInfo.volumes[0].qwFreeBytes = 0;
+    ssd.trimInfo.volumes[0].fFreePercent = -1.0f;
+    lstrcpynA(ssd.trimInfo.volumes[0].szFileSystem, "RAW", (int)sizeof(ssd.trimInfo.volumes[0].szFileSystem));
+    ssd.trimInfo.volumes[0].bTrimSupportedFs = FALSE;
+    EvaluateDriveTrimAndCapacity(&ssd);
+    Expect(!ssd.trimInfo.bHasNonTrimVolume, "0-byte RAW volume does not set bHasNonTrimVolume");
+    FormatHealthLectureExpert(&ssd, szExpert, sizeof(szExpert));
+    Expect(strstr(szExpert, "нет данных о файловой системе") != NULL || strstr(szExpert, "no filesystem data") != NULL, "Expert lecture displays no filesystem data for 0-byte volume");
+
     memcpy(&g, &ssd, sizeof(DRIVE_INFO));
     CaseEnd("volume-trim-monitoring", before);
 }
@@ -2981,6 +2994,14 @@ static void TestCounterfeitDetection(void)
         AssessDriveHealth(&g);
         Expect(g.bCounterfeitSuspected, "HDD with wiped all-zeros serial detected as counterfeit");
         ExpectHas(g.szCounterfeitReason, "занулён", "Reason mentions all-zeros");
+        ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_GOOD, "Clean counterfeit drive reliability remains GOOD");
+        ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_CAUTION, "Counterfeit drive health is CAUTION");
+        char szHddLecture[2048];
+        szHddLecture[0] = '\0';
+        UiSetLang(UI_LANG_RU);
+        FormatHealthLecturePlain(&g, szHddLecture, (int)sizeof(szHddLecture));
+        ExpectHas(szHddLecture, "Обнаружены признаки поддельного", "Russian plain lecture has counterfeit warning");
+        Expect(strstr(szHddLecture, "деградации носителя") == NULL, "Clean counterfeit plain lecture does NOT claim media degradation");
     }
 
     /* 15. Bilingual support: reason and lecture formatting */

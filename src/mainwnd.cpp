@@ -1184,6 +1184,14 @@ static void DoSaveDriveReport(HWND hWnd)
             for (vi = 0; vi < pInfo->trimInfo.nVolumeCount; vi++) {
                 const VOLUME_INFO_ENTRY* v = &pInfo->trimInfo.volumes[vi];
                 char szFree[32], szTot[32], szPct[32];
+                if (v->qwTotalBytes == 0) {
+                    safe_snprintf(szTrimLine, "| %s | %s | %s | %s | %s | %s |\r\n",
+                                  v->szLetter[0] ? v->szLetter : "?",
+                                  v->szFileSystem[0] ? v->szFileSystem : "RAW",
+                                  "\xe2\x80\x94", "\xe2\x80\x94", "\xe2\x80\x94", "\xe2\x80\x94");
+                    ReportCat(buf, kCap, &len, szTrimLine);
+                    continue;
+                }
                 double flFreeGb = (double)v->qwFreeBytes / (1024.0 * 1024.0 * 1024.0);
                 double flTotGb = (double)v->qwTotalBytes / (1024.0 * 1024.0 * 1024.0);
                 if (flTotGb < 1.0) {
@@ -1197,7 +1205,11 @@ static void DoSaveDriveReport(HWND hWnd)
     
                 }
 
-                safe_snprintf(szPct, "%.1f%%", (double)v->fFreePercent);
+                if (v->fFreePercent >= 0.0f) {
+                    safe_snprintf(szPct, "%.1f%%", (double)v->fFreePercent);
+                } else {
+                    safe_snprintf(szPct, "\xe2\x80\x94");
+                }
                 safe_snprintf(szTrimLine, "| %s | %s | %s | %s | %s | %s |\r\n",
                               v->szLetter, v->szFileSystem,
                               v->bTrimSupportedFs ? TN("Да", "Yes") : TN("НЕТ ⚠️", "NO ⚠️"),
