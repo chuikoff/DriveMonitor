@@ -30,6 +30,12 @@ void PrefixUsbProtocol(DRIVE_INFO* pInfo)
      * for which commands are safe, and does not rename the link. */
     if (pInfo->bGotNVMeIdent || pInfo->bIsNVMe)
         pre = "USB NVMe";
+    else if (pInfo->eAccessMethod == SMART_ACCESS_CYPRESS)
+        pre = "USB Cypress";
+    else if (pInfo->eAccessMethod == SMART_ACCESS_SUNPLUS)
+        pre = "USB Sunplus";
+    else if (pInfo->eAccessMethod == SMART_ACCESS_PROLIFIC)
+        pre = "USB Prolific";
     else if (pInfo->bCapAtaIdentify || pInfo->bCapSmartData ||
              pInfo->bSMART_Supported)
         pre = "USB SAT";
@@ -819,27 +825,9 @@ BOOL GetIdentifyDataSAT(HANDLE hDrive, DRIVE_INFO* pInfo)
 
     if (IsBufferAllZero(data, 64)) return FALSE;
 
-    WORD* pIdent = (WORD*)data;
-    SwapATAString(pInfo->szSerial,   &pIdent[10], 10);
-    SwapATAString(pInfo->szFirmware, &pIdent[23], 4);
-    SwapATAString(pInfo->szModel,    &pIdent[27], 20);
-
-    DWORD dwSectors28 = ((DWORD)pIdent[61] << 16) | pIdent[60];
-    unsigned __int64 qwSectors = 0;
-    if (pIdent[83] & 0x0400) {
-        qwSectors = IdentLba48(pIdent);
-    }
-    if (qwSectors == 0) qwSectors = (unsigned __int64)dwSectors28;
-    if (qwSectors > 0)
-        pInfo->dwCapacityMB = (DWORD)(qwSectors * 512 / (1024 * 1024));
-
-    pInfo->bSMART_Supported = TRUE;
-    pInfo->bSMART_Enabled   = (pIdent[85] & 0x0001) ? TRUE : FALSE;
+    if (!ParseAtaIdentifyData(data, pInfo)) return FALSE;
     pInfo->bIsUSB           = TRUE;
     pInfo->eAccessMethod    = method;
-    pInfo->wRotationRate    = pIdent[217];
-    pInfo->bCapAtaIdentify  = TRUE;
-    FillAtaProtocolFromIdent(pInfo, pIdent);
     return TRUE;
 }
 
@@ -879,6 +867,456 @@ BOOL GetSMARTThresholdsSAT(HANDLE hDrive, DRIVE_INFO* pInfo)
     FillSmartThreshold(pInfo, data);
     return TRUE;
 }
+
+/* ============================================================
+ * Generic SCSI Pass-Through for Vendor USB Bridges
+ * ============================================================ */
+BOOL ScsiSendGenericCdb(HANDLE hDrive, const UCHAR* pCdb, UCHAR cdbLen,
+                               BYTE* pDataBuf, DWORD dwDataLen, BOOL bDataIn)
+{
+    if (!DriveAllowsScsiPassthrough(hDrive) || !pCdb || cdbLen == 0)
+        return FALSE;
+
+    /* 1. Try SCSI_PASS_THROUGH_DIRECT */
+    SAT_PASSTHROUGH_BUF sb;
+    ULONGLONG stage[64];
+    DWORD dwBytes = 0;
+    DWORD nCopy = 0;
+
+    if (bDataIn && dwDataLen > sizeof(stage))
+        return FALSE;
+
+    ZeroMemory(&sb, sizeof(sb));
+    ZeroMemory(stage, sizeof(stage));
+    sb.sptd.Length           = sizeof(SCSI_PASS_THROUGH_DIRECT);
+    sb.sptd.PathId           = 0;
+    sb.sptd.TargetId         = 0;
+    sb.sptd.Lun              = 0;
+    sb.sptd.CdbLength        = cdbLen;
+    sb.sptd.SenseInfoLength  = sizeof(sb.SenseBuf);
+    sb.sptd.SenseInfoOffset  = offsetof(SAT_PASSTHROUGH_BUF, SenseBuf);
+    sb.sptd.TimeOutValue     = 10;
+    if (bDataIn) {
+        sb.sptd.DataIn             = SCSI_IOCTL_DATA_IN;
+        sb.sptd.DataTransferLength = dwDataLen;
+        sb.sptd.DataBuffer         = stage;
+    } else {
+        sb.sptd.DataIn             = SCSI_IOCTL_DATA_UNSPECIFIED;
+        sb.sptd.DataTransferLength = 0;
+        sb.sptd.DataBuffer         = NULL;
+    }
+    memcpy(sb.sptd.Cdb, pCdb, cdbLen);
+
+    if (DeviceIoControl(hDrive, IOCTL_SCSI_PASS_THROUGH_DIRECT,
+            &sb, sizeof(sb), &sb, sizeof(sb), &dwBytes, NULL)) {
+        if (!SATStatusStops(sb.sptd.ScsiStatus)) {
+            if (bDataIn) {
+                nCopy = dwDataLen;
+                if (nCopy > sb.sptd.DataTransferLength) nCopy = sb.sptd.DataTransferLength;
+                if (nCopy > sizeof(stage)) nCopy = sizeof(stage);
+                memcpy(pDataBuf, stage, nCopy);
+            }
+            return TRUE;
+        }
+    }
+
+    /* 2. Fallback to buffered SCSI_PASS_THROUGH */
+    CDI_SAT_PASSTHROUGH_BUF sptwb;
+    ZeroMemory(&sptwb, sizeof(sptwb));
+    sptwb.spt.Length          = sizeof(SCSI_PASS_THROUGH);
+    sptwb.spt.PathId          = 0;
+    sptwb.spt.TargetId        = 0;
+    sptwb.spt.Lun             = 0;
+    sptwb.spt.CdbLength       = cdbLen;
+    sptwb.spt.SenseInfoLength = 32;
+    sptwb.spt.SenseInfoOffset = offsetof(CDI_SAT_PASSTHROUGH_BUF, SenseBuf);
+    sptwb.spt.TimeOutValue    = 10;
+    if (bDataIn) {
+        sptwb.spt.DataIn             = SCSI_IOCTL_DATA_IN;
+        sptwb.spt.DataTransferLength = dwDataLen;
+        sptwb.spt.DataBufferOffset   = offsetof(CDI_SAT_PASSTHROUGH_BUF, DataBuf);
+    } else {
+        sptwb.spt.DataIn             = SCSI_IOCTL_DATA_UNSPECIFIED;
+        sptwb.spt.DataTransferLength = 0;
+    }
+    memcpy(sptwb.spt.Cdb, pCdb, cdbLen);
+
+    DWORD inLen = offsetof(CDI_SAT_PASSTHROUGH_BUF, DataBuf) + (bDataIn ? dwDataLen : 0);
+    dwBytes = 0;
+    if (DeviceIoControl(hDrive, IOCTL_SCSI_PASS_THROUGH,
+            &sptwb, inLen, &sptwb, sizeof(sptwb), &dwBytes, NULL)) {
+        if (!SATStatusStops(sptwb.spt.ScsiStatus)) {
+            if (bDataIn) {
+                nCopy = dwDataLen;
+                if (nCopy > sptwb.spt.DataTransferLength) nCopy = sptwb.spt.DataTransferLength;
+                if (nCopy > sizeof(sptwb.DataBuf)) nCopy = sizeof(sptwb.DataBuf);
+                memcpy(pDataBuf, sptwb.DataBuf, nCopy);
+            }
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+/* ============================================================
+ * Cypress ATACB (CY7C68300A, CY7C68300C, CY7C68310, I-O Data)
+ * Vendor-specific 16-byte SCSI command with opcode 0x24 / sub 0x24
+ * ============================================================ */
+static BOOL CypressSendCommand(HANDLE hDrive, BYTE bFeatures, BYTE bSectorCnt,
+                               BYTE bLBALow, BYTE bCylLow, BYTE bCylHigh,
+                               BYTE bCommand, BYTE* pDataBuf, DWORD dwDataLen)
+{
+    UCHAR cdb[16];
+    ZeroMemory(cdb, sizeof(cdb));
+    cdb[0] = 0x24; /* CYPRESS_SIGNATURE_OPCODE */
+    cdb[1] = 0x24; /* CYPRESS_SUBCOMMAND */
+    if (bCommand == ID_CMD || bCommand == 0xA1) {
+        cdb[2] |= 0x80; /* CYPRESS_IDENTIFY_DATA_BIT */
+    }
+    cdb[3]  = 0xFF; /* Register select mask: all registers */
+    cdb[4]  = 0;
+    cdb[5]  = 0;    /* DeviceControl */
+    cdb[6]  = bFeatures;
+    cdb[7]  = bSectorCnt;
+    cdb[8]  = bLBALow;
+    cdb[9]  = bCylLow;
+    cdb[10] = bCylHigh;
+    cdb[11] = 0xA0; /* Device/Head */
+    cdb[12] = bCommand;
+
+    BOOL bDataIn = (pDataBuf && dwDataLen > 0);
+    return ScsiSendGenericCdb(hDrive, cdb, 16, pDataBuf, dwDataLen, bDataIn);
+}
+
+BOOL GetSMARTReturnStatusCypress(HANDLE hDrive, BOOL* pbFail)
+{
+    if (!pbFail) return FALSE;
+    *pbFail = FALSE;
+
+    /* Issue SMART RETURN STATUS command */
+    if (!CypressSendCommand(hDrive, SMART_RETURN_STATUS, 1, 0,
+                            SMART_CYL_LOW, SMART_CYL_HI, SMART_CMD, NULL, 0))
+        return FALSE;
+
+    /* Read 8-byte RTFR registers (opcode 0x24, sub 0x24, taskfile read bit 0x01) */
+    UCHAR cdb[16];
+    BYTE retData[8];
+    ZeroMemory(cdb, sizeof(cdb));
+    ZeroMemory(retData, sizeof(retData));
+    cdb[0] = 0x24;
+    cdb[1] = 0x24;
+    cdb[2] = 0x01; /* CYPRESS_TASK_FILE_READ_BIT */
+
+    if (!ScsiSendGenericCdb(hDrive, cdb, 16, retData, sizeof(retData), TRUE))
+        return FALSE;
+
+    /* returnData[4] = CylLow (0x4F), returnData[5] = CylHi (0xC2) */
+    if (retData[4] == SMART_CYL_LOW && retData[5] == SMART_CYL_HI) {
+        *pbFail = FALSE;
+        return TRUE;
+    }
+    if (retData[4] == 0xF4 && retData[5] == 0x2C) {
+        *pbFail = TRUE;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+BOOL GetIdentifyDataCypress(HANDLE hDrive, DRIVE_INFO* pInfo)
+{
+    BYTE data[IDENTIFY_BUFFER_SIZE];
+    ZeroMemory(data, sizeof(data));
+    if (!CypressSendCommand(hDrive, 0, 1, 0, 0, 0, ID_CMD, data, sizeof(data)))
+        return FALSE;
+    if (ParseAtaIdentifyData(data, pInfo)) {
+        pInfo->bIsUSB = TRUE;
+        pInfo->eAccessMethod = SMART_ACCESS_CYPRESS;
+        pInfo->eUsbBridgeType = USB_BRIDGE_CYPRESS;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+BOOL GetSMARTAttributesCypress(HANDLE hDrive, DRIVE_INFO* pInfo)
+{
+    BYTE data[READ_ATTRIBUTE_BUFFER_SIZE];
+    ZeroMemory(data, sizeof(data));
+    CypressSendCommand(hDrive, SMART_ENABLE, 1, 0, SMART_CYL_LOW, SMART_CYL_HI, SMART_CMD, NULL, 0);
+    if (!CypressSendCommand(hDrive, SMART_READ_DATA, 1, 0x00,
+                            SMART_CYL_LOW, SMART_CYL_HI, SMART_CMD, data, sizeof(data)))
+        return FALSE;
+    if (FillSmartData(pInfo, data) <= 0)
+        return FALSE;
+    pInfo->eAccessMethod = SMART_ACCESS_CYPRESS;
+    return TRUE;
+}
+
+BOOL GetSMARTThresholdsCypress(HANDLE hDrive, DRIVE_INFO* pInfo)
+{
+    BYTE data[READ_THRESHOLD_BUFFER_SIZE];
+    ZeroMemory(data, sizeof(data));
+    if (!CypressSendCommand(hDrive, SMART_READ_THRESHOLDS, 1, 0x00,
+                            SMART_CYL_LOW, SMART_CYL_HI, SMART_CMD, data, sizeof(data)))
+        return FALSE;
+    FillSmartThreshold(pInfo, data);
+    return TRUE;
+}
+
+/* ============================================================
+ * Sunplus (SPIF215, SPIF225, SPIF301)
+ * Vendor-specific 12-byte SCSI command with opcode 0xF8
+ * ============================================================ */
+static BOOL SunplusSendCommand(HANDLE hDrive, BYTE bFeatures, BYTE bSectorCnt,
+                               BYTE bLBALow, BYTE bCylLow, BYTE bCylHigh,
+                               BYTE bCommand, BYTE* pDataBuf, DWORD dwDataLen)
+{
+    UCHAR cdb[12];
+    ZeroMemory(cdb, sizeof(cdb));
+    cdb[0] = 0xF8; /* SUNPLUS_PT_COMMAND_OPCODE */
+    cdb[1] = 0x00;
+    cdb[2] = 0x22; /* SUNPLUS_SUBCOMMAND_SEND_ATA_COMMAND */
+    cdb[3] = (pDataBuf && dwDataLen > 0) ? 0x10 : 0x00; /* SUNPLUS_XFER_IN / NONE */
+    cdb[4] = (BYTE)(dwDataLen >> 9); /* number of 512-byte blocks */
+    cdb[5] = bFeatures;
+    cdb[6] = bSectorCnt;
+    cdb[7] = bLBALow;
+    cdb[8] = bCylLow;
+    cdb[9] = bCylHigh;
+    cdb[10] = 0xA0;
+    cdb[11] = bCommand;
+
+    BOOL bDataIn = (pDataBuf && dwDataLen > 0);
+    return ScsiSendGenericCdb(hDrive, cdb, 12, pDataBuf, dwDataLen, bDataIn);
+}
+
+BOOL GetSMARTReturnStatusSunplus(HANDLE hDrive, BOOL* pbFail)
+{
+    if (!pbFail) return FALSE;
+    *pbFail = FALSE;
+
+    /* Issue SMART RETURN STATUS command */
+    if (!SunplusSendCommand(hDrive, SMART_RETURN_STATUS, 1, 0,
+                            SMART_CYL_LOW, SMART_CYL_HI, SMART_CMD, NULL, 0))
+        return FALSE;
+
+    /* Read status registers: opcode 0xF8, sub 0x21, 16 bytes */
+    UCHAR cdb[12];
+    BYTE retData[16];
+    ZeroMemory(cdb, sizeof(cdb));
+    ZeroMemory(retData, sizeof(retData));
+    cdb[0] = 0xF8;
+    cdb[2] = 0x21; /* SUNPLUS_SUBCOMMAND_GET_STATUS */
+
+    if (!ScsiSendGenericCdb(hDrive, cdb, 12, retData, sizeof(retData), TRUE))
+        return FALSE;
+
+    /* retData[4] = CylLow (0x4F), retData[5] = CylHi (0xC2) */
+    if (retData[4] == SMART_CYL_LOW && retData[5] == SMART_CYL_HI) {
+        *pbFail = FALSE;
+        return TRUE;
+    }
+    if (retData[4] == 0xF4 && retData[5] == 0x2C) {
+        *pbFail = TRUE;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+BOOL GetIdentifyDataSunplus(HANDLE hDrive, DRIVE_INFO* pInfo)
+{
+    BYTE data[IDENTIFY_BUFFER_SIZE];
+    ZeroMemory(data, sizeof(data));
+    if (!SunplusSendCommand(hDrive, 0, 1, 0, 0, 0, ID_CMD, data, sizeof(data)))
+        return FALSE;
+    if (ParseAtaIdentifyData(data, pInfo)) {
+        pInfo->bIsUSB = TRUE;
+        pInfo->eAccessMethod = SMART_ACCESS_SUNPLUS;
+        pInfo->eUsbBridgeType = USB_BRIDGE_SUNPLUS;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+BOOL GetSMARTAttributesSunplus(HANDLE hDrive, DRIVE_INFO* pInfo)
+{
+    BYTE data[READ_ATTRIBUTE_BUFFER_SIZE];
+    ZeroMemory(data, sizeof(data));
+    SunplusSendCommand(hDrive, SMART_ENABLE, 1, 0, SMART_CYL_LOW, SMART_CYL_HI, SMART_CMD, NULL, 0);
+    if (!SunplusSendCommand(hDrive, SMART_READ_DATA, 1, 0x00,
+                            SMART_CYL_LOW, SMART_CYL_HI, SMART_CMD, data, sizeof(data)))
+        return FALSE;
+    if (FillSmartData(pInfo, data) <= 0)
+        return FALSE;
+    pInfo->eAccessMethod = SMART_ACCESS_SUNPLUS;
+    return TRUE;
+}
+
+BOOL GetSMARTThresholdsSunplus(HANDLE hDrive, DRIVE_INFO* pInfo)
+{
+    BYTE data[READ_THRESHOLD_BUFFER_SIZE];
+    ZeroMemory(data, sizeof(data));
+    if (!SunplusSendCommand(hDrive, SMART_READ_THRESHOLDS, 1, 0x00,
+                            SMART_CYL_LOW, SMART_CYL_HI, SMART_CMD, data, sizeof(data)))
+        return FALSE;
+    FillSmartThreshold(pInfo, data);
+    return TRUE;
+}
+
+/* ============================================================
+ * Prolific (PL-2507, PL-2773) / JMicron Legacy (JM20337)
+ * Prolific uses 0xD8 / 0xD7; JMicron uses 0xDF
+ * ============================================================ */
+static BOOL ProlificSendCommand(HANDLE hDrive, BYTE bFeatures, BYTE bSectorCnt,
+                                BYTE bLBALow, BYTE bCylLow, BYTE bCylHigh,
+                                BYTE bCommand, BYTE* pDataBuf, DWORD dwDataLen)
+{
+    BOOL bDataIn = (pDataBuf && dwDataLen > 0);
+    UCHAR cdb[16];
+    ZeroMemory(cdb, sizeof(cdb));
+
+    /* 1. Try Prolific 0xD8 format */
+    cdb[0] = 0xD8; /* PROLIFIC_EXECUTE_ATA_COMMAND_OPCODE */
+    cdb[1] = (BYTE)(0x05 | (bDataIn ? 0x10 : 0x00));
+    cdb[2] = 0x00;
+    cdb[3] = bFeatures;
+    cdb[4] = 0x06; /* CHECK_WORD high */
+    cdb[5] = 0x7B; /* CHECK_WORD low */
+    cdb[6] = (BYTE)(dwDataLen >> 24);
+    cdb[7] = (BYTE)(dwDataLen >> 16);
+    cdb[8] = (BYTE)(dwDataLen >> 8);
+    cdb[9] = (BYTE)(dwDataLen & 0xFF);
+    cdb[10] = bSectorCnt;
+    cdb[11] = bLBALow;
+    cdb[12] = bCylLow;
+    cdb[13] = bCylHigh;
+    cdb[14] = 0xA0;
+    cdb[15] = bCommand;
+
+    if (ScsiSendGenericCdb(hDrive, cdb, 16, pDataBuf, dwDataLen, bDataIn))
+        return TRUE;
+
+    /* 2. Fallback: JMicron 0xDF format */
+    ZeroMemory(cdb, sizeof(cdb));
+    cdb[0] = 0xDF; /* JM_ATA_PT_OPCODE */
+    cdb[1] = 0x10; /* JM_DIR_DATAIN / NODATA */
+    cdb[3] = (BYTE)(dwDataLen >> 8);
+    cdb[4] = (BYTE)(dwDataLen & 0xFF);
+    cdb[5] = bFeatures;
+    cdb[6] = bSectorCnt;
+    cdb[7] = bLBALow;
+    cdb[8] = bCylLow;
+    cdb[9] = bCylHigh;
+    cdb[10] = 0xA0;
+    cdb[11] = bCommand;
+    cdb[12] = 0x06; /* Prolific VID high */
+    cdb[13] = 0x7B; /* Prolific VID low */
+
+    return ScsiSendGenericCdb(hDrive, cdb, 14, pDataBuf, dwDataLen, bDataIn);
+}
+
+BOOL GetSMARTReturnStatusProlific(HANDLE hDrive, BOOL* pbFail)
+{
+    if (!pbFail) return FALSE;
+    *pbFail = FALSE;
+
+    /* Issue SMART RETURN STATUS command */
+    if (!ProlificSendCommand(hDrive, SMART_RETURN_STATUS, 1, 0,
+                             SMART_CYL_LOW, SMART_CYL_HI, SMART_CMD, NULL, 0))
+        return FALSE;
+
+    /* Read 16-byte registers: opcode 0xD7 */
+    UCHAR cdb[6];
+    BYTE retData[16];
+    ZeroMemory(cdb, sizeof(cdb));
+    ZeroMemory(retData, sizeof(retData));
+    cdb[0] = 0xD7;
+    cdb[4] = 0x06;
+    cdb[5] = 0x7B;
+
+    if (!ScsiSendGenericCdb(hDrive, cdb, 6, retData, sizeof(retData), TRUE))
+        return FALSE;
+
+    /* retData[6] = CylLow (0x4F), retData[8] = CylHi (0xC2) */
+    if (retData[6] == SMART_CYL_LOW && retData[8] == SMART_CYL_HI) {
+        *pbFail = FALSE;
+        return TRUE;
+    }
+    if (retData[6] == 0xF4 && retData[8] == 0x2C) {
+        *pbFail = TRUE;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+BOOL GetIdentifyDataProlific(HANDLE hDrive, DRIVE_INFO* pInfo)
+{
+    BYTE data[IDENTIFY_BUFFER_SIZE];
+    ZeroMemory(data, sizeof(data));
+    if (!ProlificSendCommand(hDrive, 0, 1, 0, 0, 0, ID_CMD, data, sizeof(data)))
+        return FALSE;
+    if (ParseAtaIdentifyData(data, pInfo)) {
+        pInfo->bIsUSB = TRUE;
+        pInfo->eAccessMethod = SMART_ACCESS_PROLIFIC;
+        pInfo->eUsbBridgeType = USB_BRIDGE_PROLIFIC;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+BOOL GetSMARTAttributesProlific(HANDLE hDrive, DRIVE_INFO* pInfo)
+{
+    BYTE data[READ_ATTRIBUTE_BUFFER_SIZE];
+    ZeroMemory(data, sizeof(data));
+    ProlificSendCommand(hDrive, SMART_ENABLE, 1, 0, SMART_CYL_LOW, SMART_CYL_HI, SMART_CMD, NULL, 0);
+    if (!ProlificSendCommand(hDrive, SMART_READ_DATA, 1, 0x00,
+                             SMART_CYL_LOW, SMART_CYL_HI, SMART_CMD, data, sizeof(data)))
+        return FALSE;
+    if (FillSmartData(pInfo, data) <= 0)
+        return FALSE;
+    pInfo->eAccessMethod = SMART_ACCESS_PROLIFIC;
+    return TRUE;
+}
+
+BOOL GetSMARTThresholdsProlific(HANDLE hDrive, DRIVE_INFO* pInfo)
+{
+    BYTE data[READ_THRESHOLD_BUFFER_SIZE];
+    ZeroMemory(data, sizeof(data));
+    if (!ProlificSendCommand(hDrive, SMART_READ_THRESHOLDS, 1, 0x00,
+                             SMART_CYL_LOW, SMART_CYL_HI, SMART_CMD, data, sizeof(data)))
+        return FALSE;
+    FillSmartThreshold(pInfo, data);
+    return TRUE;
+}
+
+BOOL GetIdentifyDataLegacyBridges(HANDLE hDrive, DRIVE_INFO* pInfo)
+{
+    if (!hDrive || !pInfo) return FALSE;
+    if (IsLikelyUsbFlashDrive(pInfo)) return FALSE;
+
+    /* 1. Try known bridge from VID/PID */
+    if (pInfo->eUsbBridgeType == USB_BRIDGE_CYPRESS ||
+        pInfo->eUsbBridgeType == USB_BRIDGE_IO_DATA) {
+        if (GetIdentifyDataCypress(hDrive, pInfo)) return TRUE;
+    }
+    else if (pInfo->eUsbBridgeType == USB_BRIDGE_SUNPLUS) {
+        if (GetIdentifyDataSunplus(hDrive, pInfo)) return TRUE;
+    }
+    else if (pInfo->eUsbBridgeType == USB_BRIDGE_PROLIFIC ||
+             pInfo->eUsbBridgeType == USB_BRIDGE_JMICRON) {
+        if (GetIdentifyDataProlific(hDrive, pInfo)) return TRUE;
+    }
+
+    /* 2. If bridge is unknown or auto-detect failed, try each safely */
+    if (UsbBridgeLooksLikeEnclosure(pInfo)) {
+        if (GetIdentifyDataCypress(hDrive, pInfo)) return TRUE;
+        if (GetIdentifyDataSunplus(hDrive, pInfo)) return TRUE;
+        if (GetIdentifyDataProlific(hDrive, pInfo)) return TRUE;
+    }
+
+    return FALSE;
+}
+
 
 /* ============================================================
  * SCSI LOG SENSE
@@ -1012,6 +1450,38 @@ static BOOL ReadSMARTLogSAT(HANDLE hDrive, BYTE bLogAddr,
     return TRUE;
 }
 
+BOOL ReadAtaLogExtSAT(HANDLE hDrive, BYTE bLogAddr, WORD wPage,
+                      void* pBuf, DWORD dwBufSize)
+{
+    if (!hDrive || !pBuf || dwBufSize < 512) return FALSE;
+    SMART_ACCESS_METHOD method = SMART_ACCESS_NONE;
+    BYTE data[512];
+    ZeroMemory(data, sizeof(data));
+
+    /* 1. Try READ LOG EXT (0x2F) via SAT */
+    BYTE bFeature = (BYTE)(wPage & 0xFF);
+    BYTE bLbaMid  = (BYTE)((wPage >> 8) & 0xFF);
+    if (SATSendCommand(hDrive, bFeature, 1, bLogAddr,
+                       bLbaMid, 0x00, 0x2F,
+                       SAT_PROTO_PIO_IN, data, 512, &method)) {
+        DWORD dwCopy = (dwBufSize < 512) ? dwBufSize : 512;
+        memcpy(pBuf, data, dwCopy);
+        return TRUE;
+    }
+
+    /* 2. Fallback to SMART READ LOG (0xB0 / 0xD5) for page 0 */
+    if (wPage == 0) {
+        if (SATSendCommand(hDrive, SMART_READ_LOG, 1, bLogAddr,
+                           SMART_CYL_LOW, SMART_CYL_HI, SMART_CMD,
+                           SAT_PROTO_PIO_IN, data, 512, &method)) {
+            DWORD dwCopy = (dwBufSize < 512) ? dwBufSize : 512;
+            memcpy(pBuf, data, dwCopy);
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
 BOOL GetSMARTErrorLogSAT(HANDLE hDrive, DRIVE_INFO* pInfo)
 {
     BYTE page[512];
@@ -1030,11 +1500,15 @@ BOOL GetSMARTSelfTestLogSAT(HANDLE hDrive, DRIVE_INFO* pInfo)
 {
     ZeroMemory(&pInfo->selfTestLog, sizeof(pInfo->selfTestLog));
 
-    if (ReadSMARTLogSAT(hDrive, SMART_LOG_COMP_SELF_TEST,
-                     (BYTE*)&pInfo->selfTestLog, sizeof(pInfo->selfTestLog))) {
+    if (ReadAtaLogExtSAT(hDrive, SMART_LOG_COMP_SELF_TEST, 0,
+                         (BYTE*)&pInfo->selfTestLog, sizeof(pInfo->selfTestLog)) ||
+        ReadSMARTLogSAT(hDrive, SMART_LOG_COMP_SELF_TEST,
+                        (BYTE*)&pInfo->selfTestLog, sizeof(pInfo->selfTestLog))) {
         pInfo->bGotSelfTestLog = TRUE;
-        if (pInfo->selfTestLog.stEntries[0].bStatusByte != 0)
-            pInfo->nSelfTestStatus = pInfo->selfTestLog.stEntries[0].bStatusByte;
+        int idx = (pInfo->selfTestLog.bMostRecentTestIndex >= 1 && pInfo->selfTestLog.bMostRecentTestIndex <= 21)
+                  ? (pInfo->selfTestLog.bMostRecentTestIndex - 1) : 0;
+        if (pInfo->selfTestLog.stEntries[idx].bStatusByte != 0)
+            pInfo->nSelfTestStatus = pInfo->selfTestLog.stEntries[idx].bStatusByte;
         return TRUE;
     }
     return FALSE;
@@ -1796,6 +2270,12 @@ BOOL IsLikelyUsbFlashDrive(const DRIVE_INFO* p)
     if (strstr(hay, "A400") || strstr(hay, "SA400") ||
         strstr(hay, "SSD") || strstr(hay, "NVMe") || strstr(hay, "NVME"))
         return FALSE;
+
+    /* USB VID of known flash drive vendors/controllers */
+    if (p->wUsbVid == 0x8564 || p->wUsbVid == 0x058F || p->wUsbVid == 0x13FE ||
+        p->wUsbVid == 0x1E3D || p->wUsbVid == 0x090C || p->wUsbVid == 0x0781 ||
+        p->wUsbVid == 0x0951)
+        return TRUE;
 
     /* Brand alone is not enough: Kingston/SanDisk also make SATA SSDs.
      * Match flash product names only. */

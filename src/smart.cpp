@@ -1,10 +1,18 @@
 /* DriveMonitor - SMART orchestration (open, scan, names). GPL-2.0-or-later. See LICENSE. */
 #include "smart_internal.h"
+#include "csmi.h"
 
 /* Final protocol string after type / SMART / NVMe ident are known. */
 void FillDriveProtocol(DRIVE_INFO* pInfo)
 {
     if (!pInfo) return;
+
+    if (pInfo->eAccessMethod == SMART_ACCESS_CSMI) {
+        if (pInfo->szProtocol[0] == '\0') {
+            safe_snprintf(pInfo->szProtocol, "RAID · CSMI · SATA");
+        }
+        return;
+    }
 
     if (pInfo->bIsNVMe) {
         if (pInfo->bGotNVMeIdent) {
@@ -779,6 +787,15 @@ BOOL DriveTreatsC0AsPowerLoss(const DRIVE_INFO* pInfo)
     return FALSE;
 }
 
+BOOL IsPowerLossAttrConfirmed(const DRIVE_INFO* pInfo, BYTE bID)
+{
+    if (!pInfo) return FALSE;
+    if (bID == 0xC0) return DriveTreatsC0AsPowerLoss(pInfo);
+    if (bID == 0xA0) return (pInfo->eController == CONTROLLER_PHISON);
+    if (bID == 0xAE) return (ProfileListsAttr(pInfo, 0xAE) || DriveDbAttrName(pInfo, 0xAE) != NULL);
+    return FALSE;
+}
+
 BOOL IsShockSensorAttr(BYTE bID)
 {
     return bID == 0x0E || bID == 0xBF || bID == 0xDD;
@@ -791,11 +808,39 @@ static BOOL IsVendorSpecificId(BYTE bID)
         return FALSE;
     if (bID >= 0xA0 && bID <= 0xBB)
         return TRUE;
+    if (bID == 0xCE || bID == 0xCF)
+        return TRUE;
+    if (bID >= 0xD0 && bID <= 0xD6)
+        return TRUE;
+    if (bID >= 0xDC && bID <= 0xE6)
+        return TRUE;
     if (bID >= 0xE7 && bID <= 0xF0)
         return TRUE;
-    if (bID >= 0xF5 && bID <= 0xF8)
+    if (bID >= 0xF5 && bID <= 0xFA)
         return TRUE;
     return FALSE;
+}
+
+static BOOL IsStandardAtaAttr(BYTE bID)
+{
+    switch (bID) {
+    case 0x01: /* Raw Read Error Rate */
+    case 0x04: /* Start/Stop Count */
+    case 0x05: /* Reallocated Sectors Count */
+    case 0x09: /* Power-On Hours */
+    case 0x0C: /* Power Cycle Count */
+    case 0xBC: /* Command Timeout */
+    case 0xBE: /* Airflow Temperature */
+    case 0xC2: /* Temperature */
+    case 0xC4: /* Reallocation Event Count */
+    case 0xC5: /* Current Pending Sector Count */
+    case 0xC6: /* Offline Uncorrectable Sector Count */
+    case 0xC7: /* UltraDMA CRC Error Count */
+    case 0xFB: /* Spare blocks remaining (generic name table) */
+        return TRUE;
+    default:
+        return FALSE;
+    }
 }
 
 static RAW_ENC EncFromInterp(ATTR_INTERP e)
@@ -1316,11 +1361,15 @@ void GetAttrDecode(BYTE bID, const DRIVE_INFO* pInfo, ATTR_DECODE* out)
                 out->eEnc = RawEncFromProf(enc);
             else
                 out->eEnc = RAW_ENC_UNKNOWN;
-        } else if (IsVendorSpecificId(bID)) {
-            /* HDD 183/184/240 keep the generic ATA names. Samsung SSD
+        } else if (IsVendorSpecificId(bID) ||
+                   (!DriveIsHdd(pInfo) && !IsStandardAtaAttr(bID))) {
+            /* HDD keeps the generic ATA/mechanical names. Samsung SSD
              * 183 is not a SATA downshift and is forced unnamed below. */
             BOOL keepHdd = DriveIsHdd(pInfo) &&
-                (bID == 0xB7 || bID == 0xB8 || bID == 0xF0);
+                (bID == 0xB7 || bID == 0xB8 || bID == 0xF0 ||
+                 bID == 0xCE || bID == 0xCF ||
+                 (bID >= 0xD0 && bID <= 0xD6) ||
+                 (bID >= 0xDC && bID <= 0xE6));
             /* 187 stays the standard counter when RAW decodes as a count.
              * Hitachi packing (decode < 0) stays unnamed and is not scored. */
             BOOL keep187 = FALSE;
@@ -1337,6 +1386,8 @@ void GetAttrDecode(BYTE bID, const DRIVE_INFO* pInfo, ATTR_DECODE* out)
                 out->eEnc = RAW_ENC_COUNTER32;
                 out->eCrit = ATTR_CRIT_CRITICAL;
                 out->nSemanticConfidence = 70;
+            } else if (bID == 0xC0 && DriveTreatsC0AsPowerLoss(pInfo)) {
+                /* Retain unsafe power-off events decode already set */
             } else {
                 out->szName = VendorSpecificAttrName(bID);
                 out->eEnc = RAW_ENC_UNKNOWN;
@@ -1738,7 +1789,7 @@ USHORT NvmeIdentVid(const DRIVE_INFO* p)
     const BYTE* id;
     if (!p || !p->bGotNVMeIdent) return 0;
     id = (const BYTE*)&p->nvmeIdent;
-    return (USHORT)id[0] | ((USHORT)id[1] << 8);
+    return (USHORT)((USHORT)id[0] | ((USHORT)id[1] << 8));
 }
 
 static DRIVE_CONTROLLER ControllerFromNvmeVid(USHORT vid)
@@ -2312,20 +2363,20 @@ BOOL SafeEjectPhysicalDrive(int nDrive, char* szErr, int nErrLen)
 
     if (szErr && nErrLen > 0) szErr[0] = '\0';
     if (!OpenDrive(nDrive, &hDisk)) {
-        if (szErr) safe_snprintf_n(szErr, nErrLen,
+        if (szErr) safe_snprintf_n(szErr, nErrLen, "%s",
             TN("Не удалось открыть диск.", "Could not open the drive."));
         return FALSE;
     }
     if (!GetDiskNumber(hDisk, &nDisk)) {
         CloseHandle(hDisk);
-        if (szErr) safe_snprintf_n(szErr, nErrLen,
+        if (szErr) safe_snprintf_n(szErr, nErrLen, "%s",
             TN("Не удалось определить номер диска.",
                "Could not determine the disk number."));
         return FALSE;
     }
     if (DiskNumberIsSystem(nDisk)) {
         CloseHandle(hDisk);
-        if (szErr) safe_snprintf_n(szErr, nErrLen,
+        if (szErr) safe_snprintf_n(szErr, nErrLen, "%s",
             TN("Это системный диск Windows. Его нельзя извлечь.",
                "This is the Windows system disk. It cannot be ejected."));
         return FALSE;
@@ -2339,7 +2390,7 @@ BOOL SafeEjectPhysicalDrive(int nDrive, char* szErr, int nErrLen)
     CloseHandle(hDisk);
 
     if (!FindDiskDevInst(nDisk, &inst) || inst == 0) {
-        if (szErr) safe_snprintf_n(szErr, nErrLen,
+        if (szErr) safe_snprintf_n(szErr, nErrLen, "%s",
             TN("Тома размонтированы, но устройство в дереве PnP не найдено.",
                "Volumes were dismounted, but the device was not found in the PnP tree."));
         return FALSE;
@@ -2355,7 +2406,7 @@ BOOL SafeEjectPhysicalDrive(int nDrive, char* szErr, int nErrLen)
         inst = parent;
     }
     if (!ejected) {
-        if (szErr) safe_snprintf_n(szErr, nErrLen,
+        if (szErr) safe_snprintf_n(szErr, nErrLen, "%s",
             TN("Windows не отключил устройство. Закройте файлы на диске и повторите.",
                "Windows did not disconnect the device. Close files on the drive and try again."));
         return FALSE;
@@ -2818,13 +2869,32 @@ int ScanDrivesEx(DRIVE_INFO* pDrives, int nMaxDrives,
                 pInfo->eType = DRIVE_TYPE_NVME;
             }
             if (!pInfo->bIsNVMe) {
-                pInfo->bSMART_Supported = FALSE;
-                pInfo->eType = DRIVE_TYPE_UNKNOWN;
+                /* SATA drive behind Intel RST: query via CSMI */
+                SCSI_ADDRESS addr;
+                HANDLE hScsi = OpenScsiAdapterFromDrive(hDrive, &addr);
+                if (hScsi != INVALID_HANDLE_VALUE) {
+                    BYTE bPhy = (BYTE)addr.TargetId;
+                    if (CsmiGetIdentifyData(hScsi, bPhy, pInfo)) {
+                        pInfo->bSMART_Supported = TRUE;
+                        pInfo->eAccessMethod = SMART_ACCESS_CSMI;
+                        pInfo->eType = DetectDriveType(hDrive, pInfo);
+                        CsmiGetSMARTAttributes(hScsi, bPhy, pInfo);
+                        CsmiGetSMARTThresholds(hScsi, bPhy, pInfo);
+                        ExtractTemperatureFromATA(pInfo);
+                        ExtractCommonATACounters(pInfo);
+                        ExtractSSDIndicators(pInfo);
+                        safe_snprintf(pInfo->szProtocol, "RAID · CSMI");
+                    }
+                    CloseHandle(hScsi);
+                }
+                if (!pInfo->bSMART_Supported) {
+                    pInfo->eType = DRIVE_TYPE_UNKNOWN;
+                }
             }
             /* Confidence is frozen inside Assess; name the chip first. */
             IdentifyDriveParts(pInfo);
             CheckDriveWritability(hDrive, pInfo);
-            if (pInfo->bIsNVMe) QueryPcieLinkProperties(pInfo->nDriveIndex, pInfo);
+            if (pInfo->bIsNVMe) QueryPcieLinkProperties((DWORD)pInfo->nDriveIndex, pInfo);
             AssessDriveHealth(pInfo);
             FillDriveProtocol(pInfo);
             CloseHandle(hDrive);
@@ -2843,7 +2913,7 @@ int ScanDrivesEx(DRIVE_INFO* pDrives, int nMaxDrives,
             pInfo->bIsNVMe             = TRUE;
             IdentifyDriveParts(pInfo);
             CheckDriveWritability(hDrive, pInfo);
-            QueryPcieLinkProperties(pInfo->nDriveIndex, pInfo);
+            QueryPcieLinkProperties((DWORD)pInfo->nDriveIndex, pInfo);
             AssessDriveHealth(pInfo);
             FillDriveProtocol(pInfo);
 
@@ -2885,7 +2955,7 @@ int ScanDrivesEx(DRIVE_INFO* pDrives, int nMaxDrives,
             }
             IdentifyDriveParts(pInfo);
             CheckDriveWritability(hDrive, pInfo);
-            if (pInfo->bIsNVMe) QueryPcieLinkProperties(pInfo->nDriveIndex, pInfo);
+            if (pInfo->bIsNVMe) QueryPcieLinkProperties((DWORD)pInfo->nDriveIndex, pInfo);
             AssessDriveHealth(pInfo);
             FillDriveProtocol(pInfo);
             CloseHandle(hDrive);
@@ -2916,6 +2986,9 @@ int ScanDrivesEx(DRIVE_INFO* pDrives, int nMaxDrives,
             if (!bIdentOK && GetIdentifyDataSAT(hDrive, pInfo)) {
                 bIdentOK = TRUE;
                 if (busType == 7) pInfo->bIsUSB = TRUE;
+            }
+            if (!bIdentOK && pInfo->bIsUSB && !pInfo->bSMART_Supported) {
+                bIdentOK = GetIdentifyDataLegacyBridges(hDrive, pInfo);
             }
         }
         if (!bIdentOK) {
@@ -3142,7 +3215,18 @@ int ScanDrivesEx(DRIVE_INFO* pDrives, int nMaxDrives,
                 bridge != USB_BRIDGE_NVME_JMICRON &&
                 bridge != USB_BRIDGE_NVME_ASMEDIA) {
                 if (pInfo->bSMART_Supported) {
-                    AcquireATASMART(hDrive, nDrive, pInfo, TRUE);
+                    if (pInfo->eAccessMethod == SMART_ACCESS_CYPRESS) {
+                        GetSMARTAttributesCypress(hDrive, pInfo);
+                        GetSMARTThresholdsCypress(hDrive, pInfo);
+                    } else if (pInfo->eAccessMethod == SMART_ACCESS_SUNPLUS) {
+                        GetSMARTAttributesSunplus(hDrive, pInfo);
+                        GetSMARTThresholdsSunplus(hDrive, pInfo);
+                    } else if (pInfo->eAccessMethod == SMART_ACCESS_PROLIFIC) {
+                        GetSMARTAttributesProlific(hDrive, pInfo);
+                        GetSMARTThresholdsProlific(hDrive, pInfo);
+                    } else {
+                        AcquireATASMART(hDrive, nDrive, pInfo, TRUE);
+                    }
                 } else {
                     /* Try SAT regardless of IDENTIFY's SMART supported bit */
                     if (GetSMARTAttributesSAT(hDrive, pInfo)) {
@@ -3153,6 +3237,28 @@ int ScanDrivesEx(DRIVE_INFO* pDrives, int nMaxDrives,
                         ExtractSSDIndicators(pInfo);
                         GetSMARTErrorLogSAT(hDrive, pInfo);
                         GetSMARTSelfTestLogSAT(hDrive, pInfo);
+                        AcquireAtaLogs(hDrive, TRUE, pInfo);
+                    } else if (GetSMARTAttributesCypress(hDrive, pInfo)) {
+                        GetSMARTThresholdsCypress(hDrive, pInfo);
+                        pInfo->bSMART_Supported = TRUE;
+                        pInfo->eAccessMethod = SMART_ACCESS_CYPRESS;
+                        ExtractTemperatureFromATA(pInfo);
+                        ExtractCommonATACounters(pInfo);
+                        ExtractSSDIndicators(pInfo);
+                    } else if (GetSMARTAttributesSunplus(hDrive, pInfo)) {
+                        GetSMARTThresholdsSunplus(hDrive, pInfo);
+                        pInfo->bSMART_Supported = TRUE;
+                        pInfo->eAccessMethod = SMART_ACCESS_SUNPLUS;
+                        ExtractTemperatureFromATA(pInfo);
+                        ExtractCommonATACounters(pInfo);
+                        ExtractSSDIndicators(pInfo);
+                    } else if (GetSMARTAttributesProlific(hDrive, pInfo)) {
+                        GetSMARTThresholdsProlific(hDrive, pInfo);
+                        pInfo->bSMART_Supported = TRUE;
+                        pInfo->eAccessMethod = SMART_ACCESS_PROLIFIC;
+                        ExtractTemperatureFromATA(pInfo);
+                        ExtractCommonATACounters(pInfo);
+                        ExtractSSDIndicators(pInfo);
             } else if (GetSMARTViaStorageProtocol(hDrive, pInfo)) {
                         pInfo->bSMART_Supported = TRUE;
                         ExtractTemperatureFromATA(pInfo);
@@ -3184,7 +3290,7 @@ int ScanDrivesEx(DRIVE_INFO* pDrives, int nMaxDrives,
          * after the earlier IdentifyDriveParts. Score only after that. */
         IdentifyDriveParts(pInfo);
         CheckDriveWritability(hDrive, pInfo);
-        if (pInfo->bIsNVMe && !pInfo->bIsUSB) QueryPcieLinkProperties(pInfo->nDriveIndex, pInfo);
+        if (pInfo->bIsNVMe && !pInfo->bIsUSB) QueryPcieLinkProperties((DWORD)pInfo->nDriveIndex, pInfo);
         AssessDriveHealth(pInfo);
         FillDriveProtocol(pInfo);
 
@@ -3220,6 +3326,9 @@ int ScanDrivesEx(DRIVE_INFO* pDrives, int nMaxDrives,
         }
 
         /* Query TRIM status and filesystem volume capacities */
+        /* Scan CSMI RAID controllers for physical member drives */
+        nFound = CsmiScanRaidDrives(pDrives, nMaxDrives, nFound);
+
         QueryDriveVolumesAndTrim(pDrives, nFound);
         for (int i = 0; i < nFound; i++) {
             if (pDrives[i].trimInfo.bQueried &&

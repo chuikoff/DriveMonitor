@@ -77,6 +77,14 @@ void FillNvmeProtocolFromIdent(DRIVE_INFO* pInfo)
         return;
     }
     safe_snprintf(pInfo->szProtocol, "NVMe %u.%u.%u", maj, minr, ter);
+
+    /* OACS (Optional Admin Command Support) word 256 */
+    WORD oacs = (WORD)((WORD)id[256] | ((WORD)id[257] << 8));
+    if (oacs & 0x0010) {
+        pInfo->bSelfTestSupported = TRUE;
+        pInfo->nShortSelfTestMinutes = 2;
+        pInfo->nExtSelfTestMinutes = (int)id[258];
+    }
 }
 
 /* memcpy Identify Controller without overreading a 4096-byte page. */
@@ -142,6 +150,11 @@ static int NvmeProtocolTry(HANDLE h, CDI_NVME_QUERY_BUF* q,
         src = q->Buffer;
         copyLen = dwOutLen < 4096 ? dwOutLen : 4096;
         if (reported > 0 && reported < copyLen) copyLen = reported;
+    } else if (dataType == MY_NVMeDataTypeLogPage &&
+               (requestValue == 0x01 || requestValue == 0x06)) {
+        /* Error Information (01h) and Device Self-Test (06h) logs are legitimately
+         * all-zero when no errors have occurred or no self-tests have run yet. */
+        src = pData;
     }
     if (!src)
         return 0;
@@ -447,7 +460,7 @@ typedef struct _MY_INTEL_NVME_PT {
 } MY_INTEL_NVME_PT;
 #pragma pack(pop)
 
-static HANDLE OpenScsiAdapterFromDrive(HANDLE hDrive, SCSI_ADDRESS* pAddr)
+HANDLE OpenScsiAdapterFromDrive(HANDLE hDrive, SCSI_ADDRESS* pAddr)
 {
     SCSI_ADDRESS addr;
     DWORD dw = 0;
@@ -722,3 +735,92 @@ void TryNvmeLifetimeTemp(HANDLE hDrive, DRIVE_INFO* pInfo)
         pInfo->nTempMinC = lo;
 }
 
+BOOL NvmeSendDeviceSelfTest(HANDLE hDrive, DWORD dwTestType)
+{
+    /* dwTestType: 1 = Short, 2 = Extended, 0 = Abort */
+    if (!hDrive || hDrive == INVALID_HANDLE_VALUE)
+        return FALSE;
+
+    if (GetStorageBusType(hDrive) == 7) { /* BusTypeUsb */
+        /* For USB-NVMe enclosures (e.g. JMicron JMS583), send vendor pass-through */
+        if (DriveAllowsScsiPassthrough(hDrive)) {
+            CDI_SAT_PASSTHROUGH_BUF_4K sptwb;
+            DWORD dwReturned = 0;
+            ZeroMemory(&sptwb, sizeof(sptwb));
+            sptwb.spt.Length             = sizeof(SCSI_PASS_THROUGH);
+            sptwb.spt.SenseInfoLength    = 24;
+            sptwb.spt.DataIn             = SCSI_IOCTL_DATA_OUT;
+            sptwb.spt.DataTransferLength = 512;
+            sptwb.spt.TimeOutValue       = 10;
+            sptwb.spt.DataBufferOffset   = offsetof(CDI_SAT_PASSTHROUGH_BUF_4K, DataBuf);
+            sptwb.spt.SenseInfoOffset    = offsetof(CDI_SAT_PASSTHROUGH_BUF_4K, SenseBuf);
+            sptwb.spt.CdbLength          = 12;
+            sptwb.spt.Cdb[0]             = 0xA1;
+            sptwb.spt.Cdb[1]             = 0x80; /* Admin command */
+            sptwb.spt.Cdb[4]             = 0x02;
+            sptwb.DataBuf[0] = 'N'; sptwb.DataBuf[1] = 'V';
+            sptwb.DataBuf[2] = 'M'; sptwb.DataBuf[3] = 'E';
+            sptwb.DataBuf[8] = 0x14; /* Opcode 0x14: Device Self-Test */
+            sptwb.DataBuf[12] = 0xFF; sptwb.DataBuf[13] = 0xFF; /* NSID 0xFFFFFFFF */
+            sptwb.DataBuf[14] = 0xFF; sptwb.DataBuf[15] = 0xFF;
+            sptwb.DataBuf[0x30] = (BYTE)(dwTestType & 0x0F); /* CDW10: Self-Test Action */
+            DWORD length = offsetof(CDI_SAT_PASSTHROUGH_BUF_4K, DataBuf) + 512;
+            if (DeviceIoControl(hDrive, IOCTL_SCSI_PASS_THROUGH, &sptwb, length, &sptwb, length, &dwReturned, NULL))
+                return TRUE;
+        }
+        return FALSE;
+    }
+
+    if (DriveBehindIntelRst(hDrive)) {
+        SCSI_ADDRESS addr;
+        HANDLE hScsi = OpenScsiAdapterFromDrive(hDrive, &addr);
+        if (hScsi == INVALID_HANDLE_VALUE) return FALSE;
+        MY_INTEL_NVME_PT* pt = (MY_INTEL_NVME_PT*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(MY_INTEL_NVME_PT));
+        if (!pt) { CloseHandle(hScsi); return FALSE; }
+        pt->SRB.HeaderLength = sizeof(MY_SRB_IO_CONTROL);
+        memcpy(pt->SRB.Signature, "IntelNvm", 8);
+        pt->SRB.Timeout = 10;
+        pt->SRB.ControlCode = (ULONG)IOCTL_INTEL_NVME_PASS_THROUGH;
+        pt->SRB.Length = sizeof(MY_INTEL_NVME_PT) - sizeof(MY_SRB_IO_CONTROL);
+        pt->Version = 1;
+        pt->PathId = addr.PathId;
+        pt->TargetId = addr.TargetId;
+        pt->Lun = addr.Lun;
+        pt->NVMeCmd[0] = 0x14;       /* Opcode 0x14: Device Self-Test */
+        pt->NVMeCmd[1] = 0xFFFFFFFF; /* NSID 0xFFFFFFFF (all namespaces) */
+        pt->NVMeCmd[10] = dwTestType;/* CDW10 */
+        pt->ParamBufLen = (DWORD)(sizeof(MY_INTEL_NVME_PT) - 0x1000);
+        pt->ReturnBufferLen = 0x1000;
+        DWORD dwRet = 0;
+        BOOL ok = DeviceIoControl(hScsi, IOCTL_SCSI_MINIPORT, pt, sizeof(*pt), pt, sizeof(*pt), &dwRet, NULL);
+        CloseHandle(hScsi);
+        HeapFree(GetProcessHeap(), 0, pt);
+        return ok;
+    }
+
+    if (DriveAllowsNvmeMini(hDrive)) {
+        SCSI_ADDRESS addr;
+        HANDLE hScsi = OpenScsiAdapterFromDrive(hDrive, &addr);
+        if (hScsi == INVALID_HANDLE_VALUE) return FALSE;
+        MY_NVME_PT* pt = (MY_NVME_PT*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(MY_NVME_PT));
+        if (!pt) { CloseHandle(hScsi); return FALSE; }
+        pt->SrbIoCtrl.HeaderLength = sizeof(MY_SRB_IO_CONTROL);
+        memcpy(pt->SrbIoCtrl.Signature, "NvmeMini", 8);
+        pt->SrbIoCtrl.Timeout = 10;
+        pt->SrbIoCtrl.ControlCode = (ULONG)NVME_PASS_THROUGH_SRB_IO_CODE;
+        pt->SrbIoCtrl.Length = sizeof(MY_NVME_PT) - sizeof(MY_SRB_IO_CONTROL);
+        pt->Direction = 0; /* No data transfer */
+        pt->DataBufferLen = 0;
+        pt->ReturnBufferLen = sizeof(MY_NVME_PT);
+        pt->NVMeCmd[0] = 0x14;       /* Opcode 0x14: Device Self-Test */
+        pt->NVMeCmd[1] = 0xFFFFFFFF; /* NSID 0xFFFFFFFF */
+        pt->NVMeCmd[10] = dwTestType;/* CDW10 */
+        DWORD dwRet = 0;
+        BOOL ok = DeviceIoControl(hScsi, IOCTL_SCSI_MINIPORT, pt, sizeof(*pt), pt, sizeof(*pt), &dwRet, NULL);
+        CloseHandle(hScsi);
+        HeapFree(GetProcessHeap(), 0, pt);
+        return ok;
+    }
+
+    return FALSE;
+}

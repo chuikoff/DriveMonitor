@@ -44,6 +44,7 @@ extern "C" {
 #define SMART_CYL_HI                0xC2
 #define SMART_READ_DATA             0xD0
 #define SMART_READ_THRESHOLDS       0xD1
+#define SMART_EXECUTE_OFFLINE       0xD4
 #define SMART_READ_LOG              0xD5
 #define SMART_ENABLE                0xD8
 #define SMART_DISABLE               0xD9
@@ -53,12 +54,15 @@ extern "C" {
 #define IDENTIFY_BUFFER_SIZE        512
 #define READ_THRESHOLD_BUFFER_SIZE  512
 
-/* SMART Log addresses */
-#define SMART_LOG_SUMMARY           0x01
-#define SMART_LOG_COMP_ERROR        0x02
-#define SMART_LOG_COMP_SELF_TEST    0x03
-#define SMART_LOG_SELECTIVE_SELF_TEST 0x04
+/* SMART Log addresses (ACS-3 / ACS-4 / smartmontools) */
+#define SMART_LOG_DIRECTORY           0x00
+#define SMART_LOG_SUMMARY             0x01
+#define SMART_LOG_COMP_ERROR          0x02
 #define SMART_LOG_EXTENDED_COMP_ERROR 0x03  /* ATA8+ extended error log */
+#define SMART_LOG_DEVICE_STATISTICS   0x04
+#define SMART_LOG_COMP_SELF_TEST      0x06  /* Standard SMART Self-test log (21 entries) */
+#define SMART_LOG_EXTENDED_SELF_TEST  0x07
+#define SMART_LOG_SELECTIVE_SELF_TEST 0x09
 
 /* SAT (SCSI/ATA Translation) */
 #define SAT_ATA_PASSTHROUGH_12      0xA1
@@ -111,6 +115,14 @@ typedef enum _USB_BRIDGE_TYPE {
 /* ============================================================
  * Drive health status
  * ============================================================ */
+typedef enum _DRIVE_ANOMALY_TYPE {
+    ANOMALY_NONE = 0,
+    ANOMALY_REFLASHED_REPAIRED, /* Перепрошит / восстановлен утилитой MPTool */
+    ANOMALY_SMART_WIPED,        /* Сброшенный SMART перед перепродажей (FARM телеметрия) */
+    ANOMALY_RELABELED,          /* Ремаркированный накопитель (чужая прошивка/RPM у HDD) */
+    ANOMALY_COUNTERFEIT         /* Поддельный накопитель (чужой VID/контроллер у брендового SSD) */
+} DRIVE_ANOMALY_TYPE;
+
 typedef enum _DRIVE_HEALTH_STATUS {
     HEALTH_STATUS_UNKNOWN  = 0,
     HEALTH_STATUS_GOOD     = 1,   /* No prefail-now, no media RAW, no self-test fail */
@@ -220,7 +232,11 @@ typedef enum _SMART_ACCESS_METHOD {
     SMART_ACCESS_SAT16             = 4,  /* SCSI 85h */
     SMART_ACCESS_STORAGE_QUERY     = 5,  /* IOCTL_STORAGE_QUERY_PROPERTY */
     SMART_ACCESS_NVME_PROTOCOL     = 6,  /* StorageDeviceProtocolSpecificProperty */
-    SMART_ACCESS_NVME_PASSTHROUGH  = 7   /* USB NVMe vendor SCSI (not PROTOCOL_COMMAND) */
+    SMART_ACCESS_NVME_PASSTHROUGH  = 7,  /* USB NVMe vendor SCSI (not PROTOCOL_COMMAND) */
+    SMART_ACCESS_CYPRESS           = 8,  /* Cypress ATACB (24h) */
+    SMART_ACCESS_SUNPLUS           = 9,  /* Sunplus (F8h) */
+    SMART_ACCESS_PROLIFIC          = 10, /* Prolific / JMicron Legacy (D8h/DFh) */
+    SMART_ACCESS_CSMI              = 11  /* CSMI SAS/SATA STP Passthrough (Intel RST RAID) */
 } SMART_ACCESS_METHOD;
 
 #pragma pack(push, 1)
@@ -371,26 +387,72 @@ typedef struct _SMART_ERROR_LOG {
 } SMART_ERROR_LOG;
 
 /* ============================================================
- * SMART Self-Test Log structures
+ * SMART Self-Test Log structures (ATA-8 ACS / ACS-2 / ACS-3 Table 45 & 44)
  * ============================================================ */
+#pragma pack(push, 1)
 typedef struct _SMART_SELF_TEST_DESCRIPTOR {
-    BYTE   bLBA_Low;
-    BYTE   bLBA_Mid;
-    BYTE   bLBA_High;
-    BYTE   bStatusByte;     /* Self-test status */
-    BYTE   bLifeTimestamp;   /* Power-on hours at start */
-    BYTE   bTimestamp[2];    /* Checkpoint */
-    BYTE   bFailingLBA[4];  /* LBA of first failure */
+    BYTE   bTestNumber;        /* Content of LBA Low reg when issued: 0x01 Offline, 0x02 Short, 0x03 Extended */
+    BYTE   bStatusByte;        /* Self-test execution status byte */
+    WORD   wLifeTimestamp;     /* Power-on hours at start */
+    BYTE   bCheckpoint;        /* Self-test failure checkpoint byte */
+    DWORD  dwFailingLBA;       /* LBA of first failure (32-bit little-endian) */
+    BYTE   bVendorSpecific[15];/* Vendor specific */
 } SMART_SELF_TEST_DESCRIPTOR;
 
 typedef struct _SMART_SELF_TEST_LOG {
-    BYTE                       bRevisionNumber[2];
-    BYTE                       bSelfTestIndex;
-    BYTE                       bReserved1;
-    SMART_SELF_TEST_DESCRIPTOR stEntries[21];
-    BYTE                       bReserved2[116];
-    BYTE                       bChecksum;
+    WORD                       wRevisionNumber;      /* 0..1: Data structure revision number */
+    SMART_SELF_TEST_DESCRIPTOR stEntries[21];        /* 2..505: 21 descriptors (21 * 24 = 504 bytes) */
+    BYTE                       bVendorSpecific[2];   /* 506..507: Vendor specific */
+    BYTE                       bMostRecentTestIndex; /* 508: Index of most recent test (1 to 21, or 0 if none) */
+    BYTE                       bReserved[2];         /* 509..510: Reserved */
+    BYTE                       bChecksum;            /* 511: Checksum */
 } SMART_SELF_TEST_LOG;
+#pragma pack(pop)
+#ifdef __cplusplus
+static_assert(sizeof(SMART_SELF_TEST_DESCRIPTOR) == 24, "SMART_SELF_TEST_DESCRIPTOR must be 24 bytes");
+static_assert(sizeof(SMART_SELF_TEST_LOG) == 512, "SMART_SELF_TEST_LOG must be 512 bytes");
+#endif
+
+/* ============================================================
+ * NVMe Error Information Log (Log ID 01h) entry - 64 bytes
+ * ============================================================ */
+typedef struct _NVME_ERROR_LOG_ENTRY {
+    uint64_t ErrorCount;
+    uint16_t SQID;
+    uint16_t CMDID;
+    uint16_t StatusField;
+    uint16_t ParameterErrorLocation;
+    uint64_t LBA;
+    uint32_t NamespaceID;
+    uint8_t  VendorSpecificInfo;
+    uint8_t  Reserved[3];
+    uint64_t CommandSpecificInfo;
+    uint8_t  Reserved2[24];
+} NVME_ERROR_LOG_ENTRY;
+
+/* ============================================================
+ * NVMe Device Self-Test Log (Log ID 06h)
+ * ============================================================ */
+typedef struct _NVME_SELF_TEST_RESULT {
+    uint8_t  Status;             /* bits 3:0: result code; bits 7:4: test code */
+    uint8_t  SegmentNum;
+    uint8_t  ValidDiagnosticInfo;
+    uint8_t  Reserved;
+    uint64_t PowerOnHours;
+    uint32_t FailingNamespace;
+    uint64_t FailingLBA;
+    uint8_t  StatusCodeType;
+    uint8_t  StatusCode;
+    uint8_t  VendorSpecific[2];
+} NVME_SELF_TEST_RESULT;
+
+typedef struct _NVME_SELF_TEST_LOG {
+    uint8_t               CurrentOperation;
+    uint8_t               CurrentCompletion;
+    uint8_t               Reserved[2];
+    NVME_SELF_TEST_RESULT Results[20];
+} NVME_SELF_TEST_LOG;
+
 
 #pragma pack(pop)
 
@@ -489,7 +551,7 @@ typedef struct _DRIVE_INFO {
     int         nCrcErrors;           /* CRC slot, -1 if absent */
     int         nReportedUncorrect;   /* REPORTED slot, -1 if absent */
     int         nProtectMode;         /* PROTECT slot, -1 if absent */
-    BOOL        bWriteProtected;      /* hardware/driver write-protect or read-only mode */
+    BOOL        bWriteProtected;      /* IOCTL says writes are blocked; not the disk's own lock */
     BOOL        bThresholdViolation;  /* prefail Value<=thresh now (ATA-3); same as bPrefailNow */
     BOOL        bPrefailNow;          /* prefail current <= thresh, thresh != 0 */
     BOOL        bPrefailPast;         /* prefail worst <= thresh, current still above */
@@ -523,6 +585,22 @@ typedef struct _DRIVE_INFO {
     BOOL        bGotSelfTestLog;
     int         nSelfTestStatus;         /* Current self-test status code */
     SMART_SELF_TEST_LOG selfTestLog;
+
+    /* Self-test capabilities, estimates and live execution */
+    BOOL        bSelfTestSupported;
+    int         nShortSelfTestMinutes;
+    int         nExtSelfTestMinutes;
+    int         nSelfTestPercentRemaining;
+    BOOL        bSelfTestRunning;
+
+    /* NVMe Error Log (Log ID 01h) */
+    BOOL        bGotNvmeErrorLog;
+    DWORD       dwNvmeErrorLogEntries;
+    NVME_ERROR_LOG_ENTRY nvmeErrorLog[8];
+
+    /* NVMe Self-Test Log (Log ID 06h) */
+    BOOL        bGotNvmeSelfTestLog;
+    NVME_SELF_TEST_LOG nvmeSelfTestLog;
 
     /* SSD-specific life indicators */
     int         nSSDLifeLeft;            /* 0-100, -1 if N/A */
@@ -576,6 +654,36 @@ typedef struct _DRIVE_INFO {
     BYTE        nPcieCurLinkSpeed;    /* PCIe Gen 1..5 */
     BYTE        nPcieMaxLinkWidth;    /* PCIe x1, x2, x4, x8, x16 */
     BYTE        nPcieCurLinkWidth;    /* PCIe x1, x2, x4, x8, x16 */
+    /* SATA PHY Event Counters (SATA Log 11h, standard SATA-IO) */
+    BOOL        bSataPhyLogSupported;
+    uint64_t    nPhyCommandIcrcErrors;     /* Event 0x0001 */
+    uint64_t    nPhyR_ErrDataFis;          /* Event 0x0002..0x0004 */
+    uint64_t    nPhyTransitionsPhyRdy;     /* Event 0x0009: Transitions from PHYRDY to !PHYRDY (link drop, loose contact, power rail dip) */
+    uint64_t    nPhyComresetCount;         /* Event 0x000A: Host COMRESET / bus resets */
+    uint64_t    nPhyCrcErrorsH2D;          /* Event 0x000B: CRC error in Host-to-Device FIS (cable signal degradation) */
+    uint64_t    nPhyNonCrcErrorsH2D;       /* Event 0x000D: Non-CRC framing/disparity/8b10b errors */
+    /* ATA Device Statistics (ATA Log 04h / GPL 04h, standard ATA-8 ACS) */
+    BOOL        bDevStatSupported;
+    int         nDevStatLifetimeMaxTempC;  /* Page 05h, offset 0x20: lifetime peak temperature (-1 if not reported) */
+    int         nDevStatLifetimeMinTempC;  /* Page 05h, offset 0x28: lifetime lowest temperature (-1 if not reported) */
+    uint64_t    qwDevStatSectorsWritten;   /* Page 01h, offset 0x18: logical sectors written */
+    uint64_t    qwDevStatSectorsRead;      /* Page 01h, offset 0x28: logical sectors read */
+    uint64_t    qwDevStatUncorrectable;    /* Page 04h, offset 0x08: reported uncorrectable errors */
+    int         nDevStatPercentUsed;       /* Page 07h, offset 0x08: SSD percentage used 0..100 (-1 if not reported) */
+    /* Seagate FARM (Field Accessible Reliability Metrics) telemetry (Log 0xA6) */
+    BOOL        bFarmLogSupported;
+    DWORD       dwFarmMajorVersion;
+    DWORD       dwFarmMinorVersion;
+    uint64_t    qwFarmPowerOnHours;        /* True lifetime POH from internal controller */
+    uint64_t    qwFarmSpindlePowerOnHours; /* Spindle motor runtime */
+    uint64_t    qwFarmHeadFlightHours;     /* Head flying hours */
+    uint64_t    qwFarmPowerCycleCount;     /* True power cycles */
+    uint64_t    qwFarmSectorsWritten;      /* True host sectors written from Log A6 Page 2 */
+    uint64_t    qwFarmSectorsRead;         /* True host sectors read from Log A6 Page 2 */
+    uint64_t    qwFarmReallocatedSectors;  /* Reallocated sectors from Log A6 Page 3 */
+    int         nFarmLifetimeMaxTempC;     /* Lifetime peak temp from Log A6 Page 4 */
+    int         nFarmLifetimeMinTempC;     /* Lifetime lowest temp from Log A6 Page 4 */
+    char        szFarmAssemblyDate[8];     /* Factory assembly date (YYWW), e.g. "1836" */
     /* SCSI / Miniport port number (corresponds to \Device\RaidPortN), -1 if unknown */
     int         nScsiPort;
     /* Windows Storage Event Log statistics (last 30 days) */
@@ -589,6 +697,7 @@ typedef struct _DRIVE_INFO {
     uint64_t            nDramBitFlips;
     /* Counterfeit / Relabeled drive detection */
     BOOL                bCounterfeitSuspected;
+    int                 nAnomalyType;           /* DRIVE_ANOMALY_TYPE */
     char                szCounterfeitReason[256];
     char                szCounterfeitReasonEn[256];
 } DRIVE_INFO;
@@ -748,6 +857,7 @@ void  FormatDriveSummary(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen);
 void  FillDriveProtocol(DRIVE_INFO* pInfo);
 void  FillAtaProtocolFromIdent(DRIVE_INFO* pInfo, const WORD* pIdent);
 BOOL  DriveTreatsC0AsPowerLoss(const DRIVE_INFO* pInfo);
+BOOL  IsPowerLossAttrConfirmed(const DRIVE_INFO* pInfo, BYTE bID);
 BOOL  IsShockSensorAttr(BYTE bID);
 
 /* SSD-specific analysis */

@@ -306,6 +306,8 @@ static const PROF_ATTR kSeagateHdd[] = {
 };
 
 static const PROF_ATTR kToshibaHdd[] = {
+    PN(0xC0, PROF_SEM_NONE, PROF_ENC_LO16,
+       "Аварийные отключения", "Power-off retracts"),
     PHN(0xC7, PROF_SEM_INTERFACE, PROF_ENC_COUNTER,
         "Ошибки CRC", "CRC errors",
         PROF_RULE_WORSE, PROF_SLOT_CRC, PROF_SCOPE_ANY, 0, 1, 100, 0),

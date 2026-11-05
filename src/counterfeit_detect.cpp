@@ -100,6 +100,7 @@ void DetectCounterfeitMismatch(DRIVE_INFO* pInfo)
 {
     if (!pInfo) return;
     pInfo->bCounterfeitSuspected = FALSE;
+    pInfo->nAnomalyType = ANOMALY_NONE;
     pInfo->szCounterfeitReason[0] = '\0';
     pInfo->szCounterfeitReasonEn[0] = '\0';
 
@@ -112,11 +113,12 @@ void DetectCounterfeitMismatch(DRIVE_INFO* pInfo)
         }
         if (sLen >= 6 && zeroCount == sLen) {
             pInfo->bCounterfeitSuspected = TRUE;
+            pInfo->nAnomalyType = ANOMALY_REFLASHED_REPAIRED;
             safe_snprintf(pInfo->szCounterfeitReason,
-                "Недостоверный серийный номер: серийный номер (%s) занулён (признак сброса или кустарной прошивки)",
+                "Недостоверный серийный номер: серийный номер (%s) занулён (признак сброса или сервисной перепрошивки)",
                 pInfo->szSerial);
             safe_snprintf(pInfo->szCounterfeitReasonEn,
-                "Invalid serial number: drive serial (%s) is all zeros (wiped or flashed firmware signature)",
+                "Invalid serial number: drive serial (%s) is all zeros (wiped or flashed firmware signature for recovery)",
                 pInfo->szSerial);
             return;
         }
@@ -126,11 +128,12 @@ void DetectCounterfeitMismatch(DRIVE_INFO* pInfo)
             strncmp(pInfo->szSerial, "0123456789", 10) == 0 ||
             strncmp(pInfo->szSerial, "1234567890", 10) == 0) {
             pInfo->bCounterfeitSuspected = TRUE;
+            pInfo->nAnomalyType = ANOMALY_REFLASHED_REPAIRED;
             safe_snprintf(pInfo->szCounterfeitReason,
-                "Признак неоригинального/перепрошитого накопителя: серийный номер (%s) является шаблоном MPTool",
+                "Признак сервисной перепрошивки/восстановления: серийный номер (%s) является шаблоном MPTool (диск мог быть перепрошит после сбоя)",
                 pInfo->szSerial);
             safe_snprintf(pInfo->szCounterfeitReasonEn,
-                "Counterfeit/reflashed drive signature: serial number (%s) is a default MPTool flasher template",
+                "Reflashed/repaired drive signature: serial number (%s) is a default MPTool flasher template (may have been recovered after firmware crash)",
                 pInfo->szSerial);
             return;
         }
@@ -150,6 +153,7 @@ void DetectCounterfeitMismatch(DRIVE_INFO* pInfo)
             if (ModelLooksSamsung(szModelU) || pInfo->eVendor == VENDOR_SAMSUNG) {
                 if (vid != 0x144D) {
                     pInfo->bCounterfeitSuspected = TRUE;
+                    pInfo->nAnomalyType = ANOMALY_COUNTERFEIT;
                     safe_snprintf(pInfo->szCounterfeitReason,
                         "Поддельный Samsung NVMe: аппаратный PCI VID (0x%04X) не принадлежит Samsung (0x144D)",
                         vid);
@@ -166,6 +170,7 @@ void DetectCounterfeitMismatch(DRIVE_INFO* pInfo)
                     if (vid == 0x10EC || vid == 0x126F || vid == 0x1E4B ||
                         vid == 0x1E49 || vid == 0x1DDC || vid == 0x1987) {
                         pInfo->bCounterfeitSuspected = TRUE;
+                        pInfo->nAnomalyType = ANOMALY_COUNTERFEIT;
                         safe_snprintf(pInfo->szCounterfeitReason,
                             "Поддельный WD NVMe: аппаратный PCI VID (0x%04X) не принадлежит WD/SanDisk",
                             vid);
@@ -180,6 +185,7 @@ void DetectCounterfeitMismatch(DRIVE_INFO* pInfo)
                 if (vid != 0x1344 && vid != 0xC0A9 && vid != 0x1987 && vid != 0x1D97 && vid != 0x126F) {
                     if (vid == 0x10EC || vid == 0x1E4B || vid == 0x1E49 || vid == 0x1DDC) {
                         pInfo->bCounterfeitSuspected = TRUE;
+                        pInfo->nAnomalyType = ANOMALY_COUNTERFEIT;
                         safe_snprintf(pInfo->szCounterfeitReason,
                             "Поддельный Crucial NVMe: аппаратный PCI VID (0x%04X) не принадлежит Crucial/Micron",
                             vid);
@@ -192,6 +198,7 @@ void DetectCounterfeitMismatch(DRIVE_INFO* pInfo)
             } else if (strstr(szModelU, "INTEL SSD") || strstr(szModelU, "SOLIDIGM")) {
                 if (vid != 0x8086 && vid != 0x025E && vid != 0x126F) {
                     pInfo->bCounterfeitSuspected = TRUE;
+                    pInfo->nAnomalyType = ANOMALY_COUNTERFEIT;
                     safe_snprintf(pInfo->szCounterfeitReason,
                         "Поддельный Intel NVMe: аппаратный PCI VID (0x%04X) не принадлежит Intel/Solidigm",
                         vid);
@@ -225,6 +232,7 @@ void DetectCounterfeitMismatch(DRIVE_INFO* pInfo)
                     strncmp(szFwU, "W0", 2) == 0 || strncmp(szFwU, "S0", 2) == 0 ||
                     strncmp(szFwU, "SBF", 3) == 0 || strstr(szFwU, "2258") || strstr(szFwU, "2259")) {
                     pInfo->bCounterfeitSuspected = TRUE;
+                    pInfo->nAnomalyType = ANOMALY_COUNTERFEIT;
                     safe_snprintf(pInfo->szCounterfeitReason,
                         "Поддельный Samsung SSD: прошивка (%s) принадлежит стороннему контроллеру (Realtek/SMI)",
                         pInfo->szFirmware);
@@ -237,11 +245,42 @@ void DetectCounterfeitMismatch(DRIVE_INFO* pInfo)
         }
     }
 
-    /* 3. HDD Vendor / Model / Firmware Contradictions */
+    /* 3. Seagate FARM Telemetry Discrepancy (wiped / refurbished drive detection) */
+    if (pInfo->bFarmLogSupported && pInfo->qwFarmPowerOnHours > 0) {
+        if (pInfo->dwPowerOnHours >= 0 &&
+            pInfo->qwFarmPowerOnHours > (unsigned __int64)pInfo->dwPowerOnHours + 100) {
+            pInfo->bCounterfeitSuspected = TRUE;
+            pInfo->nAnomalyType = ANOMALY_SMART_WIPED;
+            safe_snprintf(pInfo->szCounterfeitReason,
+                "Сброшенный SMART (б/у диск): реальная наработка по аппаратному FARM-логу составляет %llu ч, а в SMART заявлено всего %lu ч (счётчики сброшены перед перепродажей)",
+                (unsigned long long)pInfo->qwFarmPowerOnHours, (unsigned long)pInfo->dwPowerOnHours);
+            safe_snprintf(pInfo->szCounterfeitReasonEn,
+                "Wiped SMART (refurbished drive): hardware FARM log records %llu hours, but SMART claims only %lu hours (runtime counters reset before resale)",
+                (unsigned long long)pInfo->qwFarmPowerOnHours, (unsigned long)pInfo->dwPowerOnHours);
+            return;
+        }
+
+        if (pInfo->qwFarmPowerCycleCount > 0 && pInfo->dwPowerCycleCount > 0 &&
+            pInfo->qwFarmPowerCycleCount > (unsigned __int64)pInfo->dwPowerCycleCount + 50 &&
+            pInfo->dwPowerCycleCount <= 5) {
+            pInfo->bCounterfeitSuspected = TRUE;
+            pInfo->nAnomalyType = ANOMALY_SMART_WIPED;
+            safe_snprintf(pInfo->szCounterfeitReason,
+                "Сброшенный SMART: циклов включения по FARM-логу %llu, а в SMART всего %lu (признак сброса б/у диска)",
+                (unsigned long long)pInfo->qwFarmPowerCycleCount, (unsigned long)pInfo->dwPowerCycleCount);
+            safe_snprintf(pInfo->szCounterfeitReasonEn,
+                "Wiped SMART: FARM log records %llu power cycles, but SMART claims only %lu (wiped used drive signature)",
+                (unsigned long long)pInfo->qwFarmPowerCycleCount, (unsigned long)pInfo->dwPowerCycleCount);
+            return;
+        }
+    }
+
+    /* 4. HDD Vendor / Model / Firmware Contradictions */
     if (DriveIsHdd(pInfo) || pInfo->eType == DRIVE_TYPE_HDD || pInfo->wRotationRate >= 0x0401) {
         if (IsWdModel(szModelU)) {
             if (IsSeagateFirmwarePattern(szFwU)) {
                 pInfo->bCounterfeitSuspected = TRUE;
+                pInfo->nAnomalyType = ANOMALY_RELABELED;
                 safe_snprintf(pInfo->szCounterfeitReason,
                     "Несоответствие платформы: модель заявлена как WD (%s), но прошивка (%s) — Seagate",
                     pInfo->szModel, pInfo->szFirmware);
@@ -252,6 +291,7 @@ void DetectCounterfeitMismatch(DRIVE_INFO* pInfo)
             }
             if (IsWdConsumerModel(szModelU) && IsHgstFirmwarePattern(szFwU)) {
                 pInfo->bCounterfeitSuspected = TRUE;
+                pInfo->nAnomalyType = ANOMALY_RELABELED;
                 safe_snprintf(pInfo->szCounterfeitReason,
                     "Ремаркированный накопитель: потребительская модель WD (%s) имеет прошивку серверного HGST (%s)",
                     pInfo->szModel, pInfo->szFirmware);
@@ -262,6 +302,7 @@ void DetectCounterfeitMismatch(DRIVE_INFO* pInfo)
             }
             if (IsWdConsumer5400Model(szModelU) && pInfo->wRotationRate >= 7000) {
                 pInfo->bCounterfeitSuspected = TRUE;
+                pInfo->nAnomalyType = ANOMALY_RELABELED;
                 safe_snprintf(pInfo->szCounterfeitReason,
                     "Физическое несоответствие: модель %s (5400 RPM) имеет мотор %u RPM (признак серверного диска)",
                     pInfo->szModel, (unsigned)pInfo->wRotationRate);
@@ -273,6 +314,7 @@ void DetectCounterfeitMismatch(DRIVE_INFO* pInfo)
         } else if (ModelLooksSeagate(szModelU)) {
             if (IsWdFirmwarePattern(szFwU) || IsHgstFirmwarePattern(szFwU)) {
                 pInfo->bCounterfeitSuspected = TRUE;
+                pInfo->nAnomalyType = ANOMALY_RELABELED;
                 safe_snprintf(pInfo->szCounterfeitReason,
                     "Несоответствие платформы: модель заявлена как Seagate (%s), но прошивка (%s) — WD/HGST",
                     pInfo->szModel, pInfo->szFirmware);
@@ -289,4 +331,22 @@ const char* GetCounterfeitReason(const DRIVE_INFO* pInfo)
 {
     if (!pInfo || !pInfo->bCounterfeitSuspected) return "";
     return UiLangIsEn() ? pInfo->szCounterfeitReasonEn : pInfo->szCounterfeitReason;
+}
+
+const char* GetCounterfeitBadge(const DRIVE_INFO* pInfo)
+{
+    if (!pInfo || !pInfo->bCounterfeitSuspected) return "";
+    switch (pInfo->nAnomalyType) {
+    case ANOMALY_REFLASHED_REPAIRED:
+        return TN("⚠️ [ПЕРЕПРОШИТ / MPTOOL]", "⚠️ [REFLASHED / MPTOOL]");
+    case ANOMALY_SMART_WIPED:
+        return TN("⚠️ [СБРОШЕН SMART]", "⚠️ [WIPED SMART]");
+    case ANOMALY_RELABELED:
+        return TN("⚠️ [РЕМАРК]", "⚠️ [RELABELED]");
+    case ANOMALY_COUNTERFEIT:
+        return TN("⚠️ [ПОДДЕЛКА]", "⚠️ [COUNTERFEIT]");
+    default:
+        break;
+    }
+    return TN("⚠️ [ПОДДЕЛКА / РЕМАРК]", "⚠️ [FAKE / RELABELED]");
 }

@@ -11,7 +11,7 @@
 | Семейство | Western Digital Elements / My Passport (USB, AF) |
 | Бренд | Western Digital |
 | Контроллер | — |
-| Серийный № | WD-WX81A96JSY9A |
+| Серийный № | WD-WX********** |
 | Прошивка | 01.01A01 |
 | Объём / тип | 1.8 TB · HDD |
 | Температура | 23 °C (норма) |

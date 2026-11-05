@@ -6,12 +6,17 @@
  * No physical disk is opened. The serial stays empty, so no mech snap
  * file is written. */
 #include "smart.h"
+#include "smart_internal.h"
+#include "csmi.h"
 #include "mainwnd.h"
 #include "latency_probe.h"
 #include "counterfeit_detect.h"
+#include "ata_log.h"
+#include "dst_engine.h"
 #include "lang.h"
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 
 static int g_fail = 0;
 static int g_check = 0;
@@ -734,7 +739,26 @@ static void TestRowRank(void)
     Run();
     ExpectRank(187, ATTR_EV_SKIP, 0, "ssd 187 skipped");
     ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_GOOD, "ssd 187 media");
+    {
+        char lecture[16384];
+        FormatHealthLectureExpert(&g, lecture, (int)sizeof(lecture));
+        ExpectNotHas(lecture, "Неисправимые (187)", "ssd 187 raw 3 not in matrix");
+        ExpectNotHas(lecture, "признак деградации носителя", "ssd 187 raw 3 not media degradation");
+    }
     CaseEnd("row-ssd187", before);
+
+    before = g_fail;
+    Base(DRIVE_TYPE_SSD_SATA, "ROWTEST", "1.0");
+    Expect(AddAttr(187, 100, 0), "row ssd187 zero slot");
+    Run();
+    ExpectRank(187, ATTR_EV_SKIP, 0, "ssd 187 zero skipped");
+    {
+        char lecture[16384];
+        FormatHealthLectureExpert(&g, lecture, (int)sizeof(lecture));
+        ExpectNotHas(lecture, "Неисправимые (187)", "ssd 187 zero not in matrix");
+        ExpectNotHas(lecture, "Неисправимые ошибки (187): 0", "ssd 187 zero not in main features");
+    }
+    CaseEnd("row-ssd187-0", before);
 
     before = g_fail;
     Base(DRIVE_TYPE_HDD, "ROWTEST", "1.0");
@@ -750,6 +774,12 @@ static void TestRowRank(void)
     ExpectStr(g.szProfileId, "samsung-870-svt", "sam187 profile");
     ExpectRank(0xBB, ATTR_EV_RANK, (int)HEALTH_STATUS_BAD, "samsung 187");
     ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_BAD, "samsung 187 media");
+    {
+        char lecture[16384];
+        FormatHealthLectureExpert(&g, lecture, (int)sizeof(lecture));
+        ExpectHas(lecture, "Неисправимые (187)", "samsung 187 in matrix");
+        ExpectHas(lecture, "Неисправимые ошибки (187): 1", "samsung 187 in main features");
+    }
     CaseEnd("row-sam187", before);
 
     before = g_fail;
@@ -1440,6 +1470,8 @@ static void TestNt256(void)
     ExpectHas(lecture, "не полностью", "nt256 partial model");
     ExpectNotHas(lecture, "определена уверенно", "nt256 not confident");
     ExpectNotHas(lecture, "Неисправимые ошибки (187): 0", "nt256 187 not a plus");
+    ExpectNotHas(lecture, "Неисправимые (187)", "nt256 187 not in matrix");
+    ExpectHas(lecture, "    4 сильных положительных признаков", "nt256 plus count excludes 187");
     CaseEnd("nt256", before);
 }
 
@@ -1896,60 +1928,122 @@ static void TestToshibaReadonly(void)
     ExpectInt((int)g.eDiskStatus, (int)HEALTH_STATUS_CRITICAL, "toshiba disk status critical");
 
     LectureExpert(lecture, (int)sizeof(lecture));
+    ExpectHas(lecture, "Диск сам", "toshiba expert says the drive itself");
     ExpectHas(lecture, "только для чтения", "toshiba lecture read-only mention");
     ExpectHas(lecture, "Protect Mode", "toshiba matrix protect mode");
     ExpectHas(lecture, "75%", "toshiba lecture 75% life");
+    ExpectNotHas(lecture, "Запись запретил переходник", "toshiba expert does not blame the adapter");
 
     char plainLecture[4096];
     FormatHealthLecturePlain(&g, plainLecture, (int)sizeof(plainLecture));
     ExpectHas(plainLecture, "Причина:", "toshiba plain lecture has reason section");
+    ExpectHas(plainLecture, "Диск сам", "toshiba plain says the drive itself");
     ExpectHas(plainLecture, "защита от записи", "toshiba plain lecture states write protection reason");
+    ExpectHas(plainLecture, "к замене", "toshiba plain says replace the drive");
+    ExpectNotHas(plainLecture, "Запись запретил переходник", "toshiba plain does not blame the adapter");
 
     CaseEnd("toshiba-readonly", before);
 }
 
-/* Universal write protection check:
- * When bWriteProtected is set (e.g. from IOCTL_DISK_IS_WRITABLE failing with ERROR_WRITE_PROTECT),
- * the health engine must mark HDD, SATA SSD, and NVMe as CRITICAL. */
+/* IOCTL write-protect is Windows or the adapter. It is not the disk's own lock
+ * unless SMART protect mode or the NVMe read-only bit is set. */
 static void TestUniversalWriteProtect(void)
 {
     int before = g_fail;
     char lecture[16384];
+    char plain[8192];
+    char prompt[512];
 
-    /* 1. HDD with write protection */
+    /* 1. HDD, Windows policy, no USB adapter, clean media. */
     Base(DRIVE_TYPE_HDD, "ST1000DM010", "CC43");
     Expect(AddAttr(5, 100, 0), "hdd realloc clean");
     Expect(AddAttr(197, 100, 0), "hdd pending clean");
     Expect(AddAttr(198, 100, 0), "hdd uncorr clean");
     g.bWriteProtected = TRUE;
     Run();
-    ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_CRITICAL, "hdd write protected reliability");
-    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_CRITICAL, "hdd write protected headline");
-    ExpectInt((int)g.eDiskStatus, (int)HEALTH_STATUS_CRITICAL, "hdd write protected disk status");
-    LectureExpert(lecture, (int)sizeof(lecture));
-    ExpectHas(lecture, "только для чтения", "hdd lecture read-only");
+    ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_GOOD, "hdd windows wp reliability");
+    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_CAUTION, "hdd windows wp headline");
+    ExpectInt((int)g.eDiskStatus, (int)HEALTH_STATUS_UNKNOWN, "hdd windows wp disk status");
+    ExpectInt((int)g.eInterface, (int)HEALTH_STATUS_CAUTION, "hdd windows wp interface");
+    FormatHealthLecturePlain(&g, plain, (int)sizeof(plain));
+    ExpectHas(plain, "Запись запретила Windows", "hdd plain blames windows");
+    ExpectNotHas(plain, "к замене", "hdd plain does not say replace");
+    ExpectNotHas(plain, "кабель", "hdd plain does not blame the cable");
+    FormatHddCautionPrompt(&g, prompt, (int)sizeof(prompt));
+    ExpectHas(prompt, "Запись запретила Windows", "hdd prompt blames windows");
 
-    /* 2. SATA SSD with write protection */
+    /* 2. HDD behind a USB adapter. */
+    Base(DRIVE_TYPE_HDD, "ST1000DM010", "CC43");
+    Expect(AddAttr(5, 100, 0), "hdd usb realloc clean");
+    Expect(AddAttr(197, 100, 0), "hdd usb pending clean");
+    Expect(AddAttr(198, 100, 0), "hdd usb uncorr clean");
+    g.bIsUSB = TRUE;
+    g.bWriteProtected = TRUE;
+    Run();
+    ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_GOOD, "hdd adapter reliability");
+    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_CAUTION, "hdd adapter headline");
+    ExpectInt((int)g.eDiskStatus, (int)HEALTH_STATUS_UNKNOWN, "hdd adapter disk status");
+    FormatHealthLecturePlain(&g, plain, (int)sizeof(plain));
+    ExpectHas(plain, "Запись запретил переходник", "hdd plain blames adapter");
+    ExpectNotHas(plain, "Диск сам", "hdd plain does not say the drive locked itself");
+    ExpectNotHas(plain, "к замене", "hdd adapter plain does not say replace");
+    LectureExpert(lecture, (int)sizeof(lecture));
+    ExpectHas(lecture, "Запись запретил переходник", "hdd expert blames adapter");
+    ExpectHas(lecture, "запись запрещена", "hdd expert matrix names the block");
+    ExpectHas(lecture, "0 критических отказов", "hdd adapter is not a critical failure");
+    ExpectNotHas(lecture, "к замене", "hdd expert does not say replace");
+    FormatHddCautionPrompt(&g, prompt, (int)sizeof(prompt));
+    ExpectHas(prompt, "Запись запретил переходник", "hdd prompt blames adapter");
+
+    /* 3. SATA SSD, Windows policy. */
     Base(DRIVE_TYPE_SSD_SATA, "Crucial CT500MX500SSD1", "M3CR046");
     Expect(AddAttr(5, 100, 0), "ssd realloc clean");
     Expect(AddAttr(197, 100, 0), "ssd pending clean");
     Expect(AddAttr(198, 100, 0), "ssd uncorr clean");
     g.bWriteProtected = TRUE;
     Run();
-    ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_CRITICAL, "sata ssd write protected reliability");
-    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_CRITICAL, "sata ssd write protected headline");
-    ExpectInt((int)g.eDiskStatus, (int)HEALTH_STATUS_CRITICAL, "sata ssd write protected disk status");
+    ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_GOOD, "sata windows wp reliability");
+    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_CAUTION, "sata windows wp headline");
+    ExpectInt((int)g.eDiskStatus, (int)HEALTH_STATUS_UNKNOWN, "sata windows wp disk status");
+    FormatHealthLecturePlain(&g, plain, (int)sizeof(plain));
+    ExpectHas(plain, "Запись запретила Windows", "sata plain blames windows");
+    ExpectNotHas(plain, "к замене", "sata plain does not say replace");
+    FormatSsdCautionPrompt(&g, prompt, (int)sizeof(prompt));
+    ExpectHas(prompt, "Запись запретила Windows", "sata prompt blames windows");
 
-    /* 3. NVMe with write protection */
+    /* 4. NVMe through an adapter, no read-only warning bit. */
     Base(DRIVE_TYPE_NVME, "Samsung SSD 980 500GB", "1B4QFXO7");
     g.bIsNVMe = TRUE;
+    g.bIsUSB = TRUE;
     g.nvmeHealth.AvailableSpare = 100;
     g.nvmeHealth.AvailableSpareThreshold = 10;
     g.bWriteProtected = TRUE;
     Run();
-    ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_CRITICAL, "nvme write protected reliability");
-    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_CRITICAL, "nvme write protected headline");
-    ExpectInt((int)g.eDiskStatus, (int)HEALTH_STATUS_CRITICAL, "nvme write protected disk status");
+    ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_GOOD, "nvme adapter reliability");
+    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_CAUTION, "nvme adapter headline");
+    ExpectInt((int)g.eDiskStatus, (int)HEALTH_STATUS_GOOD, "nvme adapter disk status");
+    FormatHealthLecturePlain(&g, plain, (int)sizeof(plain));
+    ExpectHas(plain, "Запись запретил переходник", "nvme plain blames adapter");
+    ExpectNotHas(plain, "к замене", "nvme adapter plain does not say replace");
+    FormatSsdCautionPrompt(&g, prompt, (int)sizeof(prompt));
+    ExpectHas(prompt, "Запись запретил переходник", "nvme prompt blames adapter");
+
+    /* 5. NVMe really read-only, even if it is also behind an adapter. */
+    Base(DRIVE_TYPE_NVME, "Samsung SSD 980 500GB", "1B4QFXO7");
+    g.bIsNVMe = TRUE;
+    g.bIsUSB = TRUE;
+    g.nvmeHealth.AvailableSpare = 100;
+    g.nvmeHealth.AvailableSpareThreshold = 10;
+    g.nvmeHealth.CriticalWarning = NVME_CRIT_WARN_READ_ONLY;
+    g.bWriteProtected = TRUE;
+    Run();
+    ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_CRITICAL, "nvme own ro reliability");
+    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_CRITICAL, "nvme own ro headline");
+    ExpectInt((int)g.eDiskStatus, (int)HEALTH_STATUS_CRITICAL, "nvme own ro disk status");
+    FormatHealthLecturePlain(&g, plain, (int)sizeof(plain));
+    ExpectHas(plain, "Диск сам", "nvme plain says the drive itself");
+    ExpectHas(plain, "к замене", "nvme own ro says replace");
+    ExpectNotHas(plain, "Запись запретил переходник", "nvme own ro does not blame the adapter");
 
     CaseEnd("universal-write-protect", before);
 }
@@ -2517,7 +2611,11 @@ static void TestStorageEventLog(void)
     /* Test health assessment reaction */
     drives[0].eventStats.bQueried = TRUE;
     AssessDriveHealth(&drives[0]);
-    ExpectInt((int)drives[0].eInterface, (int)HEALTH_STATUS_CAUTION, "Event 129 elevates eInterface to CAUTION");
+    ExpectInt((int)drives[0].eInterface, (int)HEALTH_STATUS_OBSERVE, "Isolated Event 129 elevates eInterface to OBSERVE");
+
+    drives[0].eventStats.nEvent129Count = 5;
+    AssessDriveHealth(&drives[0]);
+    ExpectInt((int)drives[0].eInterface, (int)HEALTH_STATUS_CAUTION, "Event 129 >= 5 elevates eInterface to CAUTION");
 
     drives[1].eventStats.bQueried = TRUE;
     AssessDriveHealth(&drives[1]);
@@ -2835,6 +2933,9 @@ static void TestCounterfeitDetection(void)
         AssessDriveHealth(&g);
         Expect(g.bCounterfeitSuspected, "WD Purple with Seagate FW detected as counterfeit");
         ExpectHas(g.szCounterfeitReason, "Seagate", "Reason mentions Seagate");
+        ExpectInt(g.nAnomalyType, (int)ANOMALY_RELABELED, "WD Purple classified as ANOMALY_RELABELED");
+        UiSetLang(UI_LANG_RU);
+        ExpectHas(GetCounterfeitBadge(&g), "РЕМАРК", "Badge reflects relabeled");
         ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_CAUTION, "Counterfeit drive health elevated to CAUTION");
     }
 
@@ -2869,6 +2970,9 @@ static void TestCounterfeitDetection(void)
         AssessDriveHealth(&g);
         Expect(g.bCounterfeitSuspected, "Samsung NVMe with Realtek VID detected as counterfeit");
         ExpectHas(g.szCounterfeitReason, "0x10EC", "Reason mentions VID 0x10EC");
+        ExpectInt(g.nAnomalyType, (int)ANOMALY_COUNTERFEIT, "Samsung NVMe classified as ANOMALY_COUNTERFEIT");
+        UiSetLang(UI_LANG_RU);
+        ExpectHas(GetCounterfeitBadge(&g), "ПОДДЕЛКА", "Badge reflects counterfeit");
     }
 
     /* 5. Counterfeit Samsung 980 NVMe SSD reporting SMI PCI VID (0x126F) */
@@ -2983,6 +3087,11 @@ static void TestCounterfeitDetection(void)
         AssessDriveHealth(&g);
         Expect(g.bCounterfeitSuspected, "Kingston A400 with MPTool serial AA0000... detected as counterfeit");
         ExpectHas(g.szCounterfeitReason, "MPTool", "Reason mentions MPTool");
+        ExpectInt(g.nAnomalyType, (int)ANOMALY_REFLASHED_REPAIRED, "Kingston A400 classified as ANOMALY_REFLASHED_REPAIRED");
+        UiSetLang(UI_LANG_RU);
+        ExpectHas(GetCounterfeitBadge(&g), "ПЕРЕПРОШИТ / MPTOOL", "Badge reflects reflashed/MPTool");
+        UiSetLang(UI_LANG_EN);
+        ExpectHas(GetCounterfeitBadge(&g), "REFLASHED / MPTOOL", "English badge reflects reflashed/MPTool");
     }
 
     /* 14b. Refurbished drive with all-zeros wiped serial */
@@ -3002,6 +3111,54 @@ static void TestCounterfeitDetection(void)
         FormatHealthLecturePlain(&g, szHddLecture, (int)sizeof(szHddLecture));
         ExpectHas(szHddLecture, "Обнаружены признаки поддельного", "Russian plain lecture has counterfeit warning");
         Expect(strstr(szHddLecture, "деградации носителя") == NULL, "Clean counterfeit plain lecture does NOT claim media degradation");
+
+        char szPrompt[256];
+        FormatHddCautionPrompt(&g, szPrompt, (int)sizeof(szPrompt));
+        ExpectHas(szPrompt, "Подозрение на поддельный/перемаркированный", "Clean counterfeit HDD caution prompt names counterfeit on main screen");
+
+        /* When interface has errors, it must NOT be eclipsed by counterfeit */
+        g.nCrcErrors = 15;
+        g.eInterface = HEALTH_STATUS_CAUTION;
+        g.eHealthStatus = HEALTH_STATUS_CAUTION;
+        FormatHddCautionPrompt(&g, szPrompt, (int)sizeof(szPrompt));
+        ExpectHas(szPrompt, "Подозрение на подделку; проблемы интерфейса", "HDD prompt names both counterfeit and interface");
+
+        szHddLecture[0] = '\0';
+        FormatHealthLecturePlain(&g, szHddLecture, (int)sizeof(szHddLecture));
+        ExpectHas(szHddLecture, "Ошибки CRC: 15", "Interface CRC is not eclipsed by counterfeit");
+        ExpectHas(szHddLecture, "кабель", "Cable recommendation is present in interface explanation");
+        ExpectHas(szHddLecture, "Также обнаружены признаки подделки", "Mentions counterfeit note under Reason");
+    }
+
+    /* 14c. SSD with counterfeit and interface issues (no eclipse, deduplication) */
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "KINGSTON SA400S37120G", "SBFK71F1");
+        lstrcpynA(g.szSerial, "AA000000000000001287", (int)sizeof(g.szSerial));
+        g.wRotationRate = 0x0001;
+        Expect(AddAttr(0xC7, 100, 42), "add CRC attribute to Kingston A400");
+        IdentifyDriveParts(&g);
+        AssessDriveHealth(&g);
+        Expect(g.bCounterfeitSuspected, "Kingston A400 detected as counterfeit");
+
+        char szPrompt[256];
+        UiSetLang(UI_LANG_RU);
+        FormatSsdCautionPrompt(&g, szPrompt, (int)sizeof(szPrompt));
+        ExpectHas(szPrompt, "Подозрение на подделку; проблемы интерфейса", "SSD prompt names both counterfeit and interface");
+
+        char szSsdLecture[2048];
+        szSsdLecture[0] = '\0';
+        FormatHealthLecturePlain(&g, szSsdLecture, (int)sizeof(szSsdLecture));
+        ExpectHas(szSsdLecture, "Ошибки CRC: 42", "SSD CRC is not eclipsed by counterfeit");
+        ExpectHas(szSsdLecture, "кабель", "SSD cable recommendation present");
+        ExpectHas(szSsdLecture, "Также обнаружены признаки подделки", "SSD mentions counterfeit note under Reason");
+
+        /* Ensure full counterfeit warning block is not duplicated twice */
+        const char* p1 = strstr(szSsdLecture, "ВНИМАНИЕ: ОБНАРУЖЕНЫ ПРИЗНАКИ");
+        Expect(p1 != NULL, "Full counterfeit warning box is present");
+        if (p1) {
+            const char* p2 = strstr(p1 + 10, "ВНИМАНИЕ: ОБНАРУЖЕНЫ ПРИЗНАКИ");
+            Expect(p2 == NULL, "Full counterfeit warning box is not duplicated");
+        }
     }
 
     /* 15. Bilingual support: reason and lecture formatting */
@@ -3034,6 +3191,1275 @@ static void TestCounterfeitDetection(void)
 
     CaseEnd("counterfeit-detection", before);
 }
+
+static int IsValidUtf8(const char* s)
+{
+    if (!s) return 0;
+    const unsigned char* p = (const unsigned char*)s;
+    while (*p) {
+        if (*p < 0x80) {
+            p++;
+        } else if ((*p & 0xE0) == 0xC0) {
+            if ((p[1] & 0xC0) != 0x80) return 0;
+            p += 2;
+        } else if ((*p & 0xF0) == 0xE0) {
+            if ((p[1] & 0xC0) != 0x80 || (p[2] & 0xC0) != 0x80) return 0;
+            p += 3;
+        } else if ((*p & 0xF8) == 0xF0) {
+            if ((p[1] & 0xC0) != 0x80 || (p[2] & 0xC0) != 0x80 || (p[3] & 0xC0) != 0x80) return 0;
+            p += 4;
+        } else {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void TestLectureUtf8Truncation(void)
+{
+    int before = g_fail;
+    Base(DRIVE_TYPE_HDD, "WDC WD40PURX-64GVNY0", "GX4K");
+    g.wRotationRate = 5400;
+    IdentifyDriveParts(&g);
+    AssessDriveHealth(&g);
+
+    UiSetLang(UI_LANG_RU);
+    for (int bufSize = 20; bufSize <= 300; bufSize += 3) {
+        char buf[512];
+        buf[0] = '\0';
+        FormatHealthLecturePlain(&g, buf, bufSize);
+        Expect(IsValidUtf8(buf), "FormatHealthLecturePlain produces valid UTF-8 even when truncated");
+    }
+    CaseEnd("utf8-truncation-safety", before);
+}
+
+
+static void TestSeagateFarmLogParsing(void)
+{
+    int before = g_fail;
+    BYTE sec[512];
+    DRIVE_INFO di;
+    memset(&di, 0, sizeof(di));
+
+    /* 1. Sector 0: FARM Header */
+    memset(sec, 0, sizeof(sec));
+    Expect(!ParseSeagateFarmHeader(NULL, &di), "ParseSeagateFarmHeader rejects NULL buffer");
+    Expect(!ParseSeagateFarmHeader(sec, NULL), "ParseSeagateFarmHeader rejects NULL DRIVE_INFO");
+    Expect(!ParseSeagateFarmHeader(sec, &di), "ParseSeagateFarmHeader rejects all-zero buffer");
+
+    /* Corrupted / invalid signature */
+    memcpy(sec, "NOTFRM", 6);
+    Expect(!ParseSeagateFarmHeader(sec, &di), "ParseSeagateFarmHeader rejects invalid signature");
+
+    /* Valid FARMER signature */
+    memcpy(sec, SEAGATE_FARM_SIGNATURE, 6);
+    uint64_t major = 1;
+    uint64_t minor = 4;
+    memcpy(sec + 8, &major, sizeof(major));
+    memcpy(sec + 16, &minor, sizeof(minor));
+    Expect(ParseSeagateFarmHeader(sec, &di), "ParseSeagateFarmHeader succeeds with valid signature");
+    Expect(di.bFarmLogSupported, "di.bFarmLogSupported is TRUE");
+    ExpectInt((int)di.dwFarmMajorVersion, 1, "FARM major version parsed correctly");
+    ExpectInt((int)di.dwFarmMinorVersion, 4, "FARM minor version parsed correctly");
+
+    /* 2. Sector 32: Page 1 Drive Info */
+    memset(sec, 0, sizeof(sec));
+    /* Invalid pageNumber */
+    uint64_t badPage = 99;
+    memcpy(sec, &badPage, sizeof(badPage));
+    Expect(!ParseSeagateFarmDriveInfo(sec, &di), "ParseSeagateFarmDriveInfo rejects bad pageNumber");
+
+    /* Valid pageNumber 1 */
+    uint64_t p1 = 1;
+    memcpy(sec, &p1, sizeof(p1));
+    uint64_t poh = 38450;
+    uint64_t spindle = 38200;
+    uint64_t headFlight = 37950;
+    uint64_t cycles = 215;
+    memcpy(sec + 152, &poh, sizeof(poh));
+    memcpy(sec + 160, &spindle, sizeof(spindle));
+    memcpy(sec + 168, &headFlight, sizeof(headFlight));
+    memcpy(sec + 184, &cycles, sizeof(cycles));
+    memcpy(sec + 360, "2048", 4); /* Week 48, 2020 */
+
+    Expect(ParseSeagateFarmDriveInfo(sec, &di), "ParseSeagateFarmDriveInfo succeeds with page 1");
+    Expect(di.qwFarmPowerOnHours == 38450ULL, "qwFarmPowerOnHours parsed correctly");
+    Expect(di.qwFarmSpindlePowerOnHours == 38200ULL, "qwFarmSpindlePowerOnHours parsed correctly");
+    Expect(di.qwFarmHeadFlightHours == 37950ULL, "qwFarmHeadFlightHours parsed correctly");
+    Expect(di.qwFarmPowerCycleCount == 215ULL, "qwFarmPowerCycleCount parsed correctly");
+    ExpectStr(di.szFarmAssemblyDate, "2048", "szFarmAssemblyDate parsed correctly");
+
+    /* 3. Sector 64: Page 2 Workload */
+    memset(sec, 0, sizeof(sec));
+    uint64_t p2 = 2;
+    memcpy(sec, &p2, sizeof(p2));
+    uint64_t wr = 5000000000ULL;
+    uint64_t rd = 3000000000ULL;
+    memcpy(sec + 64, &wr, sizeof(wr));
+    memcpy(sec + 72, &rd, sizeof(rd));
+
+    Expect(ParseSeagateFarmWorkload(sec, &di), "ParseSeagateFarmWorkload succeeds with page 2");
+    Expect(di.qwFarmSectorsWritten == 5000000000ULL, "qwFarmSectorsWritten parsed correctly");
+    Expect(di.qwFarmSectorsRead == 3000000000ULL, "qwFarmSectorsRead parsed correctly");
+
+    /* 4. Sector 96: Page 3 Error Statistics */
+    memset(sec, 0, sizeof(sec));
+    uint64_t p3 = 3;
+    memcpy(sec, &p3, sizeof(p3));
+    uint64_t realloc = 14;
+    memcpy(sec + 32, &realloc, sizeof(realloc));
+
+    Expect(ParseSeagateFarmErrorStats(sec, &di), "ParseSeagateFarmErrorStats succeeds with page 3");
+    Expect(di.qwFarmReallocatedSectors == 14ULL, "qwFarmReallocatedSectors parsed correctly");
+
+    /* 5. Sector 128: Page 4 Environment */
+    memset(sec, 0, sizeof(sec));
+    uint64_t p4 = 4;
+    memcpy(sec, &p4, sizeof(p4));
+    uint64_t maxT = 53;
+    uint64_t minT = 17;
+    memcpy(sec + 24, &maxT, sizeof(maxT));
+    memcpy(sec + 32, &minT, sizeof(minT));
+
+    Expect(ParseSeagateFarmEnvironment(sec, &di), "ParseSeagateFarmEnvironment succeeds with page 4");
+    ExpectInt(di.nFarmLifetimeMaxTempC, 53, "nFarmLifetimeMaxTempC parsed correctly");
+    ExpectInt(di.nFarmLifetimeMinTempC, 17, "nFarmLifetimeMinTempC parsed correctly");
+
+    CaseEnd("seagate-farm-log-parsing", before);
+}
+
+static void TestSeagateFarmCounterfeitDetection(void)
+{
+    int before = g_fail;
+
+    /* Case A: Refurbished / Tampered Seagate Exos (wiped SMART) */
+    Base(DRIVE_TYPE_HDD, "ST16000NM001G", "SN02");
+    lstrcpynA(g.szSerial, "ZR10ABCD", (int)sizeof(g.szSerial));
+    g.wRotationRate = 7200;
+    g.dwPowerOnHours = 8;        /* Fake wiped SMART: claims 8 hours */
+    g.dwPowerCycleCount = 2;     /* Fake power cycles */
+
+    /* Real FARM telemetry from controller System Area */
+    g.bFarmLogSupported = TRUE;
+    g.qwFarmPowerOnHours = 41200;       /* Real runtime: ~4.7 years in datacenter! */
+    g.qwFarmSpindlePowerOnHours = 41000;
+    g.qwFarmHeadFlightHours = 40850;
+    g.qwFarmPowerCycleCount = 380;
+    g.qwFarmSectorsWritten = 8000000000ULL;
+    g.qwFarmSectorsRead = 12000000000ULL;
+    g.nFarmLifetimeMaxTempC = 54;
+    g.nFarmLifetimeMinTempC = 19;
+    memcpy(g.szFarmAssemblyDate, "1932", 5);
+
+    DetectCounterfeitMismatch(&g);
+    Expect(g.bCounterfeitSuspected, "Wiped Seagate drive flagged as counterfeit/refurbished");
+    ExpectHas(g.szCounterfeitReason, "Сброшенный SMART", "Counterfeit reason names wiped SMART");
+    ExpectInt(g.nAnomalyType, (int)ANOMALY_SMART_WIPED, "Seagate FARM classified as ANOMALY_SMART_WIPED");
+    UiSetLang(UI_LANG_RU);
+    ExpectHas(GetCounterfeitBadge(&g), "СБРОШЕН SMART", "Badge reflects wiped SMART");
+    ExpectHas(g.szCounterfeitReason, "41200", "Reason contains actual FARM runtime hours");
+
+    AssessDriveHealth(&g);
+    Expect(g.eHealthStatus == HEALTH_STATUS_CAUTION, "Health status reduced to CAUTION due to wiped SMART");
+
+    char szLecture[2048];
+    szLecture[0] = 0;
+    UiSetLang(UI_LANG_RU);
+    FormatHealthLecturePlain(&g, szLecture, (int)sizeof(szLecture));
+    ExpectHas(szLecture, "ВНИМАНИЕ: ОБНАРУЖЕНЫ ПРИЗНАКИ", "Plain lecture displays counterfeit warning banner");
+    ExpectHas(szLecture, "Сброшенный SMART", "Plain lecture explains wiped SMART reason");
+
+    szLecture[0] = 0;
+    FormatHealthLectureExpert(&g, szLecture, (int)sizeof(szLecture));
+    ExpectHas(szLecture, "Аппаратная телеметрия Seagate FARM (Log A6h)", "Expert lecture has Seagate FARM section");
+    ExpectHas(szLecture, "Реальная наработка: 41200 ч", "Expert lecture displays true FARM runtime");
+    ExpectHas(szLecture, "Заводская дата сборки: неделя 32, 2019 г.", "Expert lecture displays factory assembly date");
+
+    /* Case B: Genuine Seagate drive with consistent runtime */
+    Base(DRIVE_TYPE_HDD, "ST4000VN008-2FR166", "SC60");
+    g.wRotationRate = 5900;
+    g.dwPowerOnHours = 15200;
+    g.dwPowerCycleCount = 45;
+    g.bFarmLogSupported = TRUE;
+    g.qwFarmPowerOnHours = 15204; /* Normal drift within 4 hours */
+    g.qwFarmPowerCycleCount = 45;
+
+    DetectCounterfeitMismatch(&g);
+    Expect(!g.bCounterfeitSuspected, "Genuine Seagate drive is NOT flagged as counterfeit");
+
+    /* Case C: Brand new Seagate drive */
+    Base(DRIVE_TYPE_HDD, "ST2000DM008-2FR102", "0001");
+    g.wRotationRate = 7200;
+    g.dwPowerOnHours = 0;
+    g.dwPowerCycleCount = 1;
+    g.bFarmLogSupported = TRUE;
+    g.qwFarmPowerOnHours = 1;
+    g.qwFarmPowerCycleCount = 1;
+
+    DetectCounterfeitMismatch(&g);
+    Expect(!g.bCounterfeitSuspected, "New Seagate drive is NOT flagged as counterfeit");
+
+    CaseEnd("seagate-farm-counterfeit-detection", before);
+}
+
+static void TestSataPhyLogParsing(void)
+{
+    int before = g_fail;
+    BYTE logBuf[512];
+    DRIVE_INFO di;
+    memset(logBuf, 0, sizeof(logBuf));
+    memset(&di, 0, sizeof(di));
+
+    /* 1. NULL safety and empty buffer */
+    Expect(!ParseSataPhyLog(NULL, &di), "ParseSataPhyLog returns FALSE on NULL buffer");
+    Expect(!ParseSataPhyLog(logBuf, NULL), "ParseSataPhyLog returns FALSE on NULL DRIVE_INFO");
+    Expect(!ParseSataPhyLog(logBuf, &di), "ParseSataPhyLog returns FALSE on all-zero buffer");
+
+    /* 2. Populate synthetic SATA PHY log (Log 11h) */
+    logBuf[0] = 0x01; /* Revision 1 */
+    size_t off = 4;
+
+    /* Entry 1: Event 0x0001 (Command ICRC error), length = 2 bytes (counterBits = 1) */
+    WORD id1 = (WORD)(0x0001 | (1 << 12));
+    logBuf[off] = (BYTE)(id1 & 0xFF);
+    logBuf[off + 1] = (BYTE)((id1 >> 8) & 0xFF);
+    logBuf[off + 2] = 7;
+    logBuf[off + 3] = 0;
+    off += 4;
+
+    /* Entry 2: Event 0x0002 (R_ERR data FIS), length = 4 bytes (counterBits = 2) */
+    WORD id2 = (WORD)(0x0002 | (2 << 12));
+    logBuf[off] = (BYTE)(id2 & 0xFF);
+    logBuf[off + 1] = (BYTE)((id2 >> 8) & 0xFF);
+    logBuf[off + 2] = 3;
+    logBuf[off + 3] = 0;
+    logBuf[off + 4] = 0;
+    logBuf[off + 5] = 0;
+    off += 6;
+
+    /* Entry 3: Event 0x0009 (Transitions PHYRDY), length = 4 bytes */
+    WORD id9 = (WORD)(0x0009 | (2 << 12));
+    logBuf[off] = (BYTE)(id9 & 0xFF);
+    logBuf[off + 1] = (BYTE)((id9 >> 8) & 0xFF);
+    logBuf[off + 2] = 12;
+    logBuf[off + 3] = 0;
+    logBuf[off + 4] = 0;
+    logBuf[off + 5] = 0;
+    off += 6;
+
+    /* Entry 4: Event 0x000A (COMRESET count), length = 2 bytes */
+    WORD idA = (WORD)(0x000A | (1 << 12));
+    logBuf[off] = (BYTE)(idA & 0xFF);
+    logBuf[off + 1] = (BYTE)((idA >> 8) & 0xFF);
+    logBuf[off + 2] = 4;
+    logBuf[off + 3] = 0;
+    off += 4;
+
+    /* Entry 5: Event 0x000B (Host-to-Device CRC), length = 4 bytes */
+    WORD idB = (WORD)(0x000B | (2 << 12));
+    logBuf[off] = (BYTE)(idB & 0xFF);
+    logBuf[off + 1] = (BYTE)((idB >> 8) & 0xFF);
+    logBuf[off + 2] = 25;
+    logBuf[off + 3] = 0;
+    logBuf[off + 4] = 0;
+    logBuf[off + 5] = 0;
+    off += 6;
+
+    /* Entry 6: End marker rawID = 0 */
+    logBuf[off] = 0;
+    logBuf[off + 1] = 0;
+
+    Expect(ParseSataPhyLog(logBuf, &di), "ParseSataPhyLog parses valid synthetic buffer");
+    Expect(di.bSataPhyLogSupported, "bSataPhyLogSupported is set to TRUE");
+    ExpectInt((int)di.nPhyCommandIcrcErrors, 7, "nPhyCommandIcrcErrors parsed correctly");
+    ExpectInt((int)di.nPhyR_ErrDataFis, 3, "nPhyR_ErrDataFis parsed correctly");
+    ExpectInt((int)di.nPhyTransitionsPhyRdy, 12, "nPhyTransitionsPhyRdy parsed correctly");
+    ExpectInt((int)di.nPhyComresetCount, 4, "nPhyComresetCount parsed correctly");
+    ExpectInt((int)di.nPhyCrcErrorsH2D, 25, "nPhyCrcErrorsH2D parsed correctly");
+
+    /* Truncated buffer / boundary check */
+    memset(logBuf, 0, sizeof(logBuf));
+    logBuf[0] = 0x01;
+    WORD idEdge = (WORD)(0x0001 | (3 << 12)); /* length 8 at 508 */
+    logBuf[508] = (BYTE)(idEdge & 0xFF);
+    logBuf[508 + 1] = (BYTE)((idEdge >> 8) & 0xFF);
+    memset(&di, 0, sizeof(di));
+    ParseSataPhyLog(logBuf, &di);
+
+    CaseEnd("sata-phy-log-parsing", before);
+}
+
+static void TestDeviceStatisticsParsing(void)
+{
+    int before = g_fail;
+    BYTE pageBuf[512];
+    DRIVE_INFO di;
+    memset(&di, 0, sizeof(di));
+
+    /* NULL checks */
+    Expect(!ParseDeviceStatisticsPage(1, NULL, &di), "ParseDeviceStatisticsPage returns FALSE on NULL buffer");
+    Expect(!ParseDeviceStatisticsPage(1, pageBuf, NULL), "ParseDeviceStatisticsPage returns FALSE on NULL DRIVE_INFO");
+
+    /* 1. Page 01h (General Statistics) */
+    memset(pageBuf, 0, sizeof(pageBuf));
+    pageBuf[0] = 0x01; /* Revision */
+    pageBuf[2] = 0x01; /* Page 01h */
+    /* Descriptor at offset 0x18: Logical Sectors Written */
+    DWORD valWritten = 100000000;
+    memcpy(&pageBuf[0x18], &valWritten, sizeof(valWritten));
+    pageBuf[0x18 + 7] = 0xC0; /* Supported (bit 63) + Valid (bit 62) */
+
+    /* Descriptor at offset 0x28: Logical Sectors Read */
+    DWORD valRead = 50000000;
+    memcpy(&pageBuf[0x28], &valRead, sizeof(valRead));
+    pageBuf[0x28 + 7] = 0xC0;
+
+    Expect(ParseDeviceStatisticsPage(1, pageBuf, &di), "Parse Page 01h succeeds");
+    Expect(di.bDevStatSupported, "bDevStatSupported is TRUE");
+    Expect(di.qwDevStatSectorsWritten == 100000000ULL, "qwDevStatSectorsWritten parsed correctly");
+    Expect(di.qwDevStatSectorsRead == 50000000ULL, "qwDevStatSectorsRead parsed correctly");
+
+    /* 2. Page 05h (Temperature Statistics) */
+    memset(pageBuf, 0, sizeof(pageBuf));
+    pageBuf[0] = 0x01; /* Revision */
+    pageBuf[2] = 0x05; /* Page 05h */
+    /* Entry at offset 0x20: Highest Lifetime Temp = 52 C */
+    pageBuf[0x20] = 52;
+    pageBuf[0x20 + 7] = 0xC0;
+    /* Entry at offset 0x28: Lowest Lifetime Temp = 19 C */
+    pageBuf[0x28] = 19;
+    pageBuf[0x28 + 7] = 0xC0;
+
+    Expect(ParseDeviceStatisticsPage(5, pageBuf, &di), "Parse Page 05h succeeds");
+    ExpectInt(di.nDevStatLifetimeMaxTempC, 52, "nDevStatLifetimeMaxTempC parsed correctly");
+    ExpectInt(di.nDevStatLifetimeMinTempC, 19, "nDevStatLifetimeMinTempC parsed correctly");
+
+    /* 3. Page 07h (SSD Statistics) */
+    memset(pageBuf, 0, sizeof(pageBuf));
+    pageBuf[0] = 0x01; /* Revision */
+    pageBuf[2] = 0x07; /* Page 07h */
+    /* Entry at offset 0x08: Percentage Used Endurance = 8% */
+    pageBuf[0x08] = 8;
+    pageBuf[0x08 + 7] = 0xC0;
+
+    Expect(ParseDeviceStatisticsPage(7, pageBuf, &di), "Parse Page 07h succeeds");
+    ExpectInt(di.nDevStatPercentUsed, 8, "nDevStatPercentUsed parsed correctly");
+
+    CaseEnd("device-statistics-parsing", before);
+}
+
+static void TestAtaLogsIntegration(void)
+{
+    int before = g_fail;
+    /* Test HDD with SATA PHY errors triggering detailed interface explanation */
+    Base(DRIVE_TYPE_HDD, "ST1000DM010-2EP102", "CC43");
+    g.wRotationRate = 7200;
+    g.bSataPhyLogSupported = TRUE;
+    g.nPhyTransitionsPhyRdy = 5;
+    g.nPhyCrcErrorsH2D = 14;
+    g.nPhyCommandIcrcErrors = 2;
+    g.nPhyComresetCount = 3;
+
+    AssessDriveHealth(&g);
+    Expect(g.eInterface == HEALTH_STATUS_CAUTION, "SATA PHY errors trigger interface CAUTION");
+
+    char szLecture[2048];
+    szLecture[0] = 0;
+    UiSetLang(UI_LANG_RU);
+    FormatHealthLecturePlain(&g, szLecture, (int)sizeof(szLecture));
+    ExpectHas(szLecture, "Аппаратный лог SATA PHY", "Plain lecture contains SATA PHY header");
+    ExpectHas(szLecture, "Потери готовности PHY", "Plain lecture contains PHYRDY drops");
+    ExpectHas(szLecture, "Ошибки CRC Host-to-Device", "Plain lecture contains Host-to-Device CRC");
+
+    /* Test Expert Lecture */
+    szLecture[0] = 0;
+    g.bDevStatSupported = TRUE;
+    g.nDevStatLifetimeMaxTempC = 49;
+    g.nDevStatLifetimeMinTempC = 21;
+    g.qwDevStatSectorsWritten = 1000000000ULL;
+    FormatHealthLectureExpert(&g, szLecture, (int)sizeof(szLecture));
+    ExpectHas(szLecture, "Журнал SATA PHY (Log 11h)", "Expert lecture contains SATA PHY Log 11h section");
+    ExpectHas(szLecture, "Журнал Device Statistics (Log 04h)", "Expert lecture contains Device Statistics Log 04h section");
+    ExpectHas(szLecture, "мин 21 °C, макс 49 °C", "Expert lecture contains lifetime temperature min/max");
+
+    /* Test SSD endurance from Device Statistics Log 04h Page 07h when no SMART wear attribute is present */
+    Base(DRIVE_TYPE_SSD_SATA, "GENERIC SATA SSD 120GB", "1.0");
+    g.wRotationRate = 0x0001;
+    g.bDevStatSupported = TRUE;
+    g.nDevStatPercentUsed = 15; /* 15% used -> 85% remaining */
+    g.qwDevStatSectorsWritten = 2000000ULL; /* ~1 GB */
+    AssessDriveHealth(&g);
+    ExpectInt(g.nEndurancePercent, 85, "SSD endurance derived from Device Statistics Page 07h");
+    ExpectInt(g.nHealthPercent, 85, "Health percent derived from Device Statistics endurance");
+
+    CaseEnd("ata-logs-integration", before);
+}
+
+
+
+static void TestLegacyUsbBridges(void)
+{
+    int before = g_fail;
+
+    /* 1. Protocol prefix formatting for legacy bridges */
+    Base(DRIVE_TYPE_HDD, "ST3500418AS", "CC38");
+    g.bIsUSB = TRUE;
+    g.eAccessMethod = SMART_ACCESS_CYPRESS;
+    safe_snprintf(g.szProtocol, "SATA");
+    PrefixUsbProtocol(&g);
+    ExpectStr(g.szProtocol, "USB Cypress · SATA", "PrefixUsbProtocol CYPRESS");
+
+    g.eAccessMethod = SMART_ACCESS_SUNPLUS;
+    safe_snprintf(g.szProtocol, "SATA");
+    PrefixUsbProtocol(&g);
+    ExpectStr(g.szProtocol, "USB Sunplus · SATA", "PrefixUsbProtocol SUNPLUS");
+
+    g.eAccessMethod = SMART_ACCESS_PROLIFIC;
+    safe_snprintf(g.szProtocol, "SATA");
+    PrefixUsbProtocol(&g);
+    ExpectStr(g.szProtocol, "USB Prolific · SATA", "PrefixUsbProtocol PROLIFIC");
+
+    g.bIsUSB = FALSE;
+    g.szProtocol[0] = '\0';
+    g.eAccessMethod = SMART_ACCESS_CSMI;
+    FillDriveProtocol(&g);
+    ExpectStr(g.szProtocol, "RAID · CSMI · SATA", "FillDriveProtocol CSMI");
+
+    /* 2. ParseAtaIdentifyData test */
+    BYTE ident[512];
+    memset(ident, 0, sizeof(ident));
+    ident[0] = 0x40; /* Word 0: ATA */
+    /* Serial "W-DXW1E8123456" in byte-swapped pairs */
+    const char* sn = "W-DXW1E8123456      ";
+    for (int i = 0; i < 20; i += 2) {
+        ident[20 + i] = (BYTE)sn[i + 1];
+        ident[20 + i + 1] = (BYTE)sn[i];
+    }
+    /* Firmware "CC43    " */
+    const char* fw = "CC43    ";
+    for (int i = 0; i < 8; i += 2) {
+        ident[46 + i] = (BYTE)fw[i + 1];
+        ident[46 + i + 1] = (BYTE)fw[i];
+    }
+    /* Model "ST1000DM010-2EP102                      " */
+    const char* md = "ST1000DM010-2EP102                      ";
+    for (int i = 0; i < 40; i += 2) {
+        ident[54 + i] = (BYTE)md[i + 1];
+        ident[54 + i + 1] = (BYTE)md[i];
+    }
+    /* Word 82: SMART supported (bit 0) */
+    ident[164] = 0x01;
+    ident[165] = 0x00;
+    /* Word 85: SMART enabled (bit 0) */
+    ident[170] = 0x01;
+    ident[171] = 0x00;
+    /* Word 217: 7200 RPM (0x1C20) */
+    ident[434] = 0x20;
+    ident[435] = 0x1C;
+
+    DRIVE_INFO info;
+    memset(&info, 0, sizeof(info));
+    Expect(ParseAtaIdentifyData(ident, &info), "ParseAtaIdentifyData returns TRUE");
+    ExpectStr(info.szModel, "ST1000DM010-2EP102", "Parsed model matches");
+    ExpectStr(info.szSerial, "W-DXW1E8123456", "Parsed serial matches");
+    ExpectStr(info.szFirmware, "CC43", "Parsed firmware matches");
+    Expect(info.bSMART_Supported, "SMART supported parsed");
+    Expect(info.bSMART_Enabled, "SMART enabled parsed");
+    ExpectInt(info.wRotationRate, 7200, "Rotation rate 7200 parsed");
+
+    CaseEnd("legacy-usb-bridges", before);
+}
+
+static void TestCsmiStpPacket(void)
+{
+    int before = g_fail;
+
+    /* 1. Verify structure sizes matching SNIA CSMI specification */
+    ExpectInt((int)sizeof(CSMI_SAS_STP_PASSTHRU), 44, "sizeof CSMI_SAS_STP_PASSTHRU is 44");
+    ExpectInt((int)sizeof(CSMI_SAS_STP_PASSTHRU_STATUS), 92, "sizeof CSMI_SAS_STP_PASSTHRU_STATUS is 92");
+    ExpectInt((int)sizeof(SRB_IO_CONTROL), 28, "sizeof SRB_IO_CONTROL is 28");
+    ExpectInt((int)sizeof(CSMI_SAS_STP_PASSTHRU_BUFFER), 28 + 44 + 92 + 512, "sizeof CSMI_SAS_STP_PASSTHRU_BUFFER is 676");
+
+    /* 2. Verify FIS 27h Construction logic */
+    CSMI_SAS_STP_PASSTHRU_BUFFER buf;
+    memset(&buf, 0, sizeof(buf));
+    buf.IoctlHeader.HeaderLength = (ULONG)sizeof(SRB_IO_CONTROL);
+    memcpy(buf.IoctlHeader.Signature, CSMI_SAS_SIGNATURE, 8);
+    buf.IoctlHeader.ControlCode = CC_CSMI_SAS_STP_PASSTHRU;
+
+    buf.Parameters.bPhyIdentifier = 2;
+    buf.Parameters.bCommandFIS[0]  = 0x27; /* FIS Type 27h Register H2D */
+    buf.Parameters.bCommandFIS[1]  = 0x80; /* C=1 */
+    buf.Parameters.bCommandFIS[2]  = 0xB0; /* SMART command */
+    buf.Parameters.bCommandFIS[3]  = 0xDA; /* SMART Return Status */
+    buf.Parameters.bCommandFIS[5]  = 0x4F; /* Cylinder Low */
+    buf.Parameters.bCommandFIS[6]  = 0xC2; /* Cylinder High */
+    buf.Parameters.bCommandFIS[7]  = 0xA0; /* Device/Head */
+
+    ExpectInt(buf.Parameters.bPhyIdentifier, 2, "Target phy is 2");
+    ExpectInt(buf.Parameters.bCommandFIS[0], 0x27, "FIS 27h Register H2D");
+    ExpectInt(buf.Parameters.bCommandFIS[2], 0xB0, "ATA SMART command 0xB0");
+    ExpectInt(buf.Parameters.bCommandFIS[3], 0xDA, "SMART RETURN STATUS 0xDA");
+
+    /* 3. Status FIS decoding test */
+    /* OK: CylLow=0x4F, CylHigh=0xC2 */
+    buf.Status.bStatusFIS[5] = 0x4F;
+    buf.Status.bStatusFIS[6] = 0xC2;
+    BOOL bFail = FALSE;
+    if (buf.Status.bStatusFIS[5] == 0x4F && buf.Status.bStatusFIS[6] == 0xC2) {
+        bFail = FALSE;
+    } else if (buf.Status.bStatusFIS[5] == 0xF4 && buf.Status.bStatusFIS[6] == 0x2C) {
+        bFail = TRUE;
+    }
+    Expect(!bFail, "Status FIS 4Fh/C2h decoded as SMART OK");
+
+    /* Exceeded: CylLow=0xF4, CylHigh=0x2C */
+    buf.Status.bStatusFIS[5] = 0xF4;
+    buf.Status.bStatusFIS[6] = 0x2C;
+    if (buf.Status.bStatusFIS[5] == 0x4F && buf.Status.bStatusFIS[6] == 0xC2) {
+        bFail = FALSE;
+    } else if (buf.Status.bStatusFIS[5] == 0xF4 && buf.Status.bStatusFIS[6] == 0x2C) {
+        bFail = TRUE;
+    }
+    Expect(bFail, "Status FIS F4h/2Ch decoded as SMART THRESHOLD EXCEEDED");
+
+    CaseEnd("csmi-stp-packet", before);
+}
+
+
+static void TestDstEngineFormatting(void)
+{
+    int before = g_fail;
+    DRIVE_INFO info;
+    char buf[4096];
+
+    /* 1. NVMe Self-Test History Formatting */
+    ZeroMemory(&info, sizeof(info));
+    info.bIsNVMe = TRUE;
+    info.bGotNvmeSelfTestLog = TRUE;
+    info.nvmeSelfTestLog.CurrentOperation = 0;
+    info.nvmeSelfTestLog.CurrentCompletion = 0;
+    /* Entry 0: Completed successfully */
+    info.nvmeSelfTestLog.Results[0].Status = 0x10; /* Bit 7:4 = 1 (Short), Bit 3:0 = 0 (Success) */
+    info.nvmeSelfTestLog.Results[0].SegmentNum = 1;
+    info.nvmeSelfTestLog.Results[0].PowerOnHours = 1250;
+    info.nvmeSelfTestLog.Results[0].FailingLBA = 0;
+    /* Entry 1: Failed with read error */
+    info.nvmeSelfTestLog.Results[1].Status = 0x27; /* Bit 7:4 = 2 (Extended), Bit 3:0 = 7 (Read error) */
+    info.nvmeSelfTestLog.Results[1].SegmentNum = 2;
+    info.nvmeSelfTestLog.Results[1].PowerOnHours = 1200;
+    info.nvmeSelfTestLog.Results[1].FailingLBA = 0x12345678ULL;
+
+    int nLen = DstFormatSelfTestHistory(&info, buf, (int)sizeof(buf));
+    Expect(nLen > 0, "NVMe self-test formatting returned non-zero length");
+    ExpectHas(buf, "ЖУРНАЛ САМОПРОВЕРОК", "NVMe self-test header present");
+    ExpectHas(buf, "Успешно", "NVMe self-test entry 0 success text");
+    ExpectHas(buf, "Ошибка чтения LBA", "NVMe self-test entry 1 read failure text");
+    ExpectHas(buf, "0x12345678", "NVMe self-test entry 1 failing LBA present");
+
+    /* 2. ATA Self-Test History Formatting */
+    ZeroMemory(&info, sizeof(info));
+    info.bIsNVMe = FALSE;
+    info.bGotSelfTestLog = TRUE;
+    info.selfTestLog.stEntries[0].bTestNumber = 0x01;
+    info.selfTestLog.stEntries[0].bStatusByte = 0x00; /* Completed OK */
+    info.selfTestLog.stEntries[0].wLifeTimestamp = 80; /* 80 hours */
+    info.selfTestLog.stEntries[1].bTestNumber = 0x02;
+    info.selfTestLog.stEntries[1].bStatusByte = 0x70; /* Read error */
+    info.selfTestLog.stEntries[1].dwFailingLBA = 0xDEADBEEF;
+    info.selfTestLog.stEntries[1].wLifeTimestamp = 70;
+
+    nLen = DstFormatSelfTestHistory(&info, buf, (int)sizeof(buf));
+    Expect(nLen > 0, "ATA self-test formatting returned non-zero length");
+    ExpectHas(buf, "ОК", "ATA self-test entry 0 badge OK");
+    ExpectHas(buf, "ПЛОХО", "ATA self-test entry 1 badge BAD");
+    ExpectHas(buf, "0xDEADBEEF", "ATA self-test failing LBA 0xDEADBEEF");
+
+    /* 2b. ATA Empty Self-Test Log */
+    ZeroMemory(&info, sizeof(info));
+    info.bIsNVMe = FALSE;
+    info.bGotSelfTestLog = TRUE;
+    nLen = DstFormatSelfTestHistory(&info, buf, (int)sizeof(buf));
+    Expect(nLen > 0, "ATA empty self-test log length");
+    ExpectHas(buf, "пуст", "ATA empty self-test log mentions empty");
+
+    /* 2c. ATA Unsupported Self-Test Log */
+    ZeroMemory(&info, sizeof(info));
+    info.bIsNVMe = FALSE;
+    info.bGotSelfTestLog = FALSE;
+    nLen = DstFormatSelfTestHistory(&info, buf, (int)sizeof(buf));
+    Expect(nLen > 0, "ATA unsupported self-test log length");
+    ExpectHas(buf, "не поддерживается", "ATA unsupported self-test log mentions unsupported");
+
+    /* 1b. NVMe Empty Self-Test Log */
+    ZeroMemory(&info, sizeof(info));
+    info.bIsNVMe = TRUE;
+    info.bGotNvmeSelfTestLog = TRUE;
+    nLen = DstFormatSelfTestHistory(&info, buf, (int)sizeof(buf));
+    Expect(nLen > 0, "NVMe empty self-test log length");
+    ExpectHas(buf, "пуст", "NVMe empty self-test log mentions empty");
+
+    /* 1c. NVMe Unsupported Self-Test Log */
+    ZeroMemory(&info, sizeof(info));
+    info.bIsNVMe = TRUE;
+    info.bGotNvmeSelfTestLog = FALSE;
+    nLen = DstFormatSelfTestHistory(&info, buf, (int)sizeof(buf));
+    Expect(nLen > 0, "NVMe unsupported self-test log length");
+    ExpectHas(buf, "не поддерживается", "NVMe unsupported self-test log mentions unsupported");
+
+    /* 3. NVMe Error Log Formatting */
+    ZeroMemory(&info, sizeof(info));
+    info.bIsNVMe = TRUE;
+    info.bGotNvmeErrorLog = TRUE;
+    info.dwNvmeErrorLogEntries = 1;
+    info.nvmeErrorLog[0].ErrorCount = 5;
+    info.nvmeErrorLog[0].SQID = 2;
+    info.nvmeErrorLog[0].CMDID = 10;
+    info.nvmeErrorLog[0].StatusField = 0x4002;
+    info.nvmeErrorLog[0].ParameterErrorLocation = 0x0014; /* Byte 20, bit 0 */
+    info.nvmeErrorLog[0].LBA = 0xABCDE;
+
+    nLen = DstFormatErrorLogHistory(&info, buf, (int)sizeof(buf));
+    Expect(nLen > 0, "NVMe error log formatting returned non-zero length");
+    ExpectHas(buf, "ЖУРНАЛ АППАРАТНЫХ ОШИБОК", "NVMe error log header present");
+    ExpectHas(buf, "0x4002", "NVMe error log status field 0x4002");
+    ExpectHas(buf, "0xABCDE", "NVMe error log LBA 0xABCDE");
+
+    /* 4. ATA Error Log Formatting */
+    ZeroMemory(&info, sizeof(info));
+    info.bIsNVMe = FALSE;
+    info.bGotErrorLog = TRUE;
+    info.nErrorLogCount = 2;
+    info.errorLog.stErrors[0].bErrorRegister = 0x40; /* Uncorrectable */
+    info.errorLog.stErrors[0].bStatus = 0x51;
+    info.errorLog.stErrors[0].bLBA_Low = 0x11;
+    info.errorLog.stErrors[0].bLBA_Mid = 0x22;
+    info.errorLog.stErrors[0].bLBA_High = 0x33;
+    info.errorLog.stErrors[0].bTimestamp[0] = 0x50;
+
+    nLen = DstFormatErrorLogHistory(&info, buf, (int)sizeof(buf));
+    Expect(nLen > 0, "ATA error log formatting returned non-zero length");
+    ExpectHas(buf, "Суммарное количество ошибок ATA", "ATA error log count header");
+    ExpectHas(buf, "0x40", "ATA error register 0x40");
+    ExpectHas(buf, "0x00332211", "ATA error LBA 0x00332211");
+
+    CaseEnd("dst-engine-formatting", before);
+}
+
+
+static void TestBuild51Regressions(void)
+{
+    int before = g_fail;
+
+    /* 1. ATA IDENTIFY Validation */
+    {
+        BYTE ident[512];
+        memset(ident, 0, sizeof(ident));
+        WORD* w = (WORD*)ident;
+
+        /* All zeroes must fail */
+        Expect(!ValidateAtaIdentifyData(ident), "All-zero identify buffer is rejected");
+
+        /* All 0xFF must fail */
+        memset(ident, 0xFF, sizeof(ident));
+        Expect(!ValidateAtaIdentifyData(ident), "All-0xFF identify buffer is rejected");
+
+        /* ATAPI device (Word 0 bit 15 == 1) must fail */
+        memset(ident, 0, sizeof(ident));
+        w[0] = 0x85C0; /* ATAPI CD-ROM */
+        Expect(!ValidateAtaIdentifyData(ident), "ATAPI device (bit 15=1) is rejected");
+
+        /* Valid ATA device configuration */
+        w[0] = 0x0040; /* standard ATA device */
+        /* Word 27-46: Model string (byte-swapped ASCII "WDC WDS120G2G0A-00JH30") */
+        const char* szModelAscii = "DW CDW1S022G0G-A00HJ03                  ";
+        memcpy(&w[27], szModelAscii, 40);
+        w[60] = 0x5000; /* sectors low */
+        w[61] = 0x0E46; /* sectors high -> ~240M sectors (~120GB) */
+        Expect(ValidateAtaIdentifyData(ident), "Standard ATA Identify buffer is accepted");
+
+        DRIVE_INFO drv;
+        memset(&drv, 0, sizeof(drv));
+        Expect(ParseAtaIdentifyData(ident, &drv), "ParseAtaIdentifyData accepts valid Identify");
+        Expect(strstr(drv.szModel, "WDC WDS120G2G0A") != NULL, "szModel populated with clean ASCII model");
+
+        /* Garbage RAM dump with non-printable binary characters in model string */
+        ident[54] = 0x01; /* binary control char in model word 27 */
+        ident[55] = 0xFF; /* binary non-ASCII byte */
+        Expect(!ValidateAtaIdentifyData(ident), "Garbage RAM dump with non-printable ASCII in model is rejected");
+
+        /* Absurd sector count > 100 PB */
+        memcpy(&w[27], szModelAscii, 40);
+        w[83] = 0x0400; /* LBA48 supported */
+        w[100] = 0xFFFF;
+        w[101] = 0xFFFF;
+        w[102] = 0xFFFF;
+        w[103] = 0x000F; /* > 200 billion sectors */
+        Expect(!ValidateAtaIdentifyData(ident), "Absurd sector count (>100 PB) is rejected");
+    }
+
+    /* 2. Toshiba Attribute 188 (Timeouts) and Attribute 192 (Power-off Retracts) */
+    {
+        DRIVE_INFO hdd;
+        memset(&hdd, 0, sizeof(hdd));
+        hdd.eType = DRIVE_TYPE_HDD;
+        hdd.eVendor = VENDOR_TOSHIBA;
+        hdd.bSMART_Supported = TRUE;
+        lstrcpynA(hdd.szModel, "TOSHIBA MK5076GSX", (int)sizeof(hdd.szModel));
+
+        /* Case 2A: Attribute 188 with Word 0 = 16, Word 1 = 0, Word 2 = 0
+         * 16 aborted commands during host sleep/resets, 0 timeouts > 5s.
+         * Must NOT trigger interface caution! */
+        hdd.attrData.stAttributes[0].bAttrID = 0xBC;
+        hdd.attrData.stAttributes[0].bAttrValue = 100;
+        hdd.attrData.stAttributes[0].bWorstValue = 100;
+        hdd.attrData.stAttributes[0].bRawValue[0] = 0x10; /* Word 0 = 16 */
+        hdd.attrData.stAttributes[0].bRawValue[1] = 0x00;
+        hdd.attrData.stAttributes[0].bRawValue[2] = 0x00; /* Word 1 = 0 (>5s) */
+        hdd.attrData.stAttributes[0].bRawValue[3] = 0x00;
+        hdd.attrData.stAttributes[0].bRawValue[4] = 0x00; /* Word 2 = 0 (>7.5s) */
+        hdd.attrData.stAttributes[0].bRawValue[5] = 0x00;
+
+        AssessDriveHealth(&hdd);
+        ExpectInt((int)hdd.eInterface, (int)HEALTH_STATUS_GOOD, "Attr 188 with 0 timeouts >5s keeps eInterface GOOD");
+
+        /* Case 2B: Attribute 188 with Word 1 = 15 (>5s timeouts)
+         * Real interface timeouts must trigger interface caution. */
+        hdd.attrData.stAttributes[0].bRawValue[2] = 15;
+        hdd.attrData.stAttributes[0].bRawValue[3] = 0;
+        AssessDriveHealth(&hdd);
+        ExpectInt((int)hdd.eInterface, (int)HEALTH_STATUS_CAUTION, "Attr 188 with 15 timeouts >5s sets eInterface CAUTION");
+
+        /* Case 2C: Attribute 192 (0xC0) with dual 16-bit word packing:
+         * RAW: 0x000001420142 -> 322 retracts, not 21,102,914 */
+        hdd.attrData.stAttributes[1].bAttrID = 0xC0;
+        hdd.attrData.stAttributes[1].bAttrValue = 100;
+        hdd.attrData.stAttributes[1].bWorstValue = 100;
+        hdd.attrData.stAttributes[1].bRawValue[0] = 0x42;
+        hdd.attrData.stAttributes[1].bRawValue[1] = 0x01; /* 0x0142 = 322 */
+        hdd.attrData.stAttributes[1].bRawValue[2] = 0x42;
+        hdd.attrData.stAttributes[1].bRawValue[3] = 0x01; /* duplicate */
+        hdd.attrData.stAttributes[1].bRawValue[4] = 0x00;
+        hdd.attrData.stAttributes[1].bRawValue[5] = 0x00;
+
+        AssessDriveHealth(&hdd);
+        ExpectInt(hdd.nEmergencyRetract, 322, "Attr 192 unpacks 322 retracts instead of 21 million");
+    }
+
+    /* 3. Multi-Partition SSD Free Space: Small OEM recovery partition does not cause false panic */
+    {
+        DRIVE_INFO ssd;
+        memset(&ssd, 0, sizeof(ssd));
+        ssd.eType = DRIVE_TYPE_SSD_SATA;
+        ssd.nSSDLifeLeft = 100;
+        ssd.nEndurancePercent = 100;
+        ssd.bSMART_Supported = TRUE;
+        ssd.trimInfo.bQueried = TRUE;
+        ssd.trimInfo.bOsTrimEnabled = TRUE;
+        ssd.trimInfo.bDeviceTrimSupported = TRUE;
+        ssd.trimInfo.nVolumeCount = 2;
+
+        /* Partition 1: C: (950 GB, 400 GB free = 42% free) */
+        lstrcpynA(ssd.trimInfo.volumes[0].szLetter, "C:", 4);
+        lstrcpynA(ssd.trimInfo.volumes[0].szFileSystem, "NTFS", 16);
+        ssd.trimInfo.volumes[0].qwTotalBytes = 950ULL * 1024ULL * 1024ULL * 1024ULL;
+        ssd.trimInfo.volumes[0].qwFreeBytes  = 400ULL * 1024ULL * 1024ULL * 1024ULL;
+        ssd.trimInfo.volumes[0].fFreePercent = 42.1f;
+        ssd.trimInfo.volumes[0].bTrimSupportedFs = TRUE;
+
+        /* Partition 2: Recovery (500 MB, 20 MB free = 4.0% free by OEM design) */
+        lstrcpynA(ssd.trimInfo.volumes[1].szLetter, "R:", 4);
+        lstrcpynA(ssd.trimInfo.volumes[1].szFileSystem, "NTFS", 16);
+        ssd.trimInfo.volumes[1].qwTotalBytes = 500ULL * 1024ULL * 1024ULL;
+        ssd.trimInfo.volumes[1].qwFreeBytes  = 20ULL * 1024ULL * 1024ULL;
+        ssd.trimInfo.volumes[1].fFreePercent = 4.0f;
+        ssd.trimInfo.volumes[1].bTrimSupportedFs = TRUE;
+
+        EvaluateDriveTrimAndCapacity(&ssd);
+        Expect(!ssd.trimInfo.bPanicLowSpace, "SSD with 400 GB free does not trigger panic because of 500 MB recovery partition");
+        Expect(!ssd.trimInfo.bCriticallyLowSpace, "SSD with 400 GB free does not trigger critical space warning");
+
+        AssessDriveHealth(&ssd);
+        ExpectInt((int)ssd.eWear, (int)HEALTH_STATUS_GOOD, "eWear stays GOOD with plenty of total SSD space");
+
+        /* 4. Report duplication check: Plain lecture on healthy SSD does not dump raw partition table */
+        char szPlain[4096];
+        FormatHealthLecturePlain(&ssd, szPlain, sizeof(szPlain));
+        Expect(strstr(szPlain, "Логические тома накопителя:") == NULL, "Plain lecture does not dump redundant volume list when healthy");
+    }
+
+    CaseEnd("build-51-regressions", before);
+}
+
+static void TestBuild52Regressions(void)
+{
+    int before = g_fail;
+
+    /* 1. Generic unnamed SSD attribute naming and encoding checks:
+     * Unnamed SSD attributes outside profile/drivedb must resolve to
+     * vendor-specific with RAW_ENC_UNKNOWN and not inherit HDD mechanical
+     * names (Flying height, spin-up current) or unconfirmed SSD decodes
+     * (NAND writes GiB, read retries). */
+    {
+        DRIVE_INFO ssd;
+        memset(&ssd, 0, sizeof(ssd));
+        ssd.eType = DRIVE_TYPE_SSD_SATA;
+        lstrcpynA(ssd.szModel, "Generic SSD 120GB", (int)sizeof(ssd.szModel));
+        lstrcpynA(ssd.szFirmware, "1.0", (int)sizeof(ssd.szFirmware));
+
+        ATTR_DECODE d;
+
+        /* Attr 206 (0xCE): Must NOT be Flying Height */
+        memset(&d, 0, sizeof(d));
+        GetAttrDecode(0xCE, &ssd, &d);
+        ExpectInt((int)d.eState, (int)ATTR_DECODE_UNKNOWN, "Generic SSD 206 is unknown");
+        ExpectInt((int)d.eEnc, (int)RAW_ENC_UNKNOWN, "Generic SSD 206 enc is unknown");
+        ExpectHas(d.szName, "vendor-specific", "Generic SSD 206 is vendor-specific");
+        ExpectNotHas(d.szName, "Высота полёта", "Generic SSD 206 does not have flying height");
+        ExpectNotHas(d.szName, "Flying", "Generic SSD 206 does not have Flying");
+
+        /* Attr 207 (0xCF): Must NOT be Spin-Up Current */
+        memset(&d, 0, sizeof(d));
+        GetAttrDecode(0xCF, &ssd, &d);
+        ExpectInt((int)d.eState, (int)ATTR_DECODE_UNKNOWN, "Generic SSD 207 is unknown");
+        ExpectInt((int)d.eEnc, (int)RAW_ENC_UNKNOWN, "Generic SSD 207 enc is unknown");
+        ExpectHas(d.szName, "vendor-specific", "Generic SSD 207 is vendor-specific");
+        ExpectNotHas(d.szName, "Ток раскрутки", "Generic SSD 207 does not have spin-up current");
+        ExpectNotHas(d.szName, "Spin-up", "Generic SSD 207 does not have Spin-up");
+
+        /* Attr 249 (0xF9): Must NOT be NAND Writes GiB */
+        memset(&d, 0, sizeof(d));
+        GetAttrDecode(0xF9, &ssd, &d);
+        ExpectInt((int)d.eState, (int)ATTR_DECODE_UNKNOWN, "Generic SSD 249 is unknown");
+        ExpectInt((int)d.eEnc, (int)RAW_ENC_UNKNOWN, "Generic SSD 249 enc is unknown");
+        ExpectHas(d.szName, "vendor-specific", "Generic SSD 249 is vendor-specific");
+        ExpectNotHas(d.szName, "Записи NAND", "Generic SSD 249 does not have NAND writes");
+        ExpectNotHas(d.szName, "ГиБ", "Generic SSD 249 does not have GiB");
+
+        /* Attr 250 (0xFA): Must NOT be Read Retries */
+        memset(&d, 0, sizeof(d));
+        GetAttrDecode(0xFA, &ssd, &d);
+        ExpectInt((int)d.eState, (int)ATTR_DECODE_UNKNOWN, "Generic SSD 250 is unknown");
+        ExpectInt((int)d.eEnc, (int)RAW_ENC_UNKNOWN, "Generic SSD 250 enc is unknown");
+        ExpectHas(d.szName, "vendor-specific", "Generic SSD 250 is vendor-specific");
+        ExpectNotHas(d.szName, "Повторы ошибок", "Generic SSD 250 does not have read retries");
+
+        /* Attr 174 (0xAE): Unnamed SSD is vendor-specific and power loss is NOT confirmed */
+        memset(&d, 0, sizeof(d));
+        GetAttrDecode(0xAE, &ssd, &d);
+        ExpectInt((int)d.eState, (int)ATTR_DECODE_UNKNOWN, "Generic SSD 174 is unknown");
+        ExpectInt((int)d.eEnc, (int)RAW_ENC_UNKNOWN, "Generic SSD 174 enc is unknown");
+        ExpectHas(d.szName, "vendor-specific", "Generic SSD 174 is vendor-specific");
+        Expect(!IsPowerLossAttrConfirmed(&ssd, 0xAE), "Generic SSD 174 power loss is not confirmed");
+
+        /* Standard ATA attributes on the same generic SSD must still be recognized */
+        memset(&d, 0, sizeof(d));
+        GetAttrDecode(0x05, &ssd, &d);
+        ExpectInt((int)d.eState, (int)ATTR_DECODE_KNOWN, "Generic SSD 0x05 is known");
+        ExpectHas(d.szName, "Переназначенные", "Generic SSD 0x05 realloc name");
+
+        memset(&d, 0, sizeof(d));
+        GetAttrDecode(0x09, &ssd, &d);
+        ExpectInt((int)d.eState, (int)ATTR_DECODE_KNOWN, "Generic SSD 0x09 is known");
+        ExpectHas(d.szName, "наработки", "Generic SSD 0x09 POH name");
+
+        memset(&d, 0, sizeof(d));
+        GetAttrDecode(0x0C, &ssd, &d);
+        ExpectInt((int)d.eState, (int)ATTR_DECODE_KNOWN, "Generic SSD 0x0C is known");
+        ExpectHas(d.szName, "включения", "Generic SSD 0x0C cycles name");
+
+        memset(&d, 0, sizeof(d));
+        GetAttrDecode(0xC2, &ssd, &d);
+        ExpectInt((int)d.eState, (int)ATTR_DECODE_KNOWN, "Generic SSD 0xC2 is known");
+        ExpectHas(d.szName, "Температура", "Generic SSD 0xC2 temp name");
+
+        memset(&d, 0, sizeof(d));
+        GetAttrDecode(0xC7, &ssd, &d);
+        ExpectInt((int)d.eState, (int)ATTR_DECODE_KNOWN, "Generic SSD 0xC7 is known");
+        ExpectHas(d.szName, "CRC", "Generic SSD 0xC7 CRC name");
+    }
+
+    /* 2. HDD preserves mechanical attribute names: 206 (Flying height) and 207 (Spin-up current) */
+    {
+        DRIVE_INFO hdd;
+        memset(&hdd, 0, sizeof(hdd));
+        hdd.eType = DRIVE_TYPE_HDD;
+        lstrcpynA(hdd.szModel, "Generic HDD 500GB", (int)sizeof(hdd.szModel));
+
+        ATTR_DECODE d;
+
+        memset(&d, 0, sizeof(d));
+        GetAttrDecode(0xCE, &hdd, &d);
+        ExpectInt((int)d.eState, (int)ATTR_DECODE_KNOWN, "HDD 206 is known");
+        ExpectHas(d.szName, "Высота полёта", "HDD 206 has flying height name");
+
+        memset(&d, 0, sizeof(d));
+        GetAttrDecode(0xCF, &hdd, &d);
+        ExpectInt((int)d.eState, (int)ATTR_DECODE_KNOWN, "HDD 207 is known");
+        ExpectHas(d.szName, "Ток раскрутки", "HDD 207 has spin-up current name");
+    }
+
+    /* 3. Power loss confirmation gating: C0 on ATA SSD, A0 on Phison */
+    {
+        DRIVE_INFO ssdAta;
+        memset(&ssdAta, 0, sizeof(ssdAta));
+        ssdAta.eType = DRIVE_TYPE_SSD_SATA;
+        Expect(IsPowerLossAttrConfirmed(&ssdAta, 0xC0), "C0 on ATA SSD is confirmed power loss");
+
+        DRIVE_INFO phison;
+        memset(&phison, 0, sizeof(phison));
+        phison.eType = DRIVE_TYPE_SSD_SATA;
+        phison.eController = CONTROLLER_PHISON;
+        Expect(IsPowerLossAttrConfirmed(&phison, 0xA0), "A0 on Phison is confirmed power loss");
+    }
+
+    CaseEnd("build-52-regressions", before);
+}
+
+static void TestBuild53Regressions(void)
+{
+    int before = g_fail;
+
+    /* 1. SATA PHY PHYRDY transitions alone (sleep, wake, bus resets) do not trigger eInterface CAUTION on HDD */
+    {
+        Base(DRIVE_TYPE_HDD, "ST1000DM010-2EP102", "CC43");
+        g.wRotationRate = 7200;
+        Expect(AddAttr(5, 100, 0), "hdd realloc 0");
+        Expect(AddAttr(9, 100, 1000), "hdd poh 1000");
+        g.bSataPhyLogSupported = TRUE;
+        g.nPhyTransitionsPhyRdy = 25; /* 25 sleep/wake or link drop transitions */
+        g.nPhyCrcErrorsH2D = 0;       /* No CRC errors on cable */
+        g.nPhyCommandIcrcErrors = 0;  /* No command ICRC errors */
+        g.nPhyComresetCount = 10;
+
+        AssessDriveHealth(&g);
+        ExpectInt((int)g.eInterface, (int)HEALTH_STATUS_GOOD,
+                  "PHYRDY transitions alone keep HDD interface GOOD");
+        ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_GOOD,
+                  "PHYRDY transitions alone do not degrade overall HDD health");
+
+        /* Plain and expert lectures must still report the transition count as informative context */
+        char szLecture[2048];
+        szLecture[0] = 0;
+        UiSetLang(UI_LANG_RU);
+        FormatHealthLectureExpert(&g, szLecture, (int)sizeof(szLecture));
+        ExpectHas(szLecture, "Потери готовности PHY: 25",
+                  "Expert lecture reports PHYRDY drop count as context");
+    }
+
+    /* 2. SATA SSD with PHYRDY transitions alone keeps eInterface GOOD */
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "Samsung SSD 870 EVO 500GB", "SVT01B6Q");
+        Expect(AddAttr(5, 100, 0), "ssd realloc 0");
+        Expect(AddAttr(9, 100, 500), "ssd poh 500");
+        g.nSSDLifeLeft = 99;
+        g.nEndurancePercent = 99;
+        g.bSataPhyLogSupported = TRUE;
+        g.nPhyTransitionsPhyRdy = 40;
+        g.nPhyCrcErrorsH2D = 0;
+        g.nPhyCommandIcrcErrors = 0;
+
+        Run();
+        ExpectInt((int)g.eInterface, (int)HEALTH_STATUS_GOOD,
+                  "PHYRDY transitions alone keep SSD interface GOOD");
+        ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_GOOD,
+                  "PHYRDY transitions alone do not degrade overall SSD health");
+    }
+
+    /* 3. Real CRC errors and command ICRC errors in SATA PHY log STILL trigger eInterface CAUTION */
+    {
+        Base(DRIVE_TYPE_HDD, "ST1000DM010-2EP102", "CC43");
+        g.wRotationRate = 7200;
+        Expect(AddAttr(5, 100, 0), "hdd realloc 0");
+        Expect(AddAttr(9, 100, 1000), "hdd poh 1000");
+        g.bSataPhyLogSupported = TRUE;
+        g.nPhyTransitionsPhyRdy = 2;
+        g.nPhyCrcErrorsH2D = 3; /* Real cable CRC errors */
+        g.nPhyCommandIcrcErrors = 0;
+
+        AssessDriveHealth(&g);
+        ExpectInt((int)g.eInterface, (int)HEALTH_STATUS_CAUTION,
+                  "SATA PHY H2D CRC error triggers HDD interface CAUTION");
+        ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_CAUTION,
+                  "SATA PHY H2D CRC error triggers overall CAUTION");
+
+        Base(DRIVE_TYPE_SSD_SATA, "Samsung SSD 870 EVO 500GB", "SVT01B6Q");
+        Expect(AddAttr(5, 100, 0), "ssd realloc 0");
+        Expect(AddAttr(9, 100, 500), "ssd poh 500");
+        g.nSSDLifeLeft = 99;
+        g.nEndurancePercent = 99;
+        g.bSataPhyLogSupported = TRUE;
+        g.nPhyTransitionsPhyRdy = 0;
+        g.nPhyCrcErrorsH2D = 0;
+        g.nPhyCommandIcrcErrors = 1; /* Real command ICRC error */
+
+        Run();
+        ExpectInt((int)g.eInterface, (int)HEALTH_STATUS_CAUTION,
+                  "SATA PHY command ICRC error triggers SSD interface CAUTION");
+    }
+
+    CaseEnd("build-53-regressions", before);
+}
+
+static void TestBuild54Regressions(void)
+{
+    int before = g_fail;
+
+    /* 1. Isolated Event 153 (1 or 2 occurrences over 30 days) does not elevate overall health to CAUTION */
+    {
+        Base(DRIVE_TYPE_HDD, "ST1000DM010-2EP102", "CC43");
+        g.wRotationRate = 7200;
+        Expect(AddAttr(5, 100, 0), "hdd realloc 0");
+        Expect(AddAttr(9, 100, 1000), "hdd poh 1000");
+        g.eventStats.bQueried = TRUE;
+        g.eventStats.nEvent153Count = 1; /* 1 retry over 30 days */
+        g.eventStats.nEvent129Count = 0;
+        g.eventStats.nEvent51Count = 0;
+        g.eventStats.nEventHwErrCount = 0;
+
+        AssessDriveHealth(&g);
+        ExpectInt((int)g.eInterface, (int)HEALTH_STATUS_OBSERVE,
+                  "Isolated 1 Event 153 sets HDD eInterface to OBSERVE");
+        ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_GOOD,
+                  "Isolated 1 Event 153 does not degrade overall HDD health to CAUTION");
+
+        char szPrompt[256];
+        FormatHddObservePrompt(&g, szPrompt, (int)sizeof(szPrompt));
+        ExpectHas(szPrompt, "Есть факторы риска", "Isolated 1 Event 153 produces observe prompt");
+
+        /* 2 retries also remain OBSERVE / overall GOOD */
+        g.eventStats.nEvent153Count = 2;
+        AssessDriveHealth(&g);
+        ExpectInt((int)g.eInterface, (int)HEALTH_STATUS_OBSERVE,
+                  "Isolated 2 Event 153 sets HDD eInterface to OBSERVE");
+        ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_GOOD,
+                  "Isolated 2 Event 153 keeps overall HDD health GOOD");
+
+        /* 3 retries (>= 3) elevate eInterface to CAUTION and trigger overall CAUTION */
+        g.eventStats.nEvent153Count = 3;
+        AssessDriveHealth(&g);
+        ExpectInt((int)g.eInterface, (int)HEALTH_STATUS_CAUTION,
+                  "Event 153 >= 3 sets HDD eInterface to CAUTION");
+        ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_CAUTION,
+                  "Event 153 >= 3 degrades overall HDD health to CAUTION");
+        FormatHddCautionPrompt(&g, szPrompt, (int)sizeof(szPrompt));
+        ExpectHas(szPrompt, "Проблема интерфейса", "Event 153 >= 3 produces caution prompt");
+    }
+
+    /* 2. SSD behaves identically: 1 Event 153 is OBSERVE, 3 is CAUTION */
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "Samsung SSD 870 EVO 500GB", "SVT01B6Q");
+        Expect(AddAttr(5, 100, 0), "ssd realloc 0");
+        Expect(AddAttr(9, 100, 500), "ssd poh 500");
+        g.nSSDLifeLeft = 99;
+        g.nEndurancePercent = 99;
+        g.eventStats.bQueried = TRUE;
+        g.eventStats.nEvent153Count = 1;
+        g.eventStats.nEvent129Count = 0;
+        g.eventStats.nEvent51Count = 0;
+        g.eventStats.nEventHwErrCount = 0;
+
+        Run();
+        ExpectInt((int)g.eInterface, (int)HEALTH_STATUS_OBSERVE,
+                  "Isolated 1 Event 153 sets SSD eInterface to OBSERVE");
+        ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_GOOD,
+                  "Isolated 1 Event 153 keeps overall SSD health GOOD");
+
+        g.eventStats.nEvent153Count = 3;
+        Run();
+        ExpectInt((int)g.eInterface, (int)HEALTH_STATUS_CAUTION,
+                  "Event 153 >= 3 sets SSD eInterface to CAUTION");
+        ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_CAUTION,
+                  "Event 153 >= 3 degrades overall SSD health to CAUTION");
+    }
+
+    /* 3. Combined bus reset (Event 129) and retry (Event 153) triggers CAUTION even if count < 3 */
+    {
+        Base(DRIVE_TYPE_HDD, "ST1000DM010-2EP102", "CC43");
+        g.wRotationRate = 7200;
+        Expect(AddAttr(5, 100, 0), "hdd realloc 0");
+        Expect(AddAttr(9, 100, 1000), "hdd poh 1000");
+        g.eventStats.bQueried = TRUE;
+        g.eventStats.nEvent129Count = 1; /* 1 reset */
+        g.eventStats.nEvent153Count = 1; /* 1 retry */
+        g.eventStats.nEvent51Count = 0;
+        g.eventStats.nEventHwErrCount = 0;
+
+        AssessDriveHealth(&g);
+        ExpectInt((int)g.eInterface, (int)HEALTH_STATUS_CAUTION,
+                  "Combined Event 129 + Event 153 elevates eInterface to CAUTION");
+        ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_CAUTION,
+                  "Combined Event 129 + Event 153 degrades overall health to CAUTION");
+    }
+
+    CaseEnd("build-54-regressions", before);
+}
+
+static void TestBuild55Regressions(void)
+{
+    int before = g_fail;
+
+    /* 1. First partition is small (< 1 GB, e.g. 500 MB recovery with 4% free),
+     * second partition is large (1 TB with 80% free).
+     * fMinFreePercent must take 80.0%, NOT 4.0%! */
+    {
+        DRIVE_INFO ssd;
+        memset(&ssd, 0, sizeof(ssd));
+        ssd.eType = DRIVE_TYPE_SSD_SATA;
+        ssd.nSSDLifeLeft = 100;
+        ssd.nEndurancePercent = 100;
+        ssd.bSMART_Supported = TRUE;
+        ssd.trimInfo.bQueried = TRUE;
+        ssd.trimInfo.bOsTrimEnabled = TRUE;
+        ssd.trimInfo.bDeviceTrimSupported = TRUE;
+        ssd.trimInfo.nVolumeCount = 2;
+
+        /* Partition 0: D: (500 MB, 20 MB free = 4.0% free) */
+        lstrcpynA(ssd.trimInfo.volumes[0].szLetter, "D:", 4);
+        lstrcpynA(ssd.trimInfo.volumes[0].szFileSystem, "NTFS", 16);
+        ssd.trimInfo.volumes[0].qwTotalBytes = 500ULL * 1024ULL * 1024ULL;
+        ssd.trimInfo.volumes[0].qwFreeBytes  = 20ULL * 1024ULL * 1024ULL;
+        ssd.trimInfo.volumes[0].fFreePercent = 4.0f;
+        ssd.trimInfo.volumes[0].bTrimSupportedFs = TRUE;
+
+        /* Partition 1: E: (1000 GB, 800 GB free = 80.0% free) */
+        lstrcpynA(ssd.trimInfo.volumes[1].szLetter, "E:", 4);
+        lstrcpynA(ssd.trimInfo.volumes[1].szFileSystem, "NTFS", 16);
+        ssd.trimInfo.volumes[1].qwTotalBytes = 1000ULL * 1024ULL * 1024ULL * 1024ULL;
+        ssd.trimInfo.volumes[1].qwFreeBytes  = 800ULL * 1024ULL * 1024ULL * 1024ULL;
+        ssd.trimInfo.volumes[1].fFreePercent = 80.0f;
+        ssd.trimInfo.volumes[1].bTrimSupportedFs = TRUE;
+
+        EvaluateDriveTrimAndCapacity(&ssd);
+        Expect(fabs(ssd.trimInfo.fMinFreePercent - 80.0f) < 0.1f,
+               "fMinFreePercent ignores first < 1GB partition and takes 80% from 1TB volume");
+        Expect(!ssd.trimInfo.bPanicLowSpace, "No panic space on 1TB volume with 80% free");
+        Expect(!ssd.trimInfo.bCriticallyLowSpace, "No critical space on 1TB volume with 80% free");
+    }
+
+    /* 2. Multiple partitions >= 1 GB with small recovery partition:
+     * Minimum free % must be calculated among partitions >= 1 GB. */
+    {
+        DRIVE_INFO ssd;
+        memset(&ssd, 0, sizeof(ssd));
+        ssd.eType = DRIVE_TYPE_SSD_SATA;
+        ssd.nSSDLifeLeft = 100;
+        ssd.nEndurancePercent = 100;
+        ssd.bSMART_Supported = TRUE;
+        ssd.trimInfo.bQueried = TRUE;
+        ssd.trimInfo.bOsTrimEnabled = TRUE;
+        ssd.trimInfo.bDeviceTrimSupported = TRUE;
+        ssd.trimInfo.nVolumeCount = 3;
+
+        /* Partition 0: Recovery (500 MB, 1.0% free) */
+        ssd.trimInfo.volumes[0].qwTotalBytes = 500ULL * 1024ULL * 1024ULL;
+        ssd.trimInfo.volumes[0].fFreePercent = 1.0f;
+        ssd.trimInfo.volumes[0].bTrimSupportedFs = TRUE;
+
+        /* Partition 1: C: (100 GB, 30.0% free) */
+        ssd.trimInfo.volumes[1].qwTotalBytes = 100ULL * 1024ULL * 1024ULL * 1024ULL;
+        ssd.trimInfo.volumes[1].fFreePercent = 30.0f;
+        ssd.trimInfo.volumes[1].bTrimSupportedFs = TRUE;
+
+        /* Partition 2: D: (500 GB, 15.0% free) */
+        ssd.trimInfo.volumes[2].qwTotalBytes = 500ULL * 1024ULL * 1024ULL * 1024ULL;
+        ssd.trimInfo.volumes[2].fFreePercent = 15.0f;
+        ssd.trimInfo.volumes[2].bTrimSupportedFs = TRUE;
+
+        EvaluateDriveTrimAndCapacity(&ssd);
+        Expect(fabs(ssd.trimInfo.fMinFreePercent - 15.0f) < 0.1f,
+               "fMinFreePercent takes 15% (min between C: 30% and D: 15%), ignoring 1% recovery");
+    }
+
+    /* 3. All partitions are small (< 1 GB):
+     * fMinFreePercent falls back to overall free space percentage. */
+    {
+        DRIVE_INFO ssd;
+        memset(&ssd, 0, sizeof(ssd));
+        ssd.eType = DRIVE_TYPE_SSD_SATA;
+        ssd.bSMART_Supported = TRUE;
+        ssd.trimInfo.bQueried = TRUE;
+        ssd.trimInfo.bOsTrimEnabled = TRUE;
+        ssd.trimInfo.bDeviceTrimSupported = TRUE;
+        ssd.trimInfo.nVolumeCount = 2;
+
+        /* Partition 0: 500 MB, 50 MB free (10.0%) */
+        ssd.trimInfo.volumes[0].qwTotalBytes = 500ULL * 1024ULL * 1024ULL;
+        ssd.trimInfo.volumes[0].qwFreeBytes  = 50ULL * 1024ULL * 1024ULL;
+        ssd.trimInfo.volumes[0].fFreePercent = 10.0f;
+        ssd.trimInfo.volumes[0].bTrimSupportedFs = TRUE;
+
+        /* Partition 1: 300 MB, 60 MB free (20.0%) */
+        ssd.trimInfo.volumes[1].qwTotalBytes = 300ULL * 1024ULL * 1024ULL;
+        ssd.trimInfo.volumes[1].qwFreeBytes  = 60ULL * 1024ULL * 1024ULL;
+        ssd.trimInfo.volumes[1].fFreePercent = 20.0f;
+        ssd.trimInfo.volumes[1].bTrimSupportedFs = TRUE;
+
+        /* Total = 800 MB, free = 110 MB -> 13.75% */
+        EvaluateDriveTrimAndCapacity(&ssd);
+        Expect(fabs(ssd.trimInfo.fMinFreePercent - 13.75f) < 0.2f,
+               "When all partitions < 1GB, fMinFreePercent falls back to overall free % (13.75%)");
+    }
+
+    CaseEnd("build-55-regressions", before);
+}
+
+static void TestBuild56Regressions(void)
+{
+    int before = g_fail;
+
+    /* 1. When no volumes could be read (nVolumeCount == 0), szTrimSummary must report
+     * "Активен (тома не прочитаны)", not "Активен (NTFS/ReFS)" */
+    {
+        DRIVE_INFO ssd;
+        memset(&ssd, 0, sizeof(ssd));
+        ssd.eType = DRIVE_TYPE_SSD_SATA;
+        ssd.nSSDLifeLeft = 100;
+        ssd.nEndurancePercent = 100;
+        ssd.bSMART_Supported = TRUE;
+        ssd.trimInfo.bQueried = TRUE;
+        ssd.trimInfo.bOsTrimEnabled = TRUE;
+        ssd.trimInfo.bDeviceTrimSupported = TRUE;
+        ssd.trimInfo.nVolumeCount = 0; /* Volumes could not be opened/read */
+
+        UiSetLang(UI_LANG_RU);
+        EvaluateDriveTrimAndCapacity(&ssd);
+        ExpectStr(ssd.trimInfo.szTrimSummary, "Активен (тома не прочитаны)",
+                  "szTrimSummary is 'Активен (тома не прочитаны)' when nVolumeCount == 0 (RU)");
+        Expect(strstr(ssd.trimInfo.szTrimSummary, "NTFS/ReFS") == NULL,
+               "szTrimSummary does not claim NTFS/ReFS when volumes not read (RU)");
+
+        UiSetLang(UI_LANG_EN);
+        EvaluateDriveTrimAndCapacity(&ssd);
+        ExpectStr(ssd.trimInfo.szTrimSummary, "Active (volumes not read)",
+                  "szTrimSummary is 'Active (volumes not read)' when nVolumeCount == 0 (EN)");
+        Expect(strstr(ssd.trimInfo.szTrimSummary, "NTFS/ReFS") == NULL,
+               "szTrimSummary does not claim NTFS/ReFS when volumes not read (EN)");
+
+        /* When volumes are read as NTFS, it properly reports Active (NTFS/ReFS) */
+        ssd.trimInfo.nVolumeCount = 1;
+        lstrcpynA(ssd.trimInfo.volumes[0].szLetter, "C:", 4);
+        lstrcpynA(ssd.trimInfo.volumes[0].szFileSystem, "NTFS", 16);
+        ssd.trimInfo.volumes[0].qwTotalBytes = 500ULL * 1024ULL * 1024ULL * 1024ULL;
+        ssd.trimInfo.volumes[0].qwFreeBytes  = 250ULL * 1024ULL * 1024ULL * 1024ULL;
+        ssd.trimInfo.volumes[0].fFreePercent = 50.0f;
+        ssd.trimInfo.volumes[0].bTrimSupportedFs = TRUE;
+
+        EvaluateDriveTrimAndCapacity(&ssd);
+        ExpectStr(ssd.trimInfo.szTrimSummary, "Active (NTFS/ReFS)",
+                  "szTrimSummary is 'Active (NTFS/ReFS)' when NTFS volume is read (EN)");
+
+        UiSetLang(UI_LANG_RU);
+        EvaluateDriveTrimAndCapacity(&ssd);
+        ExpectStr(ssd.trimInfo.szTrimSummary, "Активен (NTFS/ReFS)",
+                  "szTrimSummary is 'Активен (NTFS/ReFS)' when NTFS volume is read (RU)");
+    }
+
+    CaseEnd("build-56-regressions", before);
+}
+
+
+
 
 int main(void){
     printf("drivedb_test\n");
@@ -3101,6 +4527,21 @@ int main(void){
     TestVolumeTrimMonitoring();
     TestDramVerification();
     TestCounterfeitDetection();
+    TestLectureUtf8Truncation();
+    TestSataPhyLogParsing();
+    TestDeviceStatisticsParsing();
+    TestAtaLogsIntegration();
+    TestSeagateFarmLogParsing();
+    TestSeagateFarmCounterfeitDetection();
+    TestLegacyUsbBridges();
+    TestCsmiStpPacket();
+    TestDstEngineFormatting();
+    TestBuild51Regressions();
+    TestBuild52Regressions();
+    TestBuild53Regressions();
+    TestBuild54Regressions();
+    TestBuild55Regressions();
+    TestBuild56Regressions();
     if (g_fail) {
         fprintf(stderr, "FAILED %d of %d checks\n", g_fail, g_check);
         return 1;

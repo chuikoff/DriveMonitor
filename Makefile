@@ -28,6 +28,9 @@ SRCS    = $(SRCDIR)/main.cpp \
           $(SRCDIR)/volume_trim.cpp \
           $(SRCDIR)/dram_verify.cpp \
           $(SRCDIR)/counterfeit_detect.cpp \
+          $(SRCDIR)/ata_log.cpp \
+          $(SRCDIR)/csmi.cpp \
+          $(SRCDIR)/dst_engine.cpp \
           $(SRCDIR)/lang.cpp
 
 OBJS    = $(patsubst $(SRCDIR)/%.cpp, $(OBJDIR)/%.o, $(SRCS))
@@ -43,7 +46,7 @@ CFLAGS  = -mwindows -O2 \
           -DWIN32 -D_WIN32 -D_WINDOWS -DNDEBUG \
           -I$(SRCDIR) \
           -finput-charset=UTF-8
-CXXFLAGS += -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion
+CXXFLAGS += -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Wno-gnu-zero-variadic-macro-arguments
 
 # Linker flags:
 #   -static*           : Statically link the C/C++ runtime so the .exe
@@ -71,7 +74,8 @@ DB_TEST_OBJS = $(OBJDIR)/drivedb_test.o $(OBJDIR)/profile.o \
           $(OBJDIR)/ata_smart.o $(OBJDIR)/nvme_smart.o \
           $(OBJDIR)/usb_bridge.o $(OBJDIR)/latency_probe.o \
           $(OBJDIR)/storage_event_log.o $(OBJDIR)/volume_trim.o \
-          $(OBJDIR)/dram_verify.o $(OBJDIR)/counterfeit_detect.o
+          $(OBJDIR)/dram_verify.o $(OBJDIR)/counterfeit_detect.o \
+          $(OBJDIR)/ata_log.o $(OBJDIR)/csmi.o $(OBJDIR)/dst_engine.o
 
 all: $(OUTDIR) $(OBJDIR) $(TARGET)
 	@echo ""

@@ -36,6 +36,8 @@
 #define IDC_REPORT_BTN         1035
 #define IDC_EJECT_BTN          1039
 #define IDC_LATENCY_BTN        1050
+#define IDC_DRAM_VERIFY_BTN    1051
+#define IDC_SELF_TEST_BTN      1052
 #define IDC_MONITOR_STATIC   1048
 #define IDC_DRIVE_BTN_BASE   1100
 #define IDM_ABOUT            2001
@@ -71,6 +73,7 @@
 #define IDM_LATENCY_TEST     2040
 #define IDM_FULL_READ_TEST   2041
 #define IDM_DRAM_VERIFY      2042
+#define IDM_SELF_TEST        2043
 #define IDT_HOTPLUG          3002
 #define IDT_MONITOR          3003
 #define WM_APP_REFRESH_DONE  (WM_APP + 1)
@@ -132,6 +135,7 @@ void    ShowHealthLectureDialog(HWND hParent);
 void    ShowLatencyProbeDialog(HWND hParent, int nDriveIndex);
 void    ShowLatencyProbeDialogEx(HWND hParent, int nDriveIndex, int initialMode);
 void    ShowDramVerifyDialog(HWND hParent, int nDriveIndex);
+void    ShowSelfTestDialog(HWND hParent, int nDriveIndex);
 /* Wheel over the drive column scrolls that column. Other targets keep the message. */
 BOOL    DrivePanelOnMouseWheel(const MSG* msg);
 COLORREF GetHealthStatusColor(DRIVE_HEALTH_STATUS eStatus);

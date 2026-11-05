@@ -28,6 +28,7 @@ using namespace Gdiplus;
 #include "lang.h"
 #include "latency_probe.h"
 #include "dram_verify.h"
+#include "dst_engine.h"
 
 #define DONATE_URL "https://boosty.to/chuikoff"
 
@@ -47,7 +48,7 @@ static unsigned __int64 NVMeRead128Lo(const BYTE* p)
 
 static WORD ReadLE16(const BYTE* p)
 {
-    return (WORD)p[0] | ((WORD)p[1] << 8);
+    return (WORD)((WORD)p[0] | ((WORD)p[1] << 8));
 }
 
 /* NVMe Health Log Data Units: 1 unit = 1000 * 512 = 512000 bytes (NVMe spec).
@@ -65,14 +66,17 @@ static void FormatNvmeHostBytes(unsigned __int64 units, char* szBuf, int nBufLen
 /* USB enclosure/chip name from SCSI INQUIRY; type name / VID:PID fallback.
  * Names come from DetectUsbBridgeType comments — no extra VID table. */
 
-/* ATA SSD: nSSDTotalWritesGB is a profile host/NAND volume, or -1. */
+/* ATA SSD: nSSDTotalWritesGB is a profile host/NAND volume in GiB, or -1.
+ * Standard storage metric (like NVMe and CrystalDiskInfo) uses decimal TB/GB. */
 static void FormatAtaWrites(int nGiB, char* szBuf, int nBufLen)
 {
     if (nGiB < 0) { szBuf[0] = '\0'; return; }
-    if (nGiB >= 1024)
-        safe_snprintf_n(szBuf, nBufLen, TN("%.1f ТБ", "%.1f TB"), (double)nGiB / 1024.0);
+    double bytes = (double)nGiB * 1073741824.0;
+    double tb = bytes / 1e12;
+    if (tb >= 1.0)
+        safe_snprintf_n(szBuf, nBufLen, TN("%.1f ТБ", "%.1f TB"), tb);
     else
-        safe_snprintf_n(szBuf, nBufLen, TN("%d ГБ", "%d GB"), nGiB);
+        safe_snprintf_n(szBuf, nBufLen, TN("%.1f ГБ", "%.1f GB"), bytes / 1e9);
 }
 
 /* Unified SMART headline for every drive type:
@@ -560,13 +564,14 @@ HACCEL UiCreateAccelTable(void)
         { (BYTE)(FVIRTKEY | FCONTROL),           (WORD)VK_NUMPAD0,    IDM_ZOOM_100 },
         { (BYTE)(FVIRTKEY | FCONTROL),           (WORD)'M',           IDM_MONITOR },
         { (BYTE)(FVIRTKEY | FCONTROL),           (WORD)'D',           IDM_DRAM_VERIFY },
+        { (BYTE)(FVIRTKEY | FCONTROL),           (WORD)'T',           IDM_SELF_TEST },
     };
     return CreateAcceleratorTable(a, (int)(sizeof(a) / sizeof(a[0])));
 }
 
 static HFONT UiMakeFont(int px, int weight, BOOL italic)
 {
-    return CreateFontA(-UiScale(px), 0, 0, 0, weight, italic, FALSE, FALSE,
+    return CreateFontA(-UiScale(px), 0, 0, 0, weight, italic ? 1u : 0u, FALSE, FALSE,
                        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
 }
@@ -1314,13 +1319,18 @@ static void SetActionButtonsEnabled(HWND hWnd, BOOL on)
     HWND hReport = GetDlgItem(hWnd, IDC_REPORT_BTN);
     HWND hEject  = GetDlgItem(hWnd, IDC_EJECT_BTN);
     HWND hTest   = GetDlgItem(hWnd, IDC_LATENCY_BTN);
+    HWND hDram   = GetDlgItem(hWnd, IDC_DRAM_VERIFY_BTN);
+    HWND hDst    = GetDlgItem(hWnd, IDC_SELF_TEST_BTN);
     BOOL usb = FALSE;
-    if (on && g_nSelectedDrive >= 0 && g_nSelectedDrive < g_nDriveCount)
+    BOOL hasDrive = (on && g_nSelectedDrive >= 0 && g_nSelectedDrive < g_nDriveCount);
+    if (hasDrive)
         usb = g_Drives[g_nSelectedDrive].bIsUSB;
     if (hReread) EnableWindow(hReread, on);
-    if (hReport) EnableWindow(hReport, on);
+    if (hReport) EnableWindow(hReport, on && hasDrive);
     if (hEject)  EnableWindow(hEject, on && usb);
-    if (hTest)   EnableWindow(hTest, on);
+    if (hTest)   EnableWindow(hTest, hasDrive);
+    if (hDram)   EnableWindow(hDram, hasDrive);
+    if (hDst)    EnableWindow(hDst, hasDrive);
 }
 
 static void DoSafeEject(HWND hWnd)
@@ -2458,7 +2468,8 @@ void UpdateDriveInfo(HWND hWnd, int nDriveIdx)
             brand = "—";
         if (pInfo->bCounterfeitSuspected) {
             char szBrandAlert[128];
-            safe_snprintf(szBrandAlert, "%s %s", brand, TN("⚠️ [ПОДДЕЛКА / РЕМАРК]", "⚠️ [FAKE / RELABELED]"));
+            const char* szBadge = GetCounterfeitBadge(pInfo);
+            safe_snprintf(szBrandAlert, "%s %s", brand, szBadge);
             SetDlgItemTextU8(hWnd, IDC_BRAND_STATIC, szBrandAlert);
         } else {
             SetDlgItemTextU8(hWnd, IDC_BRAND_STATIC, brand);
@@ -2488,6 +2499,8 @@ void UpdateDriveInfo(HWND hWnd, int nDriveIdx)
             } else if (pInfo->trimInfo.nVolumeCount > 0 && pInfo->trimInfo.fMinFreePercent >= 0.0f) {
                 safe_snprintf(szTrimBrief, TN("TRIM: активен (своб. %.0f%%)", "TRIM: active (%.0f%% free)"),
                               (double)pInfo->trimInfo.fMinFreePercent);
+            } else if (pInfo->trimInfo.nVolumeCount == 0) {
+                safe_snprintf(szTrimBrief, "%s", TN("TRIM: активен (тома не прочитаны)", "TRIM: active (volumes not read)"));
             } else {
                 safe_snprintf(szTrimBrief, "%s", TN("TRIM: активен", "TRIM: active"));
             }
@@ -2633,7 +2646,7 @@ void UpdateDriveInfo(HWND hWnd, int nDriveIdx)
         }
     } else if (!pInfo->bSMART_Supported) {
         SetDlgItemTextU8(hWnd, IDC_PREDICT_STATIC, TN(
-            "Не удалось прочитать SMART. Запустите от имени администратора и нажмите «Обновить».",
+            "Не удалось прочитать SMART. Запустите от имени администратора и нажмите «Перечитать».",
             "Could not read SMART. Run as administrator and click Reread."));
     } else {
         /* SMART present: prompt to open the lecture. No NVMe field dump, no %. */
@@ -3135,9 +3148,9 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
     case 0xBC:
     {
         /* Seagate: total, completions over 5 s, completions over 7.5 s. */
-        WORD wTotal = (WORD)pRaw[0] | ((WORD)pRaw[1] << 8);
-        WORD wOver5 = (WORD)pRaw[2] | ((WORD)pRaw[3] << 8);
-        WORD wOver75 = (WORD)pRaw[4] | ((WORD)pRaw[5] << 8);
+        WORD wTotal = ReadLE16(pRaw);
+        WORD wOver5 = ReadLE16(pRaw + 2);
+        WORD wOver75 = ReadLE16(pRaw + 4);
         if (wTotal == 0)
             safe_snprintf(szMain, "%s", TN("0  (ОК)", "0 (OK)"));
         else
@@ -3161,11 +3174,21 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
         break;
 
     case 0xC0:
+    {
+        unsigned long nRetract = (unsigned long)dw32;
+        /* Toshiba/Fujitsu HDDs often duplicate the 16-bit retract count in both words:
+         * 0x01420142 -> 322 retracts, not 21,102,914. */
+        if (((dw32 >> 16) & 0xFFFFu) == (dw32 & 0xFFFFu) && (dw32 & 0xFFFFu) > 0) {
+            nRetract = (unsigned long)w16;
+        } else if (pDrv && (pDrv->eVendor == VENDOR_TOSHIBA || pDrv->eVendor == VENDOR_KIOXIA) && dw32 > 0xFFFFu) {
+            nRetract = (unsigned long)w16;
+        }
         if (DriveTreatsC0AsPowerLoss(pDrv))
-            safe_snprintf(szMain, TN("%lu событий", "%lu events"), (unsigned long)dw32);
+            safe_snprintf(szMain, TN("%lu событий", "%lu events"), nRetract);
         else
-            safe_snprintf(szMain, TN("%lu парковок при выключении", "%lu power-off retracts"), (unsigned long)dw32);
+            safe_snprintf(szMain, TN("%lu парковок при выключении", "%lu power-off retracts"), nRetract);
         break;
+    }
 
     case 0xB7:
         if (dw32 == 0)
@@ -3275,14 +3298,19 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
                     : ScaleAtaHostGiB(pDrv, qw48, bID == 0xF2);
                 if (nGB > 4000000ULL)
                     nGB = 4000000ULL;
-                if (bID == 0xF1)
-                    safe_snprintf(szMain, TN("%llu ГБ записано хостом",
-                                             "%llu GB written by host"),
-                                  (unsigned long long)nGB);
-                else
-                    safe_snprintf(szMain, TN("%llu ГБ прочитано хостом",
-                                             "%llu GB read by host"),
-                                  (unsigned long long)nGB);
+                double bytes = (double)nGB * 1073741824.0;
+                double tb = bytes / 1e12;
+                if (tb >= 1.0) {
+                    if (bID == 0xF1)
+                        safe_snprintf(szMain, TN("%.1f ТБ записано хостом", "%.1f TB written by host"), tb);
+                    else
+                        safe_snprintf(szMain, TN("%.1f ТБ прочитано хостом", "%.1f TB read by host"), tb);
+                } else {
+                    if (bID == 0xF1)
+                        safe_snprintf(szMain, TN("%.1f ГБ записано хостом", "%.1f GB written by host"), bytes / 1e9);
+                    else
+                        safe_snprintf(szMain, TN("%.1f ГБ прочитано хостом", "%.1f GB read by host"), bytes / 1e9);
+                }
                 break;
             }
         }
@@ -3293,30 +3321,32 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
             if ((bID == 0xF1 || bID == 0xF2) &&
                 AttrEncOf(pDrv, bID, &semG, &encG) &&
                 encG == PROF_ENC_GIB && qw48 <= 4000000ULL) {
-                if (bID == 0xF1)
-                    safe_snprintf(szMain, TN("%llu ГиБ записано хостом",
-                                             "%llu GiB written by host"),
-                                  (unsigned long long)qw48);
-                else
-                    safe_snprintf(szMain, TN("%llu ГиБ прочитано хостом",
-                                             "%llu GiB read by host"),
-                                  (unsigned long long)qw48);
+                double bytes = (double)qw48 * 1073741824.0;
+                double tb = bytes / 1e12;
+                if (tb >= 1.0) {
+                    if (bID == 0xF1)
+                        safe_snprintf(szMain, TN("%.1f ТБ записано хостом", "%.1f TB written by host"), tb);
+                    else
+                        safe_snprintf(szMain, TN("%.1f ТБ прочитано хостом", "%.1f TB read by host"), tb);
+                } else {
+                    if (bID == 0xF1)
+                        safe_snprintf(szMain, TN("%.1f ГБ записано хостом", "%.1f GB written by host"), bytes / 1e9);
+                    else
+                        safe_snprintf(szMain, TN("%.1f ГБ прочитано хостом", "%.1f GB read by host"), bytes / 1e9);
+                }
                 break;
             }
         }
         {
             unsigned __int64 nLBA = qw48;
-            unsigned __int64 nBytes = nLBA * 512ULL;
-            if (nBytes >= 1000000000000ULL) {
-                unsigned long long tenths =
-                    (unsigned long long)(nBytes / 100000000000ULL);
-                safe_snprintf(szMain, "%llu LBA  (~%llu.%llu TB)",
-                              (unsigned long long)nLBA,
-                              tenths / 10ULL, tenths % 10ULL);
-            } else if (nBytes >= 1000000000ULL) {
-                safe_snprintf(szMain, "%llu LBA  (~%llu GB)",
-                              (unsigned long long)nLBA,
-                              (unsigned long long)(nBytes / 1000000000ULL));
+            double bytes = (double)nLBA * 512.0;
+            double tb = bytes / 1e12;
+            if (tb >= 1.0) {
+                safe_snprintf(szMain, TN("%llu LBA  (~%.1f ТБ)", "%llu LBA  (~%.1f TB)"),
+                              (unsigned long long)nLBA, tb);
+            } else if (bytes >= 1e9) {
+                safe_snprintf(szMain, TN("%llu LBA  (~%.1f ГБ)", "%llu LBA  (~%.1f GB)"),
+                              (unsigned long long)nLBA, bytes / 1e9);
             } else {
                 safe_snprintf(szMain, "%llu LBA", (unsigned long long)nLBA);
             }
@@ -3381,8 +3411,8 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
             else if (dw32 == 0 && bVal >= 90)
                 safe_snprintf(szMain, "%s", TN("не задан (dummy Value)", "not set (dummy Value)"));
             else if (dw32 == 0)
-                safe_snprintf(szMain, TN("0%%  заявленный остаток ресурса",
-                                         "0%% reported life remaining"));
+                safe_snprintf(szMain, "%s", TN("0%  заявленный остаток ресурса",
+                                               "0% reported life remaining"));
             else
                 safe_snprintf(szMain, "%lu", (unsigned long)dw32);
         } else if (have9 && enc9 == PROF_ENC_PERCENT && dw32 <= 100) {
@@ -3535,12 +3565,16 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
         int encE1 = PROF_ENC_NONE;
         if (AttrEncOf(pDrv, bID, NULL, &encE1) && encE1 == PROF_ENC_BLOCK32) {
             unsigned __int64 nGiB = ((unsigned __int64)dw32 * 32ULL) / 1024ULL;
-            if (nGiB >= 1024ULL)
-                safe_snprintf(szMain, "%lu единиц (32 MiB)  (~%llu TB)",
-                              (unsigned long)dw32, (unsigned long long)(nGiB / 1024ULL));
+            double bytes = (double)nGiB * 1073741824.0;
+            double tb = bytes / 1e12;
+            if (tb >= 1.0)
+                safe_snprintf(szMain, TN("%lu единиц (32 MiB)  (~%.1f ТБ)",
+                                         "%lu units (32 MiB)  (~%.1f TB)"),
+                              (unsigned long)dw32, tb);
             else
-                safe_snprintf(szMain, "%lu единиц (32 MiB)  (~%llu GiB)",
-                              (unsigned long)dw32, (unsigned long long)nGiB);
+                safe_snprintf(szMain, TN("%lu единиц (32 MiB)  (~%.1f ГБ)",
+                                         "%lu units (32 MiB)  (~%.1f GB)"),
+                              (unsigned long)dw32, bytes / 1e9);
             break;
         }
         safe_snprintf(szMain, "%lu", (unsigned long)dw32);
@@ -3576,11 +3610,14 @@ static void FormatSmartValue(BYTE bID, BYTE* pRaw,
     case 0xF6:
         if (eCtl == CONTROLLER_MICRON) {
             unsigned __int64 nLBA = qw48;
-            unsigned __int64 nGB  = nLBA / (1024ULL * 1024ULL * 2ULL);
-            if (nGB >= 1024)
-                safe_snprintf(szMain, "%llu LBA  (~%llu TB)", (unsigned long long)nLBA, (unsigned long long)(nGB / 1024ULL));
-            else if (nGB > 0)
-                safe_snprintf(szMain, "%llu LBA  (~%llu GB)", (unsigned long long)nLBA, (unsigned long long)nGB);
+            double bytes = (double)nLBA * 512.0;
+            double tb = bytes / 1e12;
+            if (tb >= 1.0)
+                safe_snprintf(szMain, TN("%llu LBA  (~%.1f ТБ)", "%llu LBA  (~%.1f TB)"),
+                              (unsigned long long)nLBA, tb);
+            else if (bytes >= 1e9)
+                safe_snprintf(szMain, TN("%llu LBA  (~%.1f ГБ)", "%llu LBA  (~%.1f GB)"),
+                              (unsigned long long)nLBA, bytes / 1e9);
             else
                 safe_snprintf(szMain, "%llu LBA", (unsigned long long)nLBA);
             break;
@@ -3713,7 +3750,7 @@ static const char* AtaRowStatus(const DRIVE_INFO* p, const SMART_ATTRIBUTE* a,
     }
     if (id == 0xC0 && DriveTreatsC0AsPowerLoss(p))
         return (GetRawValue(a->bRawValue) > 0) ? "журнал питания" : "ОК";
-    if (ssd && id == 0xAE && GetRawValue(a->bRawValue) > 0)
+    if (ssd && id == 0xAE && GetRawValue(a->bRawValue) > 0 && IsPowerLossAttrConfirmed(p, 0xAE))
         return "журнал питания";
     if (ssd && id == 0xA0 && p->eController == CONTROLLER_PHISON && GetRawValue(a->bRawValue) > 0)
         return "журнал питания";
@@ -3835,7 +3872,7 @@ void UpdateAttrList(HWND hWnd, int nDriveIdx)
         char szCCT[32], szCCTRaw[16];
 
         safe_snprintf(szCritRaw, "%u", (unsigned)pLog->CriticalWarning);
-        if (pLog->CriticalWarning == 0) safe_snprintf(szCrit, TN("0 (нет)", "0 (none)"));
+        if (pLog->CriticalWarning == 0) safe_snprintf(szCrit, "%s", TN("0 (нет)", "0 (none)"));
         else safe_snprintf(szCrit, "0x%02X (!)", pLog->CriticalWarning);
         NVME_ROW("01h", TN("Критическое предупреждение", "Critical warning"),
                  szCrit, szCritRaw, (pLog->CriticalWarning?"ПЛОХО":"ОК"));
@@ -4218,6 +4255,7 @@ void RefreshData(HWND hWnd)
 
 #define PROP_ABOUT_FONT_BOLD  "dmFntB"
 #define PROP_ABOUT_FONT_LINK  "dmFntL"
+#define PROP_ABOUT_ICON       "dmIco"
 
 static HCURSOR s_hCursorHand = NULL;
 
@@ -4256,7 +4294,10 @@ static LRESULT CALLBACK AboutDlgProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM
                 hDlg, (HMENU)0, g_hInst, NULL);
             HICON hIc = (HICON)LoadImageA(g_hInst, MAKEINTRESOURCEA(IDI_APPICON),
                 IMAGE_ICON, ico, ico, LR_DEFAULTCOLOR);
-            if (hIc) SendMessageA(hIco, STM_SETICON, (WPARAM)hIc, 0);
+            if (hIc) {
+                SendMessageA(hIco, STM_SETICON, (WPARAM)hIc, 0);
+                SetPropA(hDlg, PROP_ABOUT_ICON, (HANDLE)hIc);
+            }
 
             HFONT hFontBold = UiMakeFont(15, FW_BOLD, FALSE);
             SetPropA(hDlg, PROP_ABOUT_FONT_BOLD, (HANDLE)hFontBold);
@@ -4396,8 +4437,10 @@ static LRESULT CALLBACK AboutDlgProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM
         {
             HFONT hBold = (HFONT)GetPropA(hDlg, PROP_ABOUT_FONT_BOLD);
             HFONT hLink = (HFONT)GetPropA(hDlg, PROP_ABOUT_FONT_LINK);
+            HICON hIco  = (HICON)GetPropA(hDlg, PROP_ABOUT_ICON);
             if (hBold) { DeleteObject(hBold); RemovePropA(hDlg, PROP_ABOUT_FONT_BOLD); }
             if (hLink) { DeleteObject(hLink); RemovePropA(hDlg, PROP_ABOUT_FONT_LINK); }
+            if (hIco)  { DestroyIcon(hIco);   RemovePropA(hDlg, PROP_ABOUT_ICON); }
         }
         return 0;
     }
@@ -4460,7 +4503,7 @@ void ShowAboutDialog(HWND hWndParent)
     SendMessageA(hDlg, WM_SETICON, ICON_BIG,   (LPARAM)hIco);
     SendMessageA(hDlg, WM_SETICON, ICON_SMALL, (LPARAM)
         LoadImageA(g_hInst, MAKEINTRESOURCEA(IDI_APPICON),
-                   IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR));
+                   IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR | LR_SHARED));
 
     ShowWindow(hDlg, SW_SHOW);
     UpdateWindow(hDlg);
@@ -4619,7 +4662,7 @@ void ShowHealthLectureDialog(HWND hParent)
         LoadIconA(g_hInst, MAKEINTRESOURCEA(IDI_APPICON)));
     SendMessageA(hDlg, WM_SETICON, ICON_SMALL, (LPARAM)
         LoadImageA(g_hInst, MAKEINTRESOURCEA(IDI_APPICON),
-                   IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR));
+                   IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR | LR_SHARED));
 
     ShowWindow(hDlg, SW_SHOW);
     UpdateWindow(hDlg);
@@ -4636,6 +4679,7 @@ static void CreateMenuBar(HWND hWnd)
     AppendMenuU8(hFile, MF_STRING, IDM_LATENCY_TEST, TN("Экспресс-тест отклика...", "Express Latency Probe..."));
     AppendMenuU8(hFile, MF_STRING, IDM_FULL_READ_TEST, TN("Полный тест скорости чтения...", "Full Read Speed Benchmark..."));
     AppendMenuU8(hFile, MF_STRING, IDM_DRAM_VERIFY, TN("Тест буфера DRAM (Read-After-Write)...\tCtrl+D", "DRAM Buffer Test (Read-After-Write)...\tCtrl+D"));
+    AppendMenuU8(hFile, MF_STRING, IDM_SELF_TEST, TN("Самодиагностика накопителя (DST)...\tCtrl+T", "Drive Self-Test (DST)...\tCtrl+T"));
     AppendMenuU8(hFile, MF_STRING, IDM_EJECT,      Tr(STR_EJECT_USB));
     AppendMenuU8(hFile, MF_STRING, IDM_SCREENSHOT, Tr(STR_SAVE_SHOT));
     AppendMenuU8(hFile, MF_SEPARATOR, 0, NULL);
@@ -4723,6 +4767,8 @@ static void ApplyUiLanguage(HWND hWnd)
     SetDlgItemTextU8(hWnd, IDC_REPORT_BTN, Tr(STR_REPORT_BTN));
     SetDlgItemTextU8(hWnd, IDC_EJECT_BTN, Tr(STR_EJECT_BTN));
     SetDlgItemTextU8(hWnd, IDC_LATENCY_BTN, TN("Тест чтения", "Read Test"));
+    SetDlgItemTextU8(hWnd, IDC_DRAM_VERIFY_BTN, TN("Тест DRAM", "DRAM Test"));
+    SetDlgItemTextU8(hWnd, IDC_SELF_TEST_BTN, TN("Тест DST", "Self-Test"));
     SetDlgItemTextU8(hWnd, IDC_AXIS_MEDIA_L, Tr(STR_MEDIA));
     SetDlgItemTextU8(hWnd, IDC_AXIS_IFACE_L, Tr(STR_INTERFACE));
     SetDlgItemTextU8(hWnd, IDC_AXIS_TEMPA_L, Tr(STR_TEMPERATURE));
@@ -4824,6 +4870,16 @@ void CreateControls(HWND hWnd)
         nRightX + 100, 138, 90, 24,
         hWnd, (HMENU)IDC_LATENCY_BTN, g_hInst, NULL);
       SendMessage(h, WM_SETFONT, (WPARAM)g_hFontSmall, TRUE); }
+    { HWND h = CreateWindowExU8(0, "BUTTON", TN("Тест DRAM", "DRAM Test"),
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        nRightX, 166, 90, 24,
+        hWnd, (HMENU)IDC_DRAM_VERIFY_BTN, g_hInst, NULL);
+      SendMessage(h, WM_SETFONT, (WPARAM)g_hFontSmall, TRUE); }
+    { HWND h = CreateWindowExU8(0, "BUTTON", TN("Тест DST", "Self-Test"),
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        nRightX + 100, 166, 90, 24,
+        hWnd, (HMENU)IDC_SELF_TEST_BTN, g_hInst, NULL);
+      SendMessage(h, WM_SETFONT, (WPARAM)g_hFontSmall, TRUE); }
 
     {
         static const struct { int idL; int idV; int sid; } ax[] = {
@@ -4834,14 +4890,14 @@ void CreateControls(HWND hWnd)
         };
         int i;
         for (i = 0; i < 4; i++) {
-            int y = 166 + 16 * i;
+            int y = 194 + 15 * i;
             HWND hL = CreateWindowExU8(0, "STATIC", Tr(ax[i].sid),
                 WS_CHILD | WS_VISIBLE | SS_LEFT,
-                nRightX, y, 78, 16,
+                nRightX, y, 78, 15,
                 hWnd, (HMENU)(UINT_PTR)ax[i].idL, g_hInst, NULL);
             HWND hV = CreateWindowExU8(0, "STATIC", "",
                 WS_CHILD | WS_VISIBLE | SS_LEFT,
-                nRightX + 80, y, nBarsW - 80, 16,
+                nRightX + 80, y, nBarsW - 80, 15,
                 hWnd, (HMENU)(UINT_PTR)ax[i].idV, g_hInst, NULL);
             SendMessage(hL, WM_SETFONT, (WPARAM)g_hFontSmall, TRUE);
             SendMessage(hV, WM_SETFONT, (WPARAM)g_hFontSmall, TRUE);
@@ -5086,10 +5142,14 @@ static void LayoutMainWindow(HWND hWnd)
         HWND hReport = GetDlgItem(hWnd, IDC_REPORT_BTN);
         HWND hEject  = GetDlgItem(hWnd, IDC_EJECT_BTN);
         HWND hTest   = GetDlgItem(hWnd, IDC_LATENCY_BTN);
+        HWND hDram   = GetDlgItem(hWnd, IDC_DRAM_VERIFY_BTN);
+        HWND hDst    = GetDlgItem(hWnd, IDC_SELF_TEST_BTN);
         if (hReread) SetWindowPos(hReread, NULL, nRightX, UiScale(110), UiScale(90), UiScale(24), SWP_NOZORDER);
         if (hReport) SetWindowPos(hReport, NULL, nRightX + UiScale(100), UiScale(110), UiScale(90), UiScale(24), SWP_NOZORDER);
         if (hEject)  SetWindowPos(hEject,  NULL, nRightX, UiScale(138), UiScale(90), UiScale(24), SWP_NOZORDER);
         if (hTest)   SetWindowPos(hTest,   NULL, nRightX + UiScale(100), UiScale(138), UiScale(90), UiScale(24), SWP_NOZORDER);
+        if (hDram)   SetWindowPos(hDram,   NULL, nRightX, UiScale(166), UiScale(90), UiScale(24), SWP_NOZORDER);
+        if (hDst)    SetWindowPos(hDst,    NULL, nRightX + UiScale(100), UiScale(166), UiScale(90), UiScale(24), SWP_NOZORDER);
         {
             int axL[] = { IDC_AXIS_MEDIA_L, IDC_AXIS_IFACE_L,
                           IDC_AXIS_TEMPA_L, IDC_AXIS_ROW4_L };
@@ -5099,9 +5159,9 @@ static void LayoutMainWindow(HWND hWnd)
             for (ai = 0; ai < 4; ai++) {
                 HWND hL = GetDlgItem(hWnd, axL[ai]);
                 HWND hV = GetDlgItem(hWnd, axV[ai]);
-                int y = UiScale(166) + UiScale(16) * ai;
-                if (hL) SetWindowPos(hL, NULL, nRightX, y, UiScale(78), UiScale(16), SWP_NOZORDER);
-                if (hV) SetWindowPos(hV, NULL, nRightX + UiScale(80), y, nBarsW - UiScale(80), UiScale(16), SWP_NOZORDER);
+                int y = UiScale(194) + UiScale(15) * ai;
+                if (hL) SetWindowPos(hL, NULL, nRightX, y, UiScale(78), UiScale(15), SWP_NOZORDER);
+                if (hV) SetWindowPos(hV, NULL, nRightX + UiScale(80), y, nBarsW - UiScale(80), UiScale(15), SWP_NOZORDER);
             }
         }
     }
@@ -5436,8 +5496,11 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             else if (nCtrl == IDM_FULL_READ_TEST) {
                 ShowLatencyProbeDialogEx(hWnd, g_nSelectedDrive, LATENCY_MODE_FULL);
             }
-            else if (nCtrl == IDM_DRAM_VERIFY) {
+            else if (nCtrl == IDC_DRAM_VERIFY_BTN || nCtrl == IDM_DRAM_VERIFY) {
                 ShowDramVerifyDialog(hWnd, g_nSelectedDrive);
+            }
+            else if (nCtrl == IDC_SELF_TEST_BTN || nCtrl == IDM_SELF_TEST) {
+                ShowSelfTestDialog(hWnd, g_nSelectedDrive);
             }
 
 
@@ -7054,6 +7117,508 @@ void ShowDramVerifyDialog(HWND hParent, int nDriveIndex)
     HWND hDlg = CreateWindowExW(
         0,
         L"DriveMonitorDramVerifyDlg",
+        wzTitle,
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        nX, nY,
+        rcAdj.right - rcAdj.left,
+        rcAdj.bottom - rcAdj.top,
+        hParent,
+        NULL,
+        g_hInst,
+        (LPVOID)pState
+    );
+
+    if (hDlg) {
+        ShowWindow(hDlg, SW_SHOW);
+        UpdateWindow(hDlg);
+    }
+}
+
+/* ============================================================================
+ * Hardware Self-Test (DST) and Error Log History Dialog
+ * ============================================================================ */
+
+#define IDC_DST_BANNER         7001
+#define IDC_DST_CAPS_LBL       7002
+#define IDC_DST_PROGRESS       7003
+#define IDC_DST_STATUS_TEXT    7004
+#define IDC_DST_SHORT_BTN      7005
+#define IDC_DST_EXT_BTN        7006
+#define IDC_DST_ABORT_BTN      7007
+#define IDC_DST_VIEW_DST       7008
+#define IDC_DST_VIEW_ERR       7009
+#define IDC_DST_LOG_BOX        7010
+#define IDC_DST_REFRESH_BTN    7011
+#define IDC_DST_COPY_BTN       7012
+#define IDC_DST_CLOSE_BTN      7013
+
+#define IDT_DST_POLL_TIMER     8001
+
+typedef struct _DST_DLG_STATE {
+    HWND        hDlg;
+    int         nDriveIndex;
+    char        szModel[64];
+    char        szSerial[64];
+    bool        bIsNvme;
+    bool        bIsSsd;
+    bool        bSelfTestSupported;
+    int         nShortMinutes;
+    int         nExtMinutes;
+    bool        bRunning;
+    bool        bShowingErrorLog;
+    DST_PROGRESS lastProgress;
+    HFONT       hFontMono;
+} DST_DLG_STATE;
+
+static void UpdateDstLogDisplay(HWND hDlg, DST_DLG_STATE* pState)
+{
+    if (!pState || pState->nDriveIndex < 0 || pState->nDriveIndex >= g_nDriveCount)
+        return;
+    const DRIVE_INFO* pInfo = &g_Drives[pState->nDriveIndex];
+    char* pBuf = (char*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 32768);
+    if (!pBuf) return;
+
+    if (pState->bShowingErrorLog) {
+        DstFormatErrorLogHistory(pInfo, pBuf, 32768);
+    } else {
+        DstFormatSelfTestHistory(pInfo, pBuf, 32768);
+    }
+    SetDlgItemTextU8(hDlg, IDC_DST_LOG_BOX, pBuf);
+    HeapFree(GetProcessHeap(), 0, pBuf);
+}
+
+static void RefreshDstLogsFromDrive(HWND hDlg, DST_DLG_STATE* pState)
+{
+    if (!pState || pState->nDriveIndex < 0 || pState->nDriveIndex >= g_nDriveCount)
+        return;
+    DRIVE_INFO* pInfo = &g_Drives[pState->nDriveIndex];
+    HANDLE hDrive = INVALID_HANDLE_VALUE;
+    if (OpenDrive(pInfo->nDriveIndex, &hDrive)) {
+        if (pInfo->bIsNVMe) {
+            DstQueryNvmeLogs(hDrive, pInfo);
+        } else {
+            DstQueryAtaLogs(hDrive, pInfo);
+        }
+        CloseHandle(hDrive);
+    }
+    UpdateDstLogDisplay(hDlg, pState);
+}
+
+static LRESULT CALLBACK DstDlgProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
+    switch (uMsg) {
+    case WM_CREATE:
+    {
+        CREATESTRUCTW* cs = (CREATESTRUCTW*)lParam;
+        DST_DLG_STATE* pState = (DST_DLG_STATE*)cs->lpCreateParams;
+        if (!pState) return -1;
+        pState->hDlg = hDlg;
+        SetPropA(hDlg, "DM_DST_STATE", (HANDLE)pState);
+
+        RECT rcClient;
+        GetClientRect(hDlg, &rcClient);
+        int w = rcClient.right - rcClient.left;
+
+        /* Create monospaced font for logs */
+        pState->hFontMono = CreateFontW(-UiScale(12), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+            FIXED_PITCH | FF_MODERN, L"Consolas");
+
+        /* Title banner */
+        HWND hBanner = CreateWindowExU8(0, "STATIC",
+            TN("Аппаратная самодиагностика накопителя (DST)", "Hardware Drive Self-Test (DST)"),
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            UiScale(20), UiScale(12), w - UiScale(40), UiScale(24),
+            hDlg, (HMENU)IDC_DST_BANNER, g_hInst, NULL);
+        SendMessage(hBanner, WM_SETFONT, (WPARAM)g_hFontTitle, TRUE);
+
+        /* Capabilities / drive summary label */
+        char szCaps[512];
+        const DRIVE_INFO* pInfo = &g_Drives[pState->nDriveIndex];
+        if (pState->bIsNvme) {
+            safe_snprintf(szCaps, "%s: %s | NVMe | %s: %s",
+                TN("Модель", "Model"), pState->szModel,
+                TN("DST", "DST"),
+                pState->bSelfTestSupported ?
+                    TN("Поддерживается контроллером (Короткий ~2 мин, Расширенный ~30+ мин)",
+                       "Supported by controller (Short ~2 min, Extended ~30+ min)") :
+                    TN("Не заявлена контроллером (OACS bit 4)", "Not reported by controller (OACS bit 4)"));
+        } else {
+            safe_snprintf(szCaps, "%s: %s | %s | %s: %s",
+                TN("Модель", "Model"), pState->szModel,
+                pState->bIsSsd ? "SATA SSD" : "SATA HDD",
+                TN("DST", "DST"),
+                pState->bSelfTestSupported ?
+                    TN("Поддерживается (Короткий ~1-2 мин, Расширенный доступен)",
+                       "Supported (Short ~1-2 min, Extended available)") :
+                    TN("Не заявлена (Identify word 84/87)", "Not reported (Identify word 84/87)"));
+        }
+
+        HWND hCaps = CreateWindowExU8(0, "STATIC", szCaps,
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            UiScale(20), UiScale(38), w - UiScale(40), UiScale(20),
+            hDlg, (HMENU)IDC_DST_CAPS_LBL, g_hInst, NULL);
+        SendMessage(hCaps, WM_SETFONT, (WPARAM)g_hFontSmall, TRUE);
+
+        /* Test initiation buttons */
+        HWND hShortBtn = CreateWindowExU8(0, "BUTTON",
+            TN("Короткий тест (~2 мин)", "Short Test (~2 min)"),
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            UiScale(20), UiScale(66), UiScale(170), UiScale(28),
+            hDlg, (HMENU)IDC_DST_SHORT_BTN, g_hInst, NULL);
+        SendMessage(hShortBtn, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+
+        HWND hExtBtn = CreateWindowExU8(0, "BUTTON",
+            TN("Расширенный тест", "Extended Test"),
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            UiScale(200), UiScale(66), UiScale(160), UiScale(28),
+            hDlg, (HMENU)IDC_DST_EXT_BTN, g_hInst, NULL);
+        SendMessage(hExtBtn, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+
+        HWND hAbortBtn = CreateWindowExU8(0, "BUTTON",
+            TN("Прервать тест", "Abort Test"),
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            UiScale(370), UiScale(66), UiScale(130), UiScale(28),
+            hDlg, (HMENU)IDC_DST_ABORT_BTN, g_hInst, NULL);
+        SendMessage(hAbortBtn, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+        EnableWindow(hAbortBtn, FALSE);
+
+        /* Progress Bar */
+        HWND hProg = CreateWindowExW(0, PROGRESS_CLASSW, L"",
+            WS_CHILD | WS_VISIBLE | PBS_SMOOTH,
+            UiScale(20), UiScale(104), w - UiScale(40), UiScale(20),
+            hDlg, (HMENU)IDC_DST_PROGRESS, g_hInst, NULL);
+        SendMessage(hProg, PBM_SETRANGE32, 0, 100);
+
+        /* Status Text */
+        HWND hStatus = CreateWindowExU8(0, "STATIC",
+            TN("Готов к запуску теста.", "Ready to start self-test."),
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            UiScale(20), UiScale(130), w - UiScale(40), UiScale(20),
+            hDlg, (HMENU)IDC_DST_STATUS_TEXT, g_hInst, NULL);
+        SendMessage(hStatus, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+
+        /* Radio buttons for log views */
+        HWND hRadDst = CreateWindowExU8(0, "BUTTON",
+            TN("Журнал самотестирования (Self-Test Log)", "Self-Test Log"),
+            WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_GROUP,
+            UiScale(20), UiScale(158), UiScale(260), UiScale(22),
+            hDlg, (HMENU)IDC_DST_VIEW_DST, g_hInst, NULL);
+        SendMessage(hRadDst, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+
+        HWND hRadErr = CreateWindowExU8(0, "BUTTON",
+            TN("Аппаратный журнал ошибок (Error Log)", "Hardware Error Log"),
+            WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON,
+            UiScale(290), UiScale(158), UiScale(260), UiScale(22),
+            hDlg, (HMENU)IDC_DST_VIEW_ERR, g_hInst, NULL);
+        SendMessage(hRadErr, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+
+        CheckRadioButton(hDlg, IDC_DST_VIEW_DST, IDC_DST_VIEW_ERR, IDC_DST_VIEW_DST);
+
+        /* Multiline Edit Control for Logs */
+        HWND hLog = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
+            UiScale(20), UiScale(186), w - UiScale(40), UiScale(320),
+            hDlg, (HMENU)IDC_DST_LOG_BOX, g_hInst, NULL);
+        if (pState->hFontMono) {
+            SendMessage(hLog, WM_SETFONT, (WPARAM)pState->hFontMono, TRUE);
+        }
+
+        /* Bottom action buttons */
+        HWND hRefresh = CreateWindowExU8(0, "BUTTON",
+            TN("Перечитать журналы", "Refresh Logs"),
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            UiScale(20), UiScale(518), UiScale(160), UiScale(28),
+            hDlg, (HMENU)IDC_DST_REFRESH_BTN, g_hInst, NULL);
+        SendMessage(hRefresh, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+
+        HWND hCopy = CreateWindowExU8(0, "BUTTON",
+            TN("Копировать в буфер", "Copy to Clipboard"),
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            UiScale(190), UiScale(518), UiScale(160), UiScale(28),
+            hDlg, (HMENU)IDC_DST_COPY_BTN, g_hInst, NULL);
+        SendMessage(hCopy, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+
+        HWND hClose = CreateWindowExU8(0, "BUTTON",
+            TN("Закрыть", "Close"),
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            w - UiScale(130), UiScale(518), UiScale(110), UiScale(28),
+            hDlg, (HMENU)IDC_DST_CLOSE_BTN, g_hInst, NULL);
+        SendMessage(hClose, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+
+        /* Initial check if test is running */
+        HANDLE hDrive = INVALID_HANDLE_VALUE;
+        if (OpenDrive(pInfo->nDriveIndex, &hDrive)) {
+            DST_PROGRESS initProg;
+            DstPollProgress(hDrive, (DRIVE_INFO*)pInfo, &initProg);
+            CloseHandle(hDrive);
+            if (initProg.bRunning) {
+                pState->bRunning = true;
+                SendMessage(hProg, PBM_SETPOS, (WPARAM)initProg.nPercentComplete, 0);
+                SetDlgItemTextU8(hDlg, IDC_DST_STATUS_TEXT, initProg.szStatusText);
+                EnableWindow(hShortBtn, FALSE);
+                EnableWindow(hExtBtn, FALSE);
+                EnableWindow(hAbortBtn, TRUE);
+                SetTimer(hDlg, IDT_DST_POLL_TIMER, 1000, NULL);
+            }
+        }
+
+        /* Query logs and populate edit box */
+        RefreshDstLogsFromDrive(hDlg, pState);
+
+        return 0;
+    }
+
+    case WM_TIMER:
+    {
+        if (wParam == IDT_DST_POLL_TIMER) {
+            DST_DLG_STATE* pState = (DST_DLG_STATE*)GetPropA(hDlg, "DM_DST_STATE");
+            if (!pState || pState->nDriveIndex < 0 || pState->nDriveIndex >= g_nDriveCount)
+                return 0;
+            DRIVE_INFO* pInfo = &g_Drives[pState->nDriveIndex];
+            HANDLE hDrive = INVALID_HANDLE_VALUE;
+            if (OpenDrive(pInfo->nDriveIndex, &hDrive)) {
+                DST_PROGRESS prog;
+                DstPollProgress(hDrive, pInfo, &prog);
+                CloseHandle(hDrive);
+
+                SendMessage(GetDlgItem(hDlg, IDC_DST_PROGRESS), PBM_SETPOS, (WPARAM)prog.nPercentComplete, 0);
+                SetDlgItemTextU8(hDlg, IDC_DST_STATUS_TEXT, prog.szStatusText);
+
+                if (!prog.bRunning) {
+                    pState->bRunning = false;
+                    KillTimer(hDlg, IDT_DST_POLL_TIMER);
+                    EnableWindow(GetDlgItem(hDlg, IDC_DST_SHORT_BTN), TRUE);
+                    EnableWindow(GetDlgItem(hDlg, IDC_DST_EXT_BTN), TRUE);
+                    EnableWindow(GetDlgItem(hDlg, IDC_DST_ABORT_BTN), FALSE);
+                    RefreshDstLogsFromDrive(hDlg, pState);
+                }
+            }
+        }
+        return 0;
+    }
+
+    case WM_COMMAND:
+    {
+        int id = LOWORD(wParam);
+        DST_DLG_STATE* pState = (DST_DLG_STATE*)GetPropA(hDlg, "DM_DST_STATE");
+        if (!pState || pState->nDriveIndex < 0 || pState->nDriveIndex >= g_nDriveCount)
+            return 0;
+        DRIVE_INFO* pInfo = &g_Drives[pState->nDriveIndex];
+
+        if (id == IDC_DST_SHORT_BTN) {
+            HANDLE hDrive = INVALID_HANDLE_VALUE;
+            if (OpenDrive(pInfo->nDriveIndex, &hDrive)) {
+                char szErr[256];
+                if (DstStartSelfTest(hDrive, pInfo, DST_TEST_SHORT, szErr, sizeof(szErr))) {
+                    pState->bRunning = true;
+                    EnableWindow(GetDlgItem(hDlg, IDC_DST_SHORT_BTN), FALSE);
+                    EnableWindow(GetDlgItem(hDlg, IDC_DST_EXT_BTN), FALSE);
+                    EnableWindow(GetDlgItem(hDlg, IDC_DST_ABORT_BTN), TRUE);
+                    SendMessage(GetDlgItem(hDlg, IDC_DST_PROGRESS), PBM_SETPOS, 0, 0);
+                    SetDlgItemTextU8(hDlg, IDC_DST_STATUS_TEXT,
+                        TN("Короткий тест запущен (фоновый режим)...", "Short self-test started (background mode)..."));
+                    SetTimer(hDlg, IDT_DST_POLL_TIMER, 1000, NULL);
+                } else {
+                    MessageBoxU8(hDlg, szErr, "DriveMonitor", MB_OK | MB_ICONWARNING);
+                }
+                CloseHandle(hDrive);
+            }
+        }
+        else if (id == IDC_DST_EXT_BTN) {
+            int ret = MessageBoxU8(hDlg,
+                TN("Расширенный тест выполняет полное сканирование всей поверхности накопителя.\n"
+                   "Это может занять от 30 минут до нескольких часов в фоновом режиме.\n\n"
+                   "Запустить расширенное самотестирование?",
+                   "Extended test performs full surface scanning across the drive.\n"
+                   "This may take from 30 minutes to several hours in the background.\n\n"
+                   "Start extended self-test?"),
+                "DriveMonitor", MB_YESNO | MB_ICONQUESTION);
+            if (ret == IDYES) {
+                HANDLE hDrive = INVALID_HANDLE_VALUE;
+                if (OpenDrive(pInfo->nDriveIndex, &hDrive)) {
+                    char szErr[256];
+                    if (DstStartSelfTest(hDrive, pInfo, DST_TEST_EXTENDED, szErr, sizeof(szErr))) {
+                        pState->bRunning = true;
+                        EnableWindow(GetDlgItem(hDlg, IDC_DST_SHORT_BTN), FALSE);
+                        EnableWindow(GetDlgItem(hDlg, IDC_DST_EXT_BTN), FALSE);
+                        EnableWindow(GetDlgItem(hDlg, IDC_DST_ABORT_BTN), TRUE);
+                        SendMessage(GetDlgItem(hDlg, IDC_DST_PROGRESS), PBM_SETPOS, 0, 0);
+                        SetDlgItemTextU8(hDlg, IDC_DST_STATUS_TEXT,
+                            TN("Расширенный тест запущен...", "Extended self-test started..."));
+                        SetTimer(hDlg, IDT_DST_POLL_TIMER, 1000, NULL);
+                    } else {
+                        MessageBoxU8(hDlg, szErr, "DriveMonitor", MB_OK | MB_ICONWARNING);
+                    }
+                    CloseHandle(hDrive);
+                }
+            }
+        }
+        else if (id == IDC_DST_ABORT_BTN) {
+            HANDLE hDrive = INVALID_HANDLE_VALUE;
+            if (OpenDrive(pInfo->nDriveIndex, &hDrive)) {
+                char szErr[256];
+                if (DstAbortSelfTest(hDrive, pInfo, szErr, sizeof(szErr))) {
+                    pState->bRunning = false;
+                    KillTimer(hDlg, IDT_DST_POLL_TIMER);
+                    EnableWindow(GetDlgItem(hDlg, IDC_DST_SHORT_BTN), TRUE);
+                    EnableWindow(GetDlgItem(hDlg, IDC_DST_EXT_BTN), TRUE);
+                    EnableWindow(GetDlgItem(hDlg, IDC_DST_ABORT_BTN), FALSE);
+                    SetDlgItemTextU8(hDlg, IDC_DST_STATUS_TEXT,
+                        TN("Тест остановлен пользователем.", "Self-test aborted by user."));
+                    RefreshDstLogsFromDrive(hDlg, pState);
+                } else {
+                    MessageBoxU8(hDlg, szErr, "DriveMonitor", MB_OK | MB_ICONWARNING);
+                }
+                CloseHandle(hDrive);
+            }
+        }
+        else if (id == IDC_DST_VIEW_DST) {
+            pState->bShowingErrorLog = false;
+            CheckRadioButton(hDlg, IDC_DST_VIEW_DST, IDC_DST_VIEW_ERR, IDC_DST_VIEW_DST);
+            UpdateDstLogDisplay(hDlg, pState);
+        }
+        else if (id == IDC_DST_VIEW_ERR) {
+            pState->bShowingErrorLog = true;
+            CheckRadioButton(hDlg, IDC_DST_VIEW_DST, IDC_DST_VIEW_ERR, IDC_DST_VIEW_ERR);
+            UpdateDstLogDisplay(hDlg, pState);
+        }
+        else if (id == IDC_DST_REFRESH_BTN) {
+            RefreshDstLogsFromDrive(hDlg, pState);
+        }
+        else if (id == IDC_DST_COPY_BTN) {
+            char* pBuf = (char*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 32768);
+            if (pBuf) {
+                if (pState->bShowingErrorLog) {
+                    DstFormatErrorLogHistory(pInfo, pBuf, 32768);
+                } else {
+                    DstFormatSelfTestHistory(pInfo, pBuf, 32768);
+                }
+                CopyTextToClipboard(hDlg, pBuf);
+                HeapFree(GetProcessHeap(), 0, pBuf);
+                MessageBoxU8(hDlg,
+                    TN("Журнал скопирован в буфер обмена.", "Log copied to clipboard."),
+                    "DriveMonitor", MB_OK | MB_ICONINFORMATION);
+            }
+        }
+        else if (id == IDC_DST_CLOSE_BTN || id == IDCANCEL) {
+            SendMessage(hDlg, WM_CLOSE, 0, 0);
+        }
+        return 0;
+    }
+
+    case WM_CLOSE:
+    {
+        DST_DLG_STATE* pState = (DST_DLG_STATE*)GetPropA(hDlg, "DM_DST_STATE");
+        if (pState && pState->bRunning) {
+            int ret = MessageBoxU8(hDlg,
+                TN("Тест всё ещё выполняется в контроллере накопителя.\n"
+                   "Закрыть диалог? (Проверка продолжит выполняться внутри диска)",
+                   "Self-test is still executing in the drive controller.\n"
+                   "Close dialog? (The test will continue running inside the drive)"),
+                "DriveMonitor", MB_YESNO | MB_ICONQUESTION);
+            if (ret != IDYES) return 0;
+        }
+        KillTimer(hDlg, IDT_DST_POLL_TIMER);
+        DestroyWindow(hDlg);
+        return 0;
+    }
+
+    case WM_DESTROY:
+    {
+        DST_DLG_STATE* pState = (DST_DLG_STATE*)GetPropA(hDlg, "DM_DST_STATE");
+        RemovePropA(hDlg, "DM_DST_STATE");
+        if (pState) {
+            if (pState->hFontMono) DeleteObject(pState->hFontMono);
+            free(pState);
+        }
+        return 0;
+    }
+
+    default:
+        break;
+    }
+    return DefWindowProcW(hDlg, uMsg, wParam, lParam);
+}
+
+void ShowSelfTestDialog(HWND hParent, int nDriveIndex)
+{
+    static BOOL bRegistered = FALSE;
+
+    if (g_nDriveCount <= 0 || nDriveIndex < 0 || nDriveIndex >= g_nDriveCount) {
+        MessageBoxU8(hParent, Tr(STR_NO_DRIVE), "DriveMonitor", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    const DRIVE_INFO* pInfo = &g_Drives[nDriveIndex];
+
+    if (!bRegistered) {
+        WNDCLASSW wc;
+        ZeroMemory(&wc, sizeof(wc));
+        wc.style         = CS_HREDRAW | CS_VREDRAW;
+        wc.hInstance     = g_hInst;
+        wc.hCursor       = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
+        wc.lpfnWndProc   = DstDlgProc;
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.hIcon         = LoadIconW(g_hInst, MAKEINTRESOURCEW(IDI_APPICON));
+        wc.lpszClassName = L"DriveMonitorSelfTestDlg";
+        RegisterClassW(&wc);
+        bRegistered = TRUE;
+    }
+
+    HWND hExist = FindWindowW(L"DriveMonitorSelfTestDlg", NULL);
+    if (hExist) {
+        SetForegroundWindow(hExist);
+        return;
+    }
+
+    DST_DLG_STATE* pState = (DST_DLG_STATE*)calloc(1, sizeof(DST_DLG_STATE));
+    if (!pState) return;
+
+    pState->nDriveIndex = nDriveIndex;
+    pState->bIsNvme = pInfo->bIsNVMe;
+    pState->bIsSsd = (pInfo->bIsNVMe ||
+                      pInfo->eType == DRIVE_TYPE_SSD_SATA ||
+                      pInfo->eType == DRIVE_TYPE_M2_SATA ||
+                      pInfo->eType == DRIVE_TYPE_NVME ||
+                      pInfo->eType == DRIVE_TYPE_EMMC);
+    pState->bSelfTestSupported = pInfo->bSelfTestSupported;
+    pState->nShortMinutes = pInfo->nShortSelfTestMinutes;
+    pState->nExtMinutes = pInfo->nExtSelfTestMinutes;
+    safe_snprintf(pState->szModel, "%s", pInfo->szModel);
+    safe_snprintf(pState->szSerial, "%s", pInfo->szSerial);
+
+    int dlgW = UiScale(720);
+    int dlgH = UiScale(590);
+
+    RECT rcParent;
+    if (hParent && GetWindowRect(hParent, &rcParent)) {
+        /* Center relative to parent */
+    } else {
+        rcParent.left = 100; rcParent.top = 100;
+        rcParent.right = 100 + dlgW; rcParent.bottom = 100 + dlgH;
+    }
+    int nX = rcParent.left + ((rcParent.right - rcParent.left) - dlgW) / 2;
+    int nY = rcParent.top + ((rcParent.bottom - rcParent.top) - dlgH) / 2;
+    if (nX < 10) nX = 10;
+    if (nY < 10) nY = 10;
+
+    char szTitle[256];
+    safe_snprintf(szTitle, "%s — %s (%s)",
+        TN("Самодиагностика накопителя (DST)", "Hardware Drive Self-Test (DST)"),
+        pState->szModel,
+        pState->bIsNvme ? "NVMe" : (pState->bIsSsd ? "SSD" : "HDD"));
+
+    WCHAR wzTitle[256];
+    U8ToW(szTitle, wzTitle, 256);
+
+    RECT rcAdj;
+    rcAdj.left = 0; rcAdj.top = 0; rcAdj.right = dlgW; rcAdj.bottom = dlgH;
+    AdjustWindowRectEx(&rcAdj, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE, 0);
+
+    HWND hDlg = CreateWindowExW(
+        0,
+        L"DriveMonitorSelfTestDlg",
         wzTitle,
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         nX, nY,

@@ -1,5 +1,6 @@
 /* DriveMonitor - ATA/SATA SMART (IOCTL_ATA_PASS_THROUGH). GPL-2.0-or-later. See LICENSE. */
 #include "smart_internal.h"
+#include "csmi.h"
 
 void FillAtaProtocolFromIdent(DRIVE_INFO* pInfo, const WORD* pIdent)
 {
@@ -98,6 +99,97 @@ BOOL EnableSMART(HANDLE hDrive, int nDrive)
         &dwBytes, NULL);
 }
 
+BOOL ValidateAtaIdentifyData(const BYTE* pIdent512)
+{
+    if (!pIdent512) return FALSE;
+    if (IsBufferAllZero(pIdent512, 64)) return FALSE;
+
+    /* Reject all-0xFF buffer */
+    BOOL bAllFF = TRUE;
+    for (int i = 0; i < 64; i++) {
+        if (pIdent512[i] != 0xFF) {
+            bAllFF = FALSE;
+            break;
+        }
+    }
+    if (bAllFF) return FALSE;
+
+    const WORD* pIdent = (const WORD*)pIdent512;
+
+    /* Word 0: Bit 15 must be 0 for standard ATA HDD / SSD.
+     * Bit 15 == 1 indicates ATAPI (optical/tape drive) or invalid/garbage RAM dump. */
+    if ((pIdent[0] & 0x8000) != 0) return FALSE;
+
+    /* Unpack and validate Model string (Words 27-46 = 40 bytes) */
+    char szModelTemp[48];
+    SwapATAString(szModelTemp, &pIdent[27], 20);
+
+    /* Trim leading and trailing spaces */
+    char* pStart = szModelTemp;
+    while (*pStart == ' ') pStart++;
+    char* pEnd = pStart + strlen(pStart);
+    while (pEnd > pStart && (*(pEnd - 1) == ' ' || *(pEnd - 1) == '\r' || *(pEnd - 1) == '\n')) {
+        pEnd--;
+    }
+    *pEnd = '\0';
+
+    size_t nLen = strlen(pStart);
+    if (nLen < 2) return FALSE;
+
+    /* Model must consist strictly of printable ASCII characters (0x20..0x7E) */
+    for (size_t i = 0; i < nLen; i++) {
+        unsigned char c = (unsigned char)pStart[i];
+        if (c < 0x20 || c > 0x7E) return FALSE;
+    }
+
+    /* Plausible capacity check: reject ridiculous sector counts > 100 PB (200 billion sectors) */
+    unsigned __int64 qwSectors = 0;
+    if (pIdent[83] & 0x0400) {
+        qwSectors = IdentLba48(pIdent);
+    }
+    if (qwSectors == 0) {
+        DWORD dwSectors28 = ((DWORD)pIdent[61] << 16) | pIdent[60];
+        qwSectors = (unsigned __int64)dwSectors28;
+    }
+    if (qwSectors > 200000000000ULL) return FALSE;
+
+    return TRUE;
+}
+
+BOOL ParseAtaIdentifyData(const BYTE* pIdent512, DRIVE_INFO* pInfo)
+{
+    if (!pIdent512 || !pInfo) return FALSE;
+    if (!ValidateAtaIdentifyData(pIdent512)) return FALSE;
+
+    const WORD* pIdent = (const WORD*)pIdent512;
+    SwapATAString(pInfo->szSerial,   &pIdent[10], 10);
+    SwapATAString(pInfo->szFirmware, &pIdent[23], 4);
+    SwapATAString(pInfo->szModel,    &pIdent[27], 20);
+
+    DWORD dwSectors28 = ((DWORD)pIdent[61] << 16) | pIdent[60];
+    unsigned __int64 qwSectors = 0;
+    if (pIdent[83] & 0x0400) {
+        qwSectors = IdentLba48(pIdent);
+    }
+    if (qwSectors == 0) qwSectors = (unsigned __int64)dwSectors28;
+    pInfo->dwCapacityMB = (DWORD)(qwSectors * 512 / (1024 * 1024));
+
+    /* Word 82-84: Command set/feature support */
+    pInfo->bSMART_Supported = (pIdent[82] & 0x0001) ? TRUE : FALSE;
+    pInfo->bSMART_Enabled   = (pIdent[85] & 0x0001) ? TRUE : FALSE;
+    pInfo->bSelfTestSupported = ((pIdent[84] & 0x0002) || (pIdent[87] & 0x0002)) ? TRUE : FALSE;
+
+    /* Word 217: Nominal Media Rotation Rate
+     * 0x0001 = non-rotating (SSD), >= 0x0401 = RPM */
+    pInfo->wRotationRate = pIdent[217];
+
+    /* Word 76/77: SATA gen / negotiated speed -> szProtocol */
+    pInfo->bCapAtaIdentify = TRUE;
+    FillAtaProtocolFromIdent(pInfo, pIdent);
+
+    return (pInfo->szModel[0] != '\0');
+}
+
 BOOL GetIdentifyData(HANDLE hDrive, int nDrive, DRIVE_INFO* pInfo)
 {
     BYTE inBuf[sizeof(SENDCMDINPARAMS) - 1 + IDENTIFY_BUFFER_SIZE];
@@ -122,35 +214,7 @@ BOOL GetIdentifyData(HANDLE hDrive, int nDrive, DRIVE_INFO* pInfo)
         return FALSE;
 
     SENDCMDOUTPARAMS* pCop = (SENDCMDOUTPARAMS*)outBuf;
-    WORD* pIdent = (WORD*)pCop->bBuffer;
-
-    if (IsBufferAllZero((BYTE*)pIdent, 64)) return FALSE;
-
-    SwapATAString(pInfo->szSerial,   &pIdent[10], 10);
-    SwapATAString(pInfo->szFirmware, &pIdent[23], 4);
-    SwapATAString(pInfo->szModel,    &pIdent[27], 20);
-
-    DWORD dwSectors28 = ((DWORD)pIdent[61] << 16) | pIdent[60];
-    unsigned __int64 qwSectors = 0;
-    if (pIdent[83] & 0x0400) {
-        qwSectors = IdentLba48(pIdent);
-    }
-    if (qwSectors == 0) qwSectors = (unsigned __int64)dwSectors28;
-    pInfo->dwCapacityMB = (DWORD)(qwSectors * 512 / (1024 * 1024));
-
-    /* Word 82-84: Command set/feature support */
-    pInfo->bSMART_Supported = (pIdent[82] & 0x0001) ? TRUE : FALSE;
-    pInfo->bSMART_Enabled   = (pIdent[85] & 0x0001) ? TRUE : FALSE;
-
-    /* Word 217: Nominal Media Rotation Rate
-     * 0x0001 = non-rotating (SSD), >= 0x0401 = RPM */
-    pInfo->wRotationRate = pIdent[217];
-
-    /* Word 76/77: SATA gen / negotiated speed → szProtocol */
-    pInfo->bCapAtaIdentify = TRUE;
-    FillAtaProtocolFromIdent(pInfo, pIdent);
-
-    return TRUE;
+    return ParseAtaIdentifyData((const BYTE*)pCop->bBuffer, pInfo);
 }
 
 BOOL GetSMARTAttributes(HANDLE hDrive, int nDrive, DRIVE_INFO* pInfo)
@@ -325,6 +389,93 @@ static BOOL ReadSMARTLogATAPassthrough(HANDLE hDrive, BYTE bLogAddr,
     return TRUE;
 }
 
+BOOL ReadAtaLogExtNative(HANDLE hDrive, BYTE bLogAddr, WORD wPage,
+                         void* pBuf, DWORD dwBufSize)
+{
+    if (!hDrive || !pBuf || dwBufSize < 512) return FALSE;
+    if (!DriveAllowsAtaIoctl(hDrive)) return FALSE;
+
+    /* 1. Try ATA PASS-THROUGH with 0x2F (READ LOG EXT) */
+    BYTE buf[sizeof(MY_ATA_PASS_THROUGH_EX) + 4 + 512];
+    ZeroMemory(buf, sizeof(buf));
+
+    MY_ATA_PASS_THROUGH_EX* pApt = (MY_ATA_PASS_THROUGH_EX*)buf;
+    pApt->Length             = sizeof(MY_ATA_PASS_THROUGH_EX);
+    pApt->AtaFlags           = ATA_FLAGS_DRDY_REQUIRED | ATA_FLAGS_DATA_IN | ATA_FLAGS_48BIT_COMMAND;
+    pApt->DataTransferLength = 512;
+    pApt->TimeOutValue       = 10;
+    pApt->DataBufferOffset   = sizeof(MY_ATA_PASS_THROUGH_EX) + 4;
+
+    pApt->CurrentTaskFile[0]  = (BYTE)(wPage & 0xFF);        /* Features: page low */
+    pApt->PreviousTaskFile[0] = (BYTE)((wPage >> 8) & 0xFF); /* Features: page high */
+    pApt->CurrentTaskFile[1]  = 1;                           /* Sector count: 1 */
+    pApt->PreviousTaskFile[1] = 0;
+    pApt->CurrentTaskFile[2]  = bLogAddr;                    /* LBA Low: Log Address */
+    pApt->PreviousTaskFile[2] = 0;
+    pApt->CurrentTaskFile[3]  = 0;                           /* LBA Mid */
+    pApt->PreviousTaskFile[3] = 0;
+    pApt->CurrentTaskFile[4]  = 0;                           /* LBA High */
+    pApt->PreviousTaskFile[4] = 0;
+    pApt->CurrentTaskFile[5]  = 0x40;                        /* Device (LBA mode) */
+    pApt->CurrentTaskFile[6]  = 0x2F;                        /* Command: READ LOG EXT */
+
+    DWORD dwBytes = 0;
+    if (DeviceIoControl(hDrive, IOCTL_ATA_PASS_THROUGH,
+            buf, sizeof(buf), buf, sizeof(buf), &dwBytes, NULL)) {
+        memcpy(pBuf, buf + sizeof(MY_ATA_PASS_THROUGH_EX) + 4, 512);
+        return TRUE;
+    }
+
+    /* 2. Fallback to SMART READ LOG (0xB0 / 0xD5) for page 0 */
+    if (wPage == 0) {
+        ZeroMemory(buf, sizeof(buf));
+        pApt->Length             = sizeof(MY_ATA_PASS_THROUGH_EX);
+        pApt->AtaFlags           = ATA_FLAGS_DRDY_REQUIRED | ATA_FLAGS_DATA_IN;
+        pApt->DataTransferLength = 512;
+        pApt->TimeOutValue       = 10;
+        pApt->DataBufferOffset   = sizeof(MY_ATA_PASS_THROUGH_EX) + 4;
+
+        pApt->CurrentTaskFile[0] = SMART_READ_LOG;
+        pApt->CurrentTaskFile[1] = 1;
+        pApt->CurrentTaskFile[2] = bLogAddr;
+        pApt->CurrentTaskFile[3] = SMART_CYL_LOW;
+        pApt->CurrentTaskFile[4] = SMART_CYL_HI;
+        pApt->CurrentTaskFile[5] = 0xA0;
+        pApt->CurrentTaskFile[6] = SMART_CMD;
+
+        if (DeviceIoControl(hDrive, IOCTL_ATA_PASS_THROUGH,
+                buf, sizeof(buf), buf, sizeof(buf), &dwBytes, NULL)) {
+            memcpy(pBuf, buf + sizeof(MY_ATA_PASS_THROUGH_EX) + 4, 512);
+            return TRUE;
+        }
+
+        /* 3. Fallback to SMART_RCV_DRIVE_DATA */
+        BYTE inBuf[sizeof(SENDCMDINPARAMS) - 1];
+        BYTE outBuf[sizeof(SENDCMDOUTPARAMS) - 1 + 512];
+        ZeroMemory(inBuf, sizeof(inBuf));
+        ZeroMemory(outBuf, sizeof(outBuf));
+
+        SENDCMDINPARAMS* pCip = (SENDCMDINPARAMS*)inBuf;
+        pCip->cBufferSize                 = 512;
+        pCip->irDriveRegs.bFeaturesReg    = SMART_READ_LOG;
+        pCip->irDriveRegs.bSectorCountReg = 1;
+        pCip->irDriveRegs.bSectorNumberReg= bLogAddr;
+        pCip->irDriveRegs.bCylLowReg      = SMART_CYL_LOW;
+        pCip->irDriveRegs.bCylHighReg     = SMART_CYL_HI;
+        pCip->irDriveRegs.bDriveHeadReg   = 0xA0;
+        pCip->irDriveRegs.bCommandReg     = SMART_CMD;
+        pCip->bDriveNumber                = 0;
+
+        if (DeviceIoControl(hDrive, SMART_RCV_DRIVE_DATA,
+                pCip, sizeof(SENDCMDINPARAMS) - 1,
+                outBuf, sizeof(outBuf), &dwBytes, NULL)) {
+            SENDCMDOUTPARAMS* pCop = (SENDCMDOUTPARAMS*)outBuf;
+            memcpy(pBuf, pCop->bBuffer, 512);
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
 
 BOOL GetSMARTErrorLog(HANDLE hDrive, int nDrive, DRIVE_INFO* pInfo)
 {
@@ -359,10 +510,16 @@ BOOL GetSMARTSelfTestLog(HANDLE hDrive, int nDrive, DRIVE_INFO* pInfo)
 {
     ZeroMemory(&pInfo->selfTestLog, sizeof(pInfo->selfTestLog));
 
-    if (ReadSMARTLog(hDrive, nDrive, SMART_LOG_COMP_SELF_TEST,
+    if (ReadAtaLogExtNative(hDrive, SMART_LOG_COMP_SELF_TEST, 0,
+                            (BYTE*)&pInfo->selfTestLog, sizeof(pInfo->selfTestLog)) ||
+        ReadSMARTLog(hDrive, nDrive, SMART_LOG_COMP_SELF_TEST,
+                     (BYTE*)&pInfo->selfTestLog, sizeof(pInfo->selfTestLog)) ||
+        ReadSMARTLogATAPassthrough(hDrive, SMART_LOG_COMP_SELF_TEST,
                      (BYTE*)&pInfo->selfTestLog, sizeof(pInfo->selfTestLog))) {
         pInfo->bGotSelfTestLog = TRUE;
-        pInfo->nSelfTestStatus = pInfo->selfTestLog.stEntries[0].bStatusByte;
+        int idx = (pInfo->selfTestLog.bMostRecentTestIndex >= 1 && pInfo->selfTestLog.bMostRecentTestIndex <= 21)
+                  ? (pInfo->selfTestLog.bMostRecentTestIndex - 1) : 0;
+        pInfo->nSelfTestStatus = pInfo->selfTestLog.stEntries[idx].bStatusByte;
         return TRUE;
     }
     return FALSE;
@@ -372,10 +529,14 @@ BOOL GetSMARTSelfTestLogATAPassthrough(HANDLE hDrive, DRIVE_INFO* pInfo)
 {
     ZeroMemory(&pInfo->selfTestLog, sizeof(pInfo->selfTestLog));
 
-    if (ReadSMARTLogATAPassthrough(hDrive, SMART_LOG_COMP_SELF_TEST,
+    if (ReadAtaLogExtNative(hDrive, SMART_LOG_COMP_SELF_TEST, 0,
+                            (BYTE*)&pInfo->selfTestLog, sizeof(pInfo->selfTestLog)) ||
+        ReadSMARTLogATAPassthrough(hDrive, SMART_LOG_COMP_SELF_TEST,
                      (BYTE*)&pInfo->selfTestLog, sizeof(pInfo->selfTestLog))) {
         pInfo->bGotSelfTestLog = TRUE;
-        pInfo->nSelfTestStatus = pInfo->selfTestLog.stEntries[0].bStatusByte;
+        int idx = (pInfo->selfTestLog.bMostRecentTestIndex >= 1 && pInfo->selfTestLog.bMostRecentTestIndex <= 21)
+                  ? (pInfo->selfTestLog.bMostRecentTestIndex - 1) : 0;
+        pInfo->nSelfTestStatus = pInfo->selfTestLog.stEntries[idx].bStatusByte;
         return TRUE;
     }
     return FALSE;
@@ -431,26 +592,7 @@ BOOL GetIdentifyDataATAPassthrough(HANDLE hDrive, DRIVE_INFO* pInfo)
 
     if (IsBufferAllZero(data, 64)) return FALSE;
 
-    WORD* pIdent = (WORD*)data;
-    SwapATAString(pInfo->szSerial,   &pIdent[10], 10);
-    SwapATAString(pInfo->szFirmware, &pIdent[23], 4);
-    SwapATAString(pInfo->szModel,    &pIdent[27], 20);
-
-    DWORD dwSectors28 = ((DWORD)pIdent[61] << 16) | pIdent[60];
-    unsigned __int64 qwSectors = 0;
-    if (pIdent[83] & 0x0400) {
-        qwSectors = IdentLba48(pIdent);
-    }
-    if (qwSectors == 0) qwSectors = (unsigned __int64)dwSectors28;
-    if (qwSectors > 0)
-        pInfo->dwCapacityMB = (DWORD)(qwSectors * 512 / (1024 * 1024));
-
-    pInfo->bSMART_Supported = (pIdent[82] & 0x0001) ? TRUE : FALSE;
-    pInfo->bSMART_Enabled   = (pIdent[85] & 0x0001) ? TRUE : FALSE;
-    pInfo->wRotationRate    = pIdent[217];
-    pInfo->bCapAtaIdentify = TRUE;
-    FillAtaProtocolFromIdent(pInfo, pIdent);
-    return TRUE;
+    return ParseAtaIdentifyData(data, pInfo);
 }
 
 /* ATA CHECK POWER MODE (0xE5).
@@ -794,6 +936,24 @@ int FillSmartData(DRIVE_INFO* pInfo, const BYTE* pRawBuf)
     }
     if (nCount > 0)
         pInfo->bCapSmartData = TRUE;
+
+    /* Offset 363: Self-test execution status byte */
+    pInfo->nSelfTestStatus = pRawBuf[363];
+    int stCode = (pRawBuf[363] >> 4) & 0x0F;
+    if (stCode == 15) {
+        pInfo->bSelfTestRunning = TRUE;
+        pInfo->nSelfTestPercentRemaining = (pRawBuf[363] & 0x0F) * 10;
+    } else {
+        pInfo->bSelfTestRunning = FALSE;
+        pInfo->nSelfTestPercentRemaining = 0;
+    }
+    pInfo->nShortSelfTestMinutes = pRawBuf[372];
+    if (pRawBuf[373] != 255) {
+        pInfo->nExtSelfTestMinutes = pRawBuf[373];
+    } else {
+        pInfo->nExtSelfTestMinutes = (int)((WORD)pRawBuf[375] | ((WORD)pRawBuf[376] << 8));
+    }
+
     return nCount;
 }
 
@@ -918,6 +1078,7 @@ BOOL AcquireATASMART(HANDLE hDrive, int nDrive, DRIVE_INFO* pInfo, BOOL bReadLog
                 if (!GetSMARTSelfTestLogATAPassthrough(hDrive, pInfo))
                     GetSMARTSelfTestLogSAT(hDrive, pInfo);
             }
+            AcquireAtaLogs(hDrive, FALSE, pInfo);
         }
     } else {
         /* No accepted attribute sector. A rejected packet keeps
@@ -934,3 +1095,128 @@ BOOL AcquireATASMART(HANDLE hDrive, int nDrive, DRIVE_INFO* pInfo, BOOL bReadLog
     return bAttr;
 }
 
+/* ============================================================
+ * SMART EXECUTE OFF-LINE IMMEDIATE (Command 0xB0, Features 0xD4)
+ * Subcommands (in LBA Low):
+ *   0x01: Short Self-test routine
+ *   0x02: Extended Self-test routine
+ *   0x03: Conveyance Self-test routine
+ *   0x00: Abort Self-test routine
+ * ============================================================ */
+BOOL AtaSendSmartOfflineImmediate(HANDLE hDrive, const DRIVE_INFO* pInfo, BYTE bSubcommand)
+{
+    if (hDrive == INVALID_HANDLE_VALUE || !hDrive) return FALSE;
+
+    /* 1. If CSMI RAID member */
+    if (pInfo && pInfo->eAccessMethod == SMART_ACCESS_CSMI) {
+        SCSI_ADDRESS addr;
+        HANDLE hScsi = OpenScsiAdapterFromDrive(hDrive, &addr);
+        if (hScsi != INVALID_HANDLE_VALUE) {
+            BYTE bPhy = (BYTE)addr.TargetId;
+            BOOL ok = CsmiSendStpCommand(hScsi, bPhy, SMART_EXECUTE_OFFLINE, 0, bSubcommand, SMART_CYL_LOW, SMART_CYL_HI, SMART_CMD, NULL, 0, FALSE);
+            CloseHandle(hScsi);
+            return ok;
+        }
+    }
+
+    /* 2. ATA Pass-Through */
+    if (DriveAllowsAtaIoctl(hDrive)) {
+        BYTE buf[sizeof(MY_ATA_PASS_THROUGH_EX) + 4];
+        ZeroMemory(buf, sizeof(buf));
+        MY_ATA_PASS_THROUGH_EX* pApt = (MY_ATA_PASS_THROUGH_EX*)buf;
+        pApt->Length             = sizeof(MY_ATA_PASS_THROUGH_EX);
+        pApt->AtaFlags           = ATA_FLAGS_DRDY_REQUIRED;
+        pApt->DataTransferLength = 0;
+        pApt->TimeOutValue       = 10;
+        pApt->DataBufferOffset   = 0;
+
+        pApt->CurrentTaskFile[0] = SMART_EXECUTE_OFFLINE; /* Features: 0xD4 */
+        pApt->CurrentTaskFile[1] = 0;                     /* Sector count */
+        pApt->CurrentTaskFile[2] = bSubcommand;          /* LBA Low */
+        pApt->CurrentTaskFile[3] = SMART_CYL_LOW;        /* 0x4F */
+        pApt->CurrentTaskFile[4] = SMART_CYL_HI;         /* 0xC2 */
+        pApt->CurrentTaskFile[5] = 0xA0;                 /* Device */
+        pApt->CurrentTaskFile[6] = SMART_CMD;            /* 0xB0 */
+
+        DWORD dwBytes = 0;
+        if (DeviceIoControl(hDrive, IOCTL_ATA_PASS_THROUGH,
+                buf, sizeof(buf), buf, sizeof(buf), &dwBytes, NULL)) {
+            return TRUE;
+        }
+    }
+
+    /* 3. SAT16 Pass-Through (SCSI 85h) */
+    if (DriveAllowsScsiPassthrough(hDrive)) {
+        BYTE cdb[16];
+        ZeroMemory(cdb, sizeof(cdb));
+        cdb[0]  = 0x85;        /* ATA PASS-THROUGH (16) */
+        cdb[1]  = (3 << 1);    /* Non-data protocol */
+        cdb[4]  = SMART_EXECUTE_OFFLINE; /* 0xD4 */
+        cdb[8]  = bSubcommand; /* LBA Low */
+        cdb[10] = SMART_CYL_LOW; /* 0x4F */
+        cdb[12] = SMART_CYL_HI;  /* 0xC2 */
+        cdb[14] = SMART_CMD;     /* 0xB0 */
+        if (ScsiSendGenericCdb(hDrive, cdb, 16, NULL, 0, FALSE)) {
+            return TRUE;
+        }
+    }
+
+    /* 4. Legacy SMART IOCTL: SMART_SEND_DRIVE_COMMAND */
+    SENDCMDINPARAMS in;
+    BYTE outBuf[sizeof(SENDCMDOUTPARAMS) + 16];
+    ZeroMemory(&in, sizeof(in));
+    ZeroMemory(outBuf, sizeof(outBuf));
+    in.cBufferSize = 0;
+    in.bDriveNumber = (BYTE)(pInfo ? pInfo->nDriveIndex : 0);
+    in.irDriveRegs.bFeaturesReg     = SMART_EXECUTE_OFFLINE;
+    in.irDriveRegs.bSectorNumberReg = bSubcommand;
+    in.irDriveRegs.bCylLowReg       = SMART_CYL_LOW;
+    in.irDriveRegs.bCylHighReg      = SMART_CYL_HI;
+    in.irDriveRegs.bDriveHeadReg    = 0xA0;
+    in.irDriveRegs.bCommandReg      = SMART_CMD;
+
+    DWORD dwBytes = 0;
+    if (DeviceIoControl(hDrive, SMART_SEND_DRIVE_COMMAND, &in, sizeof(in), outBuf, sizeof(outBuf), &dwBytes, NULL)) {
+        return TRUE;
+    }
+
+    /* 5. Legacy USB Bridges (Cypress, Sunplus, Prolific) */
+    if (pInfo && pInfo->bIsUSB) {
+        if (pInfo->eAccessMethod == SMART_ACCESS_CYPRESS) {
+            BYTE cdb[16];
+            ZeroMemory(cdb, sizeof(cdb));
+            cdb[0] = 0x24; cdb[1] = 0x24; cdb[3] = 0xFF;
+            cdb[4] = SMART_EXECUTE_OFFLINE;
+            cdb[6] = bSubcommand;
+            cdb[7] = SMART_CYL_LOW;
+            cdb[8] = SMART_CYL_HI;
+            cdb[9] = 0xA0;
+            cdb[10] = SMART_CMD;
+            return ScsiSendGenericCdb(hDrive, cdb, 16, NULL, 0, FALSE);
+        } else if (pInfo->eAccessMethod == SMART_ACCESS_SUNPLUS) {
+            BYTE cdb[12];
+            ZeroMemory(cdb, sizeof(cdb));
+            cdb[0] = 0xF8; cdb[1] = 0x22;
+            cdb[3] = SMART_EXECUTE_OFFLINE;
+            cdb[5] = bSubcommand;
+            cdb[6] = SMART_CYL_LOW;
+            cdb[7] = SMART_CYL_HI;
+            cdb[8] = 0xA0;
+            cdb[9] = SMART_CMD;
+            return ScsiSendGenericCdb(hDrive, cdb, 12, NULL, 0, FALSE);
+        } else if (pInfo->eAccessMethod == SMART_ACCESS_PROLIFIC) {
+            BYTE cdb[16];
+            ZeroMemory(cdb, sizeof(cdb));
+            cdb[0] = 0xD8; cdb[1] = 0x06; cdb[2] = 0x7B;
+            cdb[5] = SMART_EXECUTE_OFFLINE;
+            cdb[7] = bSubcommand;
+            cdb[8] = SMART_CYL_LOW;
+            cdb[9] = SMART_CYL_HI;
+            cdb[10] = 0xA0;
+            cdb[11] = SMART_CMD;
+            return ScsiSendGenericCdb(hDrive, cdb, 16, NULL, 0, FALSE);
+        }
+    }
+
+    return FALSE;
+}

@@ -28,6 +28,9 @@ void DetectCounterfeitMismatch(struct _DRIVE_INFO* pInfo);
 /* Returns localized reason string (RU/EN) according to current UI language */
 const char* GetCounterfeitReason(const struct _DRIVE_INFO* pInfo);
 
+/* Returns localized badge tag (e.g. "⚠️ [ПЕРЕПРОШИТ / MPTOOL]", "⚠️ [ПОДДЕЛКА]") */
+const char* GetCounterfeitBadge(const struct _DRIVE_INFO* pInfo);
+
 #ifdef __cplusplus
 }
 #endif

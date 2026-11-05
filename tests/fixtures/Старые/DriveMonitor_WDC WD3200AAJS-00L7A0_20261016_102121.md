@@ -11,7 +11,7 @@
 | Семейство | Western Digital Caviar Blue Serial ATA |
 | Бренд | Western Digital |
 | Контроллер | Western Digital |
-| Серийный № | WD-WMAV2R754501 |
+| Серийный № | WD-WM********** |
 | Прошивка | 01.03E01 |
 | Объём / тип | 298.1 GB · HDD |
 | Температура | 24 °C (норма) |

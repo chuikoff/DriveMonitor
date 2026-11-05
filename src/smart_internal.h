@@ -19,6 +19,7 @@
 #include "smart.h"
 #include "safestr.h"
 #include "lang.h"
+#include "ata_log.h"
 
 #ifndef CR_SUCCESS
 #define CR_SUCCESS 0
@@ -291,5 +292,36 @@ BOOL NVMeHealthLogRealtek(HANDLE hDrive, DRIVE_INFO* pInfo);
 BOOL NVMeIdentifyVLI(HANDLE hDrive, DRIVE_INFO* pInfo);
 BOOL NVMeHealthLogVLI(HANDLE hDrive, DRIVE_INFO* pInfo);
 BOOL NVMeOverUSBTryAll(HANDLE hDrive, DRIVE_INFO* pInfo);
+
+BOOL ValidateAtaIdentifyData(const BYTE* pIdent512);
+BOOL ParseAtaIdentifyData(const BYTE* pIdent512, DRIVE_INFO* pInfo);
+HANDLE OpenScsiAdapterFromDrive(HANDLE hDrive, SCSI_ADDRESS* pAddr);
+
+/* Legacy USB-to-ATA bridge helpers (Cypress, Sunplus, Prolific/JMicron) */
+BOOL GetIdentifyDataCypress(HANDLE hDrive, DRIVE_INFO* pInfo);
+BOOL GetSMARTAttributesCypress(HANDLE hDrive, DRIVE_INFO* pInfo);
+BOOL GetSMARTThresholdsCypress(HANDLE hDrive, DRIVE_INFO* pInfo);
+BOOL GetSMARTReturnStatusCypress(HANDLE hDrive, BOOL* pbFail);
+
+BOOL GetIdentifyDataSunplus(HANDLE hDrive, DRIVE_INFO* pInfo);
+BOOL GetSMARTAttributesSunplus(HANDLE hDrive, DRIVE_INFO* pInfo);
+BOOL GetSMARTThresholdsSunplus(HANDLE hDrive, DRIVE_INFO* pInfo);
+BOOL GetSMARTReturnStatusSunplus(HANDLE hDrive, BOOL* pbFail);
+
+BOOL GetIdentifyDataProlific(HANDLE hDrive, DRIVE_INFO* pInfo);
+BOOL GetSMARTAttributesProlific(HANDLE hDrive, DRIVE_INFO* pInfo);
+BOOL GetSMARTThresholdsProlific(HANDLE hDrive, DRIVE_INFO* pInfo);
+BOOL GetSMARTReturnStatusProlific(HANDLE hDrive, BOOL* pbFail);
+
+BOOL GetIdentifyDataLegacyBridges(HANDLE hDrive, DRIVE_INFO* pInfo);
+
+BOOL GetIdentifyDataLegacyBridges(HANDLE hDrive, DRIVE_INFO* pInfo);
+
+BOOL ScsiSendGenericCdb(HANDLE hDrive, const BYTE* pCdb, BYTE bCdbLen,
+                        BYTE* pDataBuf, DWORD dwDataLen, BOOL bDataIn);
+BOOL ReadAtaLogExtNative(HANDLE hDrive, BYTE bLogAddr, WORD wPage, void* pBuf, DWORD dwBufSize);
+BOOL ReadAtaLogExtSAT(HANDLE hDrive, BYTE bLogAddr, WORD wPage, void* pBuf, DWORD dwBufSize);
+BOOL AtaSendSmartOfflineImmediate(HANDLE hDrive, const DRIVE_INFO* pInfo, BYTE bSubcommand);
+BOOL NvmeSendDeviceSelfTest(HANDLE hDrive, DWORD dwTestType);
 
 #endif /* SMART_INTERNAL_H */

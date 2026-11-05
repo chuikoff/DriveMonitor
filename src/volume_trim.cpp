@@ -80,17 +80,72 @@ void EvaluateDriveTrimAndCapacity(DRIVE_INFO* pInfo)
     pInfo->trimInfo.bPanicLowSpace = FALSE;
     pInfo->trimInfo.fMinFreePercent = -1.0f;
 
+    unsigned __int64 qwTotalAll = 0;
+    unsigned __int64 qwFreeAll = 0;
+
     for (int i = 0; i < pInfo->trimInfo.nVolumeCount; i++) {
         const VOLUME_INFO_ENTRY* v = &pInfo->trimInfo.volumes[i];
         if (v->qwTotalBytes > 0 && !v->bTrimSupportedFs) {
             pInfo->trimInfo.bHasNonTrimVolume = TRUE;
         }
         if (v->fFreePercent >= 0.0f) {
-            if (pInfo->trimInfo.fMinFreePercent < 0.0f || v->fFreePercent < pInfo->trimInfo.fMinFreePercent) {
-                pInfo->trimInfo.fMinFreePercent = v->fFreePercent;
+            /* Only partitions >= 1 GB count towards min free % of volumes.
+             * Small partitions (< 1 GB, such as OEM recovery or EFI) are ignored here;
+             * if no partition is >= 1 GB, fMinFreePercent falls back to total free space % below. */
+            if (v->qwTotalBytes >= 1024ULL * 1024ULL * 1024ULL) {
+                if (pInfo->trimInfo.fMinFreePercent < 0.0f || v->fFreePercent < pInfo->trimInfo.fMinFreePercent) {
+                    pInfo->trimInfo.fMinFreePercent = v->fFreePercent;
+                }
             }
-            if (v->fFreePercent < 7.0f) pInfo->trimInfo.bCriticallyLowSpace = TRUE;
-            if (v->fFreePercent < 5.0f) pInfo->trimInfo.bPanicLowSpace = TRUE;
+        }
+        if (v->qwTotalBytes > 0) {
+            qwTotalAll += v->qwTotalBytes;
+            if (v->fFreePercent >= 0.0f) {
+                qwFreeAll += (unsigned __int64)((double)v->qwTotalBytes * (double)v->fFreePercent / 100.0);
+            } else {
+                qwFreeAll += v->qwFreeBytes;
+            }
+        }
+    }
+
+    /* Overall free space across all volumes on the drive */
+    float fTotalFreePct = -1.0f;
+    if (qwTotalAll > 0) {
+        fTotalFreePct = (float)((double)qwFreeAll / (double)qwTotalAll * 100.0);
+    }
+    if (pInfo->trimInfo.fMinFreePercent < 0.0f) {
+        if (fTotalFreePct >= 0.0f) {
+            pInfo->trimInfo.fMinFreePercent = fTotalFreePct;
+        } else {
+            /* Fallback if total capacity was unspecified across all volumes */
+            for (int i = 0; i < pInfo->trimInfo.nVolumeCount; i++) {
+                const VOLUME_INFO_ENTRY* v = &pInfo->trimInfo.volumes[i];
+                if (v->fFreePercent >= 0.0f) {
+                    if (pInfo->trimInfo.fMinFreePercent < 0.0f || v->fFreePercent < pInfo->trimInfo.fMinFreePercent) {
+                        pInfo->trimInfo.fMinFreePercent = v->fFreePercent;
+                    }
+                }
+            }
+        }
+    }
+
+    /* For SSD / NVMe:
+     * Evaluate space deficit against overall drive space, or major partitions (>= 10 GB).
+     * Tiny recovery / system partitions (< 1 GB) must not cause false SSD panic warnings. */
+    if (pInfo->eType != DRIVE_TYPE_HDD) {
+        if (fTotalFreePct >= 0.0f) {
+            if (fTotalFreePct < 7.0f) pInfo->trimInfo.bCriticallyLowSpace = TRUE;
+            if (fTotalFreePct < 5.0f) pInfo->trimInfo.bPanicLowSpace = TRUE;
+        }
+        for (int i = 0; i < pInfo->trimInfo.nVolumeCount; i++) {
+            const VOLUME_INFO_ENTRY* v = &pInfo->trimInfo.volumes[i];
+            /* If total bytes is not set (e.g. synthetic test), or partition >= 10 GB */
+            if (v->qwTotalBytes == 0 || v->qwTotalBytes >= 10ULL * 1024ULL * 1024ULL * 1024ULL) {
+                if (v->fFreePercent >= 0.0f) {
+                    if (v->fFreePercent < 7.0f) pInfo->trimInfo.bCriticallyLowSpace = TRUE;
+                    if (v->fFreePercent < 5.0f) pInfo->trimInfo.bPanicLowSpace = TRUE;
+                }
+            }
         }
     }
 
@@ -104,6 +159,9 @@ void EvaluateDriveTrimAndCapacity(DRIVE_INFO* pInfo)
     } else if (!pInfo->trimInfo.bDeviceTrimSupported && !pInfo->bIsNVMe) {
         safe_snprintf(pInfo->trimInfo.szTrimSummary, "%s",
             TN("Не поддерживается мостом/накопителем", "Not supported by bridge/device"));
+    } else if (pInfo->trimInfo.nVolumeCount == 0) {
+        safe_snprintf(pInfo->trimInfo.szTrimSummary, "%s",
+            TN("Активен (тома не прочитаны)", "Active (volumes not read)"));
     } else {
         safe_snprintf(pInfo->trimInfo.szTrimSummary, "%s",
             TN("Активен (NTFS/ReFS)", "Active (NTFS/ReFS)"));
@@ -151,6 +209,16 @@ void QueryDriveVolumesAndTrim(DRIVE_INFO* pDrives, int nNumDrives)
     }
 
     for (const char* p = letters; *p; p += strlen(p) + 1) {
+        char root[8];
+        safe_snprintf(root, "%c:\\", p[0]);
+
+        /* Ignore CD-ROM, network drives, and RAM disks */
+        UINT uDriveType = GetDriveTypeA(root);
+        if (uDriveType == DRIVE_CDROM || uDriveType == DRIVE_REMOTE ||
+            uDriveType == DRIVE_RAMDISK || uDriveType == DRIVE_NO_ROOT_DIR) {
+            continue;
+        }
+
         char vol[16];
         safe_snprintf(vol, "\\\\.\\%c:", p[0]);
 
@@ -170,15 +238,16 @@ void QueryDriveVolumesAndTrim(DRIVE_INFO* pDrives, int nNumDrives)
         if (!bGotExtents) {
             bGotDevNum = DeviceIoControl(hVol, IOCTL_STORAGE_GET_DEVICE_NUMBER,
                                          NULL, 0, &sdn, sizeof(sdn), &ret, NULL);
+            /* Reject non-disk devices (e.g. CD-ROM, virtual optical ISOs) */
+            if (bGotDevNum && sdn.DeviceType != FILE_DEVICE_DISK) {
+                bGotDevNum = FALSE;
+            }
         }
         CloseHandle(hVol);
 
         if (!bGotExtents && !bGotDevNum) continue;
 
         /* Get filesystem type and free space */
-        char root[8];
-        safe_snprintf(root, "%c:\\", p[0]);
-
         char fsName[64];
         fsName[0] = '\0';
         GetVolumeInformationA(root, NULL, 0, NULL, NULL, NULL, fsName, sizeof(fsName));
@@ -223,20 +292,6 @@ void QueryDriveVolumesAndTrim(DRIVE_INFO* pDrives, int nNumDrives)
                     pEntry->qwFreeBytes = totalFree.QuadPart;
                     pEntry->fFreePercent = fFreePct;
                     pEntry->bTrimSupportedFs = bTrimFs;
-
-                    if (totalBytes.QuadPart > 0 && !bTrimFs && pDrives[d].eType != DRIVE_TYPE_HDD) {
-                        pTrim->bHasNonTrimVolume = TRUE;
-                    }
-
-                    if (fFreePct >= 0.0f) {
-                        if (pTrim->fMinFreePercent < 0.0f || fFreePct < pTrim->fMinFreePercent) {
-                            pTrim->fMinFreePercent = fFreePct;
-                        }
-                        if (pDrives[d].eType != DRIVE_TYPE_HDD) {
-                            if (fFreePct < 7.0f) pTrim->bCriticallyLowSpace = TRUE;
-                            if (fFreePct < 5.0f) pTrim->bPanicLowSpace = TRUE;
-                        }
-                    }
                 }
             }
         }
