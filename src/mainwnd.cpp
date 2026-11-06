@@ -4741,16 +4741,20 @@ static void ReplaceSubstringAll(char* s, int maxLen, const char* from, const cha
     }
 }
 
-/* szProtocol is filled at scan time. Swap the speed unit and max qualifiers when the UI language changes. */
+/* szProtocol is filled at scan time. Swap the speed unit, max, and the PCIe port note. */
 static void RefitProtocolLang(char* s, int n)
 {
     if (!s || !s[0] || n <= 0) return;
     if (UiLangIsEn()) {
         ReplaceSubstringAll(s, n, "Гбит/с", "Gb/s");
         ReplaceSubstringAll(s, n, "макс.", "max");
+        ReplaceSubstringAll(s, n, "диск", "drive");
+        ReplaceSubstringAll(s, n, "порт", "port");
     } else {
         ReplaceSubstringAll(s, n, "Gb/s", "Гбит/с");
         ReplaceSubstringAll(s, n, "max", "макс.");
+        ReplaceSubstringAll(s, n, "drive", "диск");
+        ReplaceSubstringAll(s, n, "port", "порт");
     }
 }
 

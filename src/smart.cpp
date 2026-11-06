@@ -23,12 +23,28 @@ void FillDriveProtocol(DRIVE_INFO* pInfo)
         if (!pInfo->bIsUSB && pInfo->nPcieCurLinkSpeed > 0) {
             char* pciePos = strstr(pInfo->szProtocol, " · PCIe");
             if (pciePos) *pciePos = '\0';
-            char pcieStr[64];
+            char pcieStr[96];
             if (pInfo->bLinkDegraded) {
                 safe_snprintf(pcieStr, " · PCIe %u.0 x%u (%s %u.0 x%u \xE2\x9A\xA0)",
                     (unsigned)pInfo->nPcieCurLinkSpeed, (unsigned)pInfo->nPcieCurLinkWidth,
                     TN("макс.", "max"),
                     (unsigned)pInfo->nPcieMaxLinkSpeed, (unsigned)pInfo->nPcieMaxLinkWidth);
+            } else if (pInfo->bPcieHostCapped) {
+                unsigned dSp = pInfo->nPcieMaxLinkSpeed;
+                unsigned dWd = pInfo->nPcieMaxLinkWidth;
+                unsigned uSp = pInfo->nPcieUpMaxLinkSpeed ? pInfo->nPcieUpMaxLinkSpeed : dSp;
+                unsigned uWd = pInfo->nPcieUpMaxLinkWidth ? pInfo->nPcieUpMaxLinkWidth : dWd;
+                if (pInfo->szPcieUpDev[0]) {
+                    safe_snprintf(pcieStr, " · PCIe %u.0 x%u (%s %u.0 x%u, %s %s %u.0 x%u)",
+                        (unsigned)pInfo->nPcieCurLinkSpeed, (unsigned)pInfo->nPcieCurLinkWidth,
+                        TN("диск", "drive"), dSp, dWd,
+                        TN("порт", "port"), pInfo->szPcieUpDev, uSp, uWd);
+                } else {
+                    safe_snprintf(pcieStr, " · PCIe %u.0 x%u (%s %u.0 x%u, %s %u.0 x%u)",
+                        (unsigned)pInfo->nPcieCurLinkSpeed, (unsigned)pInfo->nPcieCurLinkWidth,
+                        TN("диск", "drive"), dSp, dWd,
+                        TN("порт", "port"), uSp, uWd);
+                }
             } else {
                 safe_snprintf(pcieStr, " · PCIe %u.0 x%u",
                     (unsigned)pInfo->nPcieCurLinkSpeed, (unsigned)pInfo->nPcieCurLinkWidth);
@@ -2075,43 +2091,132 @@ static const DEVPROPKEY kPciMaxLinkWidth = {
     { 0x3ab22e31, 0x8264, 0x4b4e, { 0x9a, 0xf5, 0xa8, 0xd2, 0xd8, 0xe3, 0x3e, 0x62 } }, 12
 };
 
+static void StorePcieDevToken(DEVINST inst, char* dst, int nDst)
+{
+    char id[300];
+    const char* p;
+    int i;
+    if (!dst || nDst < 9) return;
+    dst[0] = '\0';
+    if (CM_Get_Device_IDA(inst, id, (ULONG)sizeof(id), 0) != CR_SUCCESS) return;
+    p = strstr(id, "DEV_");
+    if (!p) return;
+    for (i = 4; i < 8; i++) {
+        char c = p[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')))
+            return;
+    }
+    memcpy(dst, p, 8);
+    dst[8] = '\0';
+}
+
+static void NotePcieUpstream(DRIVE_INFO* p, DEVINST inst, ULONG maxSpeed, ULONG maxWidth)
+{
+    BOOL tighter = FALSE;
+    if (maxSpeed > 0 && maxSpeed < 256 &&
+        (p->nPcieUpMaxLinkSpeed == 0 || maxSpeed < p->nPcieUpMaxLinkSpeed)) {
+        p->nPcieUpMaxLinkSpeed = (BYTE)maxSpeed;
+        tighter = TRUE;
+    }
+    if (maxWidth > 0 && maxWidth < 256 &&
+        (p->nPcieUpMaxLinkWidth == 0 || maxWidth < p->nPcieUpMaxLinkWidth)) {
+        p->nPcieUpMaxLinkWidth = (BYTE)maxWidth;
+        tighter = TRUE;
+    }
+    if (tighter)
+        StorePcieDevToken(inst, p->szPcieUpDev, (int)sizeof(p->szPcieUpDev));
+}
+
+void ApplyPcieLinkLimit(DRIVE_INFO* p)
+{
+    unsigned limSpd, limWid;
+    BOOL spdCap, widCap;
+    if (!p) return;
+    p->bLinkDegraded = FALSE;
+    p->bPcieHostCapped = FALSE;
+
+    limSpd = p->nPcieMaxLinkSpeed;
+    if (p->nPcieUpMaxLinkSpeed > 0 &&
+        (limSpd == 0 || p->nPcieUpMaxLinkSpeed < limSpd))
+        limSpd = p->nPcieUpMaxLinkSpeed;
+    limWid = p->nPcieMaxLinkWidth;
+    if (p->nPcieUpMaxLinkWidth > 0 &&
+        (limWid == 0 || p->nPcieUpMaxLinkWidth < limWid))
+        limWid = p->nPcieUpMaxLinkWidth;
+
+    if ((limSpd > 0 && p->nPcieCurLinkSpeed > 0 && p->nPcieCurLinkSpeed < limSpd) ||
+        (limWid > 0 && p->nPcieCurLinkWidth > 0 && p->nPcieCurLinkWidth < limWid))
+        p->bLinkDegraded = TRUE;
+    if (p->bLinkDegraded) return;
+
+    spdCap = p->nPcieUpMaxLinkSpeed > 0 &&
+             p->nPcieMaxLinkSpeed > p->nPcieUpMaxLinkSpeed &&
+             p->nPcieCurLinkSpeed > 0 &&
+             p->nPcieCurLinkSpeed <= p->nPcieUpMaxLinkSpeed;
+    widCap = p->nPcieUpMaxLinkWidth > 0 &&
+             p->nPcieMaxLinkWidth > p->nPcieUpMaxLinkWidth &&
+             p->nPcieCurLinkWidth > 0 &&
+             p->nPcieCurLinkWidth <= p->nPcieUpMaxLinkWidth;
+    if (spdCap || widCap)
+        p->bPcieHostCapped = TRUE;
+}
+
 void QueryPcieLinkProperties(DWORD nDisk, DRIVE_INFO* pInfo)
 {
     DEVINST inst = 0;
     int walk = 0;
+    BOOL gotEnd = FALSE;
     if (!pInfo || pInfo->bIsUSB) return;
 
     if (!FindDiskDevInst(nDisk, &inst)) return;
 
+    /* The first node with a current speed is the drive. Parents after it
+     * are the slot. Their max, not the drive's, is the board ceiling. */
+    pInfo->nPcieUpMaxLinkSpeed = 0;
+    pInfo->nPcieUpMaxLinkWidth = 0;
+    pInfo->szPcieUpDev[0] = '\0';
+    pInfo->bPcieHostCapped = FALSE;
+
     while (inst && walk < 8) {
-        DEVPROPTYPE propType;
+        DEVPROPTYPE propType = 0;
         ULONG curSpeed = 0, curWidth = 0, maxSpeed = 0, maxWidth = 0;
-        ULONG sz = sizeof(curSpeed);
-        CONFIGRET cr = CM_Get_DevNode_PropertyW(inst, &kPciCurrentLinkSpeed, &propType, (PBYTE)&curSpeed, &sz, 0);
-        if (cr == CR_SUCCESS && curSpeed > 0) {
-            sz = sizeof(curWidth);
-            CM_Get_DevNode_PropertyW(inst, &kPciCurrentLinkWidth, &propType, (PBYTE)&curWidth, &sz, 0);
-            sz = sizeof(maxSpeed);
-            CM_Get_DevNode_PropertyW(inst, &kPciMaxLinkSpeed, &propType, (PBYTE)&maxSpeed, &sz, 0);
-            sz = sizeof(maxWidth);
-            CM_Get_DevNode_PropertyW(inst, &kPciMaxLinkWidth, &propType, (PBYTE)&maxWidth, &sz, 0);
-
-            pInfo->nPcieCurLinkSpeed = (BYTE)curSpeed;
-            pInfo->nPcieCurLinkWidth = (BYTE)curWidth;
-            pInfo->nPcieMaxLinkSpeed = (BYTE)maxSpeed;
-            pInfo->nPcieMaxLinkWidth = (BYTE)maxWidth;
-
-            if ((maxSpeed > 0 && curSpeed > 0 && curSpeed < maxSpeed) ||
-                (maxWidth > 0 && curWidth > 0 && curWidth < maxWidth)) {
-                pInfo->bLinkDegraded = TRUE;
-            }
-            break;
-        }
+        ULONG sz;
         DEVINST parent = 0;
+        sz = sizeof(curSpeed);
+        if (CM_Get_DevNode_PropertyW(inst, &kPciCurrentLinkSpeed, &propType,
+                                     (PBYTE)&curSpeed, &sz, 0) != CR_SUCCESS)
+            curSpeed = 0;
+        sz = sizeof(curWidth);
+        if (CM_Get_DevNode_PropertyW(inst, &kPciCurrentLinkWidth, &propType,
+                                     (PBYTE)&curWidth, &sz, 0) != CR_SUCCESS)
+            curWidth = 0;
+        sz = sizeof(maxSpeed);
+        if (CM_Get_DevNode_PropertyW(inst, &kPciMaxLinkSpeed, &propType,
+                                     (PBYTE)&maxSpeed, &sz, 0) != CR_SUCCESS)
+            maxSpeed = 0;
+        sz = sizeof(maxWidth);
+        if (CM_Get_DevNode_PropertyW(inst, &kPciMaxLinkWidth, &propType,
+                                     (PBYTE)&maxWidth, &sz, 0) != CR_SUCCESS)
+            maxWidth = 0;
+
+        if (!gotEnd) {
+            if (curSpeed > 0) {
+                pInfo->nPcieCurLinkSpeed = (BYTE)curSpeed;
+                pInfo->nPcieCurLinkWidth = (BYTE)curWidth;
+                pInfo->nPcieMaxLinkSpeed = (BYTE)maxSpeed;
+                pInfo->nPcieMaxLinkWidth = (BYTE)maxWidth;
+                gotEnd = TRUE;
+            }
+        } else if (maxSpeed > 0 || maxWidth > 0) {
+            NotePcieUpstream(pInfo, inst, maxSpeed, maxWidth);
+        }
+
         if (CM_Get_Parent(&parent, inst, 0) != CR_SUCCESS) break;
         inst = parent;
         walk++;
     }
+    if (gotEnd)
+        ApplyPcieLinkLimit(pInfo);
 }
 
 static BOOL BufHasI(const char* buf, ULONG len, const char* tok)

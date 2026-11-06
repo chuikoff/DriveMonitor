@@ -2591,6 +2591,31 @@ static void FormatHddLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
     LectureAddCounterfeit(szBuf, nBufLen, pInfo);
 }
 
+static void LectureAddPcieHostCap(char* szBuf, int nBufLen, const DRIVE_INFO* p)
+{
+    unsigned uSp, uWd;
+    if (!p || !p->bPcieHostCapped || p->bLinkDegraded) return;
+    uSp = p->nPcieUpMaxLinkSpeed ? p->nPcieUpMaxLinkSpeed : p->nPcieMaxLinkSpeed;
+    uWd = p->nPcieUpMaxLinkWidth ? p->nPcieUpMaxLinkWidth : p->nPcieMaxLinkWidth;
+    if (p->szPcieUpDev[0]) {
+        LectureAddF(szBuf, nBufLen, TN(
+            "Диск сам PCIe %u.0 x%u. Порт %s, в котором он сидит, только %u.0 x%u. "
+            "Согласованный режим — потолок этой платы, а не плохой контакт и не BIOS.\r\n",
+            "The drive itself is PCIe %u.0 x%u. Port %s only does %u.0 x%u. "
+            "The negotiated mode is this board's ceiling, not a bad contact and not the BIOS.\r\n"),
+            (unsigned)p->nPcieMaxLinkSpeed, (unsigned)p->nPcieMaxLinkWidth,
+            p->szPcieUpDev, uSp, uWd);
+    } else {
+        LectureAddF(szBuf, nBufLen, TN(
+            "Диск сам PCIe %u.0 x%u. Порт, в котором он сидит, только %u.0 x%u. "
+            "Согласованный режим — потолок этой платы, а не плохой контакт и не BIOS.\r\n",
+            "The drive itself is PCIe %u.0 x%u. The port it sits in only does %u.0 x%u. "
+            "The negotiated mode is this board's ceiling, not a bad contact and not the BIOS.\r\n"),
+            (unsigned)p->nPcieMaxLinkSpeed, (unsigned)p->nPcieMaxLinkWidth,
+            uSp, uWd);
+    }
+}
+
 static void FormatSsdLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen)
 {
     if (!szBuf || nBufLen <= 0) return;
@@ -2599,6 +2624,7 @@ static void FormatSsdLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
 
     if (!pInfo->bSMART_Supported) {
         LectureAddReadOnlyCause(szBuf, nBufLen, pInfo);
+        LectureAddPcieHostCap(szBuf, nBufLen, pInfo);
         if (LectureAddSmartDataError(pInfo, szBuf, nBufLen))
             return;
         LectureAdd(szBuf, nBufLen, TN(
@@ -3009,6 +3035,8 @@ static void FormatSsdLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
         break;
     }
 
+    LectureAddPcieHostCap(szBuf, nBufLen, pInfo);
+
     if (pInfo->nEndurancePercent >= 0)
         LectureAddF(szBuf, nBufLen, TN("\r\nРесурс: %d%%\r\n",
                                        "\r\nLife remaining: %d%%\r\n"),
@@ -3389,6 +3417,7 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
     szState = GetHealthStatusName(pInfo->eHealthStatus);
     LectureAddDualStatus(szBuf, nBufLen, pInfo);
     LectureAddReadOnlyCause(szBuf, nBufLen, pInfo);
+    LectureAddPcieHostCap(szBuf, nBufLen, pInfo);
     LectureAddF(szBuf, nBufLen, TN("Сводка: %s\r\n", "Summary: %s\r\n"), szState);
 
     if (!pInfo->bSMART_Supported) {

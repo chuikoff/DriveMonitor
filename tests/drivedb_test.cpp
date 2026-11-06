@@ -2538,6 +2538,145 @@ static void TestLinkSpeedDegradation(void)
         Expect(strstr(info.szProtocol, "\xE2\x9A\xA0") == NULL, "No warning glyph when link is full speed");
     }
 
+    /* 6. Gen4 drive on a Gen3 x4 port: the board ceiling, not a bad seat */
+    {
+        DRIVE_INFO info;
+        char lecture[4096];
+        char expert[4096];
+        memset(&info, 0, sizeof(info));
+        info.bIsNVMe = TRUE;
+        info.bSMART_Supported = TRUE;
+        info.bSMART_Enabled = TRUE;
+        info.bGotNVMeIdent = TRUE;
+        info.nvmeHealth.AvailableSpare = 100;
+        info.nvmeHealth.AvailableSpareThreshold = 10;
+        info.nvmeHealth.PercentageUsed = 0;
+        info.eType = DRIVE_TYPE_NVME;
+        info.nPcieCurLinkSpeed = 3;
+        info.nPcieCurLinkWidth = 4;
+        info.nPcieMaxLinkSpeed = 4;
+        info.nPcieMaxLinkWidth = 4;
+        info.nPcieUpMaxLinkSpeed = 3;
+        info.nPcieUpMaxLinkWidth = 4;
+        lstrcpynA(info.szPcieUpDev, "DEV_9DB4", (int)sizeof(info.szPcieUpDev));
+        ApplyPcieLinkLimit(&info);
+        Expect(!info.bLinkDegraded, "Gen4 drive on a Gen3 x4 port is not degraded");
+        Expect(info.bPcieHostCapped, "Gen4 drive on a Gen3 x4 port is host-capped");
+
+        AssessDriveHealth(&info);
+        ExpectInt((int)info.eInterface, (int)HEALTH_STATUS_GOOD, "host cap does not raise interface");
+        ExpectInt((int)info.eHealthStatus, (int)HEALTH_STATUS_GOOD, "host cap does not raise the headline");
+
+        FillDriveProtocol(&info);
+        ExpectHas(info.szProtocol, "PCIe 3.0 x4", "host cap protocol shows negotiated 3.0 x4");
+        ExpectHas(info.szProtocol, "диск 4.0 x4", "host cap protocol names the drive max");
+        ExpectHas(info.szProtocol, "порт DEV_9DB4 3.0 x4", "host cap protocol names the port");
+        Expect(strstr(info.szProtocol, "\xE2\x9A\xA0") == NULL, "host cap protocol has no warning glyph");
+
+        FormatHealthLecture(&info, lecture, sizeof(lecture));
+        ExpectHas(lecture, "Диск сам PCIe 4.0 x4", "lecture says the drive itself is Gen4");
+        ExpectHas(lecture, "DEV_9DB4", "lecture names the port");
+        ExpectHas(lecture, "потолок этой платы", "lecture says this is the board ceiling");
+        ExpectNotHas(lecture, "фиксацию", "lecture does not ask to reseat");
+
+        FormatHealthLectureExpert(&info, expert, sizeof(expert));
+        ExpectHas(expert, "потолок этой платы", "expert lecture says this is the board ceiling");
+        ExpectNotHas(expert, "фиксацию", "expert lecture does not ask to reseat");
+    }
+
+    /* 7. Real downtrain: 3.0 x2 on a port that is also 4.0 x4 */
+    {
+        DRIVE_INFO info;
+        char lecture[4096];
+        memset(&info, 0, sizeof(info));
+        info.bIsNVMe = TRUE;
+        info.bSMART_Supported = TRUE;
+        info.bSMART_Enabled = TRUE;
+        info.bGotNVMeIdent = TRUE;
+        info.nvmeHealth.AvailableSpare = 100;
+        info.nvmeHealth.AvailableSpareThreshold = 10;
+        info.nvmeHealth.PercentageUsed = 0;
+        info.eType = DRIVE_TYPE_NVME;
+        info.nPcieCurLinkSpeed = 3;
+        info.nPcieCurLinkWidth = 2;
+        info.nPcieMaxLinkSpeed = 4;
+        info.nPcieMaxLinkWidth = 4;
+        info.nPcieUpMaxLinkSpeed = 4;
+        info.nPcieUpMaxLinkWidth = 4;
+        ApplyPcieLinkLimit(&info);
+        Expect(info.bLinkDegraded, "3.0 x2 on a 4.0 x4 port is degraded");
+        Expect(!info.bPcieHostCapped, "a real downtrain is not host-capped");
+        AssessDriveHealth(&info);
+        ExpectInt((int)info.eHealthStatus, (int)HEALTH_STATUS_CAUTION, "real PCIe downtrain stays CAUTION");
+        FillDriveProtocol(&info);
+        ExpectHas(info.szProtocol, "\xE2\x9A\xA0", "real downtrain keeps the warning glyph");
+        FormatHealthLecture(&info, lecture, sizeof(lecture));
+        ExpectHas(lecture, "деградация скорости шины PCIe", "real downtrain lecture still warns");
+        ExpectHas(lecture, "фиксацию", "real downtrain still asks to check the seat");
+    }
+
+    /* 8. Port max was not read: keep the old warning */
+    {
+        DRIVE_INFO info;
+        memset(&info, 0, sizeof(info));
+        info.nPcieCurLinkSpeed = 3;
+        info.nPcieCurLinkWidth = 4;
+        info.nPcieMaxLinkSpeed = 4;
+        info.nPcieMaxLinkWidth = 4;
+        ApplyPcieLinkLimit(&info);
+        Expect(info.bLinkDegraded, "unknown upstream still counts as degraded");
+        Expect(!info.bPcieHostCapped, "unknown upstream is not host-capped");
+    }
+
+    /* 9. Below the port as well: still degraded, even if the port is slower than the drive */
+    {
+        DRIVE_INFO info;
+        memset(&info, 0, sizeof(info));
+        info.nPcieCurLinkSpeed = 2;
+        info.nPcieCurLinkWidth = 4;
+        info.nPcieMaxLinkSpeed = 4;
+        info.nPcieMaxLinkWidth = 4;
+        info.nPcieUpMaxLinkSpeed = 3;
+        info.nPcieUpMaxLinkWidth = 4;
+        lstrcpynA(info.szPcieUpDev, "DEV_9DB4", (int)sizeof(info.szPcieUpDev));
+        ApplyPcieLinkLimit(&info);
+        Expect(info.bLinkDegraded, "link below the port is still degraded");
+        Expect(!info.bPcieHostCapped, "link below the port is not called the board ceiling");
+    }
+
+    /* 10. Port is really x2: an x4 drive at x2 is the port, not a bad seat */
+    {
+        DRIVE_INFO info;
+        char lecture[4096];
+        memset(&info, 0, sizeof(info));
+        info.bIsNVMe = TRUE;
+        info.bSMART_Supported = TRUE;
+        info.bSMART_Enabled = TRUE;
+        info.bGotNVMeIdent = TRUE;
+        info.nvmeHealth.AvailableSpare = 100;
+        info.nvmeHealth.AvailableSpareThreshold = 10;
+        info.nvmeHealth.PercentageUsed = 0;
+        info.eType = DRIVE_TYPE_NVME;
+        info.nPcieCurLinkSpeed = 4;
+        info.nPcieCurLinkWidth = 2;
+        info.nPcieMaxLinkSpeed = 4;
+        info.nPcieMaxLinkWidth = 4;
+        info.nPcieUpMaxLinkSpeed = 4;
+        info.nPcieUpMaxLinkWidth = 2;
+        ApplyPcieLinkLimit(&info);
+        Expect(!info.bLinkDegraded, "x2 port does not degrade an x4 drive");
+        Expect(info.bPcieHostCapped, "x2 port caps an x4 drive");
+        AssessDriveHealth(&info);
+        ExpectInt((int)info.eHealthStatus, (int)HEALTH_STATUS_GOOD, "x2 port does not raise the headline");
+        FillDriveProtocol(&info);
+        ExpectHas(info.szProtocol, "диск 4.0 x4", "x2 port protocol names the drive width");
+        ExpectHas(info.szProtocol, "порт 4.0 x2", "x2 port protocol names the port width");
+        Expect(strstr(info.szProtocol, "DEV_") == NULL, "missing port id is not invented");
+        FormatHealthLecture(&info, lecture, sizeof(lecture));
+        ExpectHas(lecture, "Порт, в котором он сидит", "lecture without a port id still names the port");
+        ExpectNotHas(lecture, "фиксацию", "x2 port lecture does not ask to reseat");
+    }
+
     CaseEnd("link-speed-degradation", before);
 }
 

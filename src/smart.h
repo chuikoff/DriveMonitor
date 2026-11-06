@@ -650,10 +650,14 @@ typedef struct _DRIVE_INFO {
     BOOL        bLinkDegraded;
     BYTE        nSataMaxGen;          /* 1 = Gen1 (1.5Gb/s), 2 = Gen2 (3Gb/s), 3 = Gen3 (6Gb/s) */
     BYTE        nSataCurGen;          /* Current negotiated Gen */
-    BYTE        nPcieMaxLinkSpeed;    /* PCIe Gen 1..5 */
+    BYTE        nPcieMaxLinkSpeed;    /* PCIe Gen 1..5, the drive */
     BYTE        nPcieCurLinkSpeed;    /* PCIe Gen 1..5 */
-    BYTE        nPcieMaxLinkWidth;    /* PCIe x1, x2, x4, x8, x16 */
+    BYTE        nPcieMaxLinkWidth;    /* PCIe x1, x2, x4, x8, x16, the drive */
     BYTE        nPcieCurLinkWidth;    /* PCIe x1, x2, x4, x8, x16 */
+    BYTE        nPcieUpMaxLinkSpeed;  /* upstream port max gen, 0 if unread */
+    BYTE        nPcieUpMaxLinkWidth;
+    char        szPcieUpDev[16];      /* "DEV_9DB4" of that port, or empty */
+    BOOL        bPcieHostCapped;      /* link matches the port, below the drive */
     /* SATA PHY Event Counters (SATA Log 11h, standard SATA-IO) */
     BOOL        bSataPhyLogSupported;
     uint64_t    nPhyCommandIcrcErrors;     /* Event 0x0001 */
@@ -855,6 +859,9 @@ int NvmeIdentifyTempC(USHORT kelvin);
 void  FormatPowerOnHours(DWORD dwHours, char* szBuf, int nBufLen);
 void  FormatDriveSummary(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen);
 void  FillDriveProtocol(DRIVE_INFO* pInfo);
+/* Current below min(drive, upstream port) is degraded.
+ * Matching a slower port is the board ceiling. Upstream 0 uses the drive max. */
+void  ApplyPcieLinkLimit(DRIVE_INFO* pInfo);
 void  FillAtaProtocolFromIdent(DRIVE_INFO* pInfo, const WORD* pIdent);
 BOOL  DriveTreatsC0AsPowerLoss(const DRIVE_INFO* pInfo);
 BOOL  IsPowerLossAttrConfirmed(const DRIVE_INFO* pInfo, BYTE bID);
