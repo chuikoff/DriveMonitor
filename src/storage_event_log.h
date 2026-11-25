@@ -41,6 +41,9 @@ BOOL ParseStorageEventXml(const wchar_t* pwszXml, struct _DRIVE_INFO* pDrives, i
 /* Clear / reset event stats structure */
 void ClearStorageEventStats(STORAGE_EVENT_STATS* pStats);
 
+/* Enable / disable filtering out events that occurred before the current system boot (for USB drives) */
+void EnableStorageEventPreBootFilter(BOOL bEnable);
+
 #ifdef __cplusplus
 }
 #endif

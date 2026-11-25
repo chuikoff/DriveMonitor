@@ -58,6 +58,9 @@ BOOL ParseSeagateFarmDriveInfo(const BYTE* pSec512, DRIVE_INFO* pInfo);
 BOOL ParseSeagateFarmWorkload(const BYTE* pSec512, DRIVE_INFO* pInfo);
 BOOL ParseSeagateFarmErrorStats(const BYTE* pSec512, DRIVE_INFO* pInfo);
 BOOL ParseSeagateFarmEnvironment(const BYTE* pSec512, DRIVE_INFO* pInfo);
+
+/* Returns TRUE if ATA GPL (0x2F READ LOG EXT) probes should be attempted on this drive. */
+BOOL DriveShouldQueryAtaGplLogs(const DRIVE_INFO* pInfo);
 void AcquireSeagateFarmLog(HANDLE hDrive, BOOL bIsSAT, DRIVE_INFO* pInfo);
 
 /* Reading / retrieval functions */

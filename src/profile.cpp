@@ -138,6 +138,20 @@ static const PROF_ATTR kPhison[] = {
     PA(0, 0, 0)
 };
 
+/* Phison S8/S9/S10/S11 classic table (e.g. SATA SSD / SBFA10.3, KIOXIA EXCERIA):
+ * overrides 0xA8 (SATA PHY errors instead of specified max erase) and adds
+ * 0xAA (early/later bad blocks), 0xAD (max/avg erase), 0xDA (CRC errors).
+ * Inherits E7, F1/F2, A9, BB, SLC erase, etc. via extends="phison". */
+static const PROF_ATTR kPhisonS11[] = {
+    PN(0xA8, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Ошибки SATA PHY", "SATA PHY errors"),
+    PN(0xAA, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Сбойные блоки (ранние/поздние)", "Bad block count (early/later)"),
+    PN(0xAD, PROF_SEM_ERASE,      PROF_ENC_MAXAVG,  "Циклы стирания (макс./средн.)", "Erase count (max/avg)"),
+    PHN(0xDA, PROF_SEM_INTERFACE, PROF_ENC_COUNTER,
+        "Ошибки CRC", "CRC errors",
+        PROF_RULE_WORSE, PROF_SLOT_NONE, PROF_SCOPE_ANY, 0, 1, 100, 0),
+    PA(0, 0, 0)
+};
+
 static const PROF_ATTR kSamsungSsd[] = {
     /* Value is remaining life when 231 is absent. RAW is not the percent.
      * Preference 0 loses to 231. */
@@ -178,17 +192,61 @@ static const PROF_ATTR kSmi225[] = {
     PN(0xA7, PROF_SEM_ERASE,      PROF_ENC_AVG,     "Среднее стираний", "Average erase count"),
     PN(0xA8, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Макс. стираний по спецификации", "Specified max erase count"),
     PN(0xA9, PROF_SEM_ENDURANCE,  PROF_ENC_PERCENT, "Остаток ресурса", "Life remaining"),
+
     PN(0xAF, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Ошибки программирования (чип)", "Program fail count (chip)"),
     PN(0xB0, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Ошибки стирания (чип)", "Erase fail count (chip)"),
     PN(0xB1, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Выравнивание износа", "Wear leveling"),
     PN(0xB2, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Плохие блоки (runtime)", "Runtime invalid blocks"),
-    PN(0xB5, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Ошибки программирования (всего)", "Program fail count (total)"),
-    PN(0xB6, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Ошибки стирания (всего)", "Erase fail count (total)"),
+    PN(0xB5, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Число программирований (всего)", "Program count (total)"),
+    PN(0xB6, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Число стираний (всего)", "Erase count (total)"),
     PN(0xC3, PROF_SEM_NONE,       PROF_ENC_COUNTER, "ECC контроллера", "Controller ECC"),
+
     PN(0xE8, PROF_SEM_NONE,       PROF_ENC_PERCENT, "Резервное пространство", "Available reserved space"),
     PN(0xF1, PROF_SEM_HOST_WRITE, PROF_ENC_BLOCK32, "Записано хостом", "Host written"),
     PN(0xF2, PROF_SEM_HOST_READ,  PROF_ENC_BLOCK32, "Прочитано хостом", "Host read"),
     PN(0xF5, PROF_SEM_NAND_WRITE, PROF_ENC_BLOCK32, "Записи NAND", "NAND writes"),
+    PA(0, 0, 0)
+};
+
+/* Apacer AS340/AS350 on Silicon Motion SM2258 (e.g. VE firmware).
+ * 163 is max erase, 164 is average erase (drivedb counter), 166 is bad blocks.
+ * 169 (A9h) is life remaining (%). 232 (E8h) is spare blocks (%).
+ * 241/242/249/250 are 32-MiB blocks (BLOCK32). */
+static const PROF_ATTR kApacerSmi[] = {
+    PN(0xA1, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Годные резервные блоки", "Valid spare blocks"),
+
+    PN(0xA9, PROF_SEM_ENDURANCE,  PROF_ENC_PERCENT, "Остаток ресурса", "Life remaining"),
+
+    PN(0xAE, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Неожиданные отключения питания", "Unexpected power loss count"),
+
+    PN(0xB5, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Число программирований (всего)", "Program count (total)"),
+    PN(0xC3, PROF_SEM_NONE,       PROF_ENC_COUNTER, "ECC контроллера", "Controller ECC"),
+    PN(0xCE, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Минимальное стирание", "Min erase count"),
+    PN(0xCF, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Максимальное стирание", "Max erase count"),
+    PN(0xE8, PROF_SEM_NONE,       PROF_ENC_PERCENT, "Резервное пространство", "Available reserved space"),
+    PN(0xF1, PROF_SEM_HOST_WRITE, PROF_ENC_BLOCK32, "Записано хостом", "Host written"),
+    PN(0xF2, PROF_SEM_HOST_READ,  PROF_ENC_BLOCK32, "Прочитано хостом", "Host read"),
+    PN(0xF9, PROF_SEM_NAND_WRITE, PROF_ENC_BLOCK32, "Записи NAND", "NAND writes"),
+    PN(0xFA, PROF_SEM_NONE,       PROF_ENC_BLOCK32, "Чтения NAND", "NAND reads"),
+
+    PA(0, 0, 0)
+};
+
+/* Apacer AS340/AS350 with AP* firmware (e.g. AP202PS0, AP612PE0, AP613PE0).
+ * Distinct from SM2258 VE* firmware: 231 (E7h) is lifetime left (%),
+ * 241 (F1h) is 512-byte LBAs written, and 163/164 are max/avg erase counts. */
+static const PROF_ATTR kApacerAp[] = {
+    PN(0xA3, PROF_SEM_ERASE,      PROF_ENC_MAX,     "Макс. стираний", "Max erase count"),
+    PN(0xA4, PROF_SEM_ERASE,      PROF_ENC_AVG,     "Среднее стираний", "Average erase count"),
+    PN(0xA6, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Плохие блоки", "Bad blocks"),
+    PN(0xA7, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Режим защиты SSD", "SSD protect mode"),
+    PN(0xA8, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Ошибки SATA PHY", "SATA PHY errors"),
+    PN(0xAB, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Ошибки программирования", "Program fail count"),
+    PN(0xAC, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Ошибки стирания", "Erase fail count"),
+    PN(0xAF, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Таблица плохих кластеров", "Bad cluster table count"),
+    PN(0xC0, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Аварийные отключения питания", "Unsafe power-off events"),
+    PN(0xE7, PROF_SEM_ENDURANCE,  PROF_ENC_PERCENT, "Остаток ресурса SSD", "SSD life remaining"),
+    PN(0xF1, PROF_SEM_HOST_WRITE, PROF_ENC_LBA,     "Всего записано (LBA)", "Total LBAs written"),
     PA(0, 0, 0)
 };
 
@@ -221,8 +279,7 @@ static const PROF_ATTR kRealtekSata[] = {
     PN(0xA7, PROF_SEM_ERASE,      PROF_ENC_AVG,     "Среднее стираний", "Average erase count"),
     PN(0xA8, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Макс. стираний по спецификации", "Specified max erase count"),
     PN(0xA9, PROF_SEM_ENDURANCE,  PROF_ENC_PERCENT, "Остаток ресурса SSD", "SSD life remaining"),
-    PN(0xAB, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Ошибки программирования", "Program fail count"),
-    PN(0xAC, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Ошибки стирания", "Erase fail count"),
+
     PN(0xB1, PROF_SEM_WEAR,       PROF_ENC_COUNTER, "Выравнивание износа", "Wear leveling count"),
     PN(0xB2, PROF_SEM_MEDIA,      PROF_ENC_COUNTER, "Сбойные блоки в работе", "Runtime invalid blocks"),
     PN(0xC2, PROF_SEM_THERMAL,    PROF_ENC_COUNTER, "Температура", "Temperature"),
@@ -267,6 +324,43 @@ static const PROF_ATTR kYeestorSata[] = {
     PA(0, 0, 0)
 };
 
+/* Yeestor YS9082HP with HCS* firmware (e.g. Neo Forza NFS121SA312 / HCS1A25P).
+ * Observed telemetry: 0xAF carries packed flags/cluster word, 0xB0 counts
+ * block/erase activity (not failures), and 0xF1/0xF2/0xF5 count 32-MiB blocks. */
+static const PROF_ATTR kYeestorHp[] = {
+    PN(0x01, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Частота ошибок чтения", "Raw read error rate"),
+    PH(0x05, PROF_SEM_MEDIA,      PROF_ENC_LO16,    PROF_RULE_WORSE,
+       PROF_SLOT_REALLOC, PROF_SCOPE_ANY, 0, 1, 0, 10),
+    PN(0x09, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Часы работы", "Power-on hours"),
+    PN(0x0C, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Число включений", "Power cycles"),
+    PN(0xA0, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Неисправимые секторы", "Uncorrectable sectors"),
+    PN(0xA1, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Годные резервные блоки", "Valid spare blocks"),
+    PN(0xA3, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Начальные плохие блоки", "Initial bad blocks"),
+    PN(0xA4, PROF_SEM_ERASE,      PROF_ENC_COUNTER, "Всего стираний", "Total erase count"),
+    PN(0xA5, PROF_SEM_ERASE,      PROF_ENC_MAX,     "Макс. стираний", "Max erase count"),
+    PN(0xA6, PROF_SEM_ERASE,      PROF_ENC_MIN,     "Мин. стираний", "Min erase count"),
+    PN(0xA7, PROF_SEM_ERASE,      PROF_ENC_AVG,     "Среднее стираний", "Average erase count"),
+    PN(0xA8, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Макс. стираний по спецификации", "Specified max erase count"),
+    PN(0xA9, PROF_SEM_ENDURANCE,  PROF_ENC_PERCENT, "Остаток ресурса SSD", "SSD life remaining"),
+    PN(0xAF, PROF_SEM_NONE,       PROF_ENC_PACKED,  "Служебные флаги/кластеры", "Vendor flags / clusters"),
+    PN(0xB0, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Счётчик операций блоков", "Block operation count"),
+    PN(0xB1, PROF_SEM_WEAR,       PROF_ENC_COUNTER, "Выравнивание износа", "Wear leveling counter"),
+    PN(0xB2, PROF_SEM_MEDIA,      PROF_ENC_COUNTER, "Использованные резервные блоки", "Used reserve blocks"),
+    PN(0xB5, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Число программирований (всего)", "Program count (total)"),
+    PN(0xB6, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Число стираний (всего)", "Erase count (total)"),
+    PN(0xC0, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Небезопасные отключения питания", "Unsafe power loss count"),
+    PN(0xC2, PROF_SEM_THERMAL,    PROF_ENC_COUNTER, "Температура", "Temperature"),
+    PN(0xC3, PROF_SEM_NONE,       PROF_ENC_COUNTER, "ECC контроллера", "Controller ECC"),
+    PHN(0xC7, PROF_SEM_INTERFACE, PROF_ENC_COUNTER,
+        "Ошибки CRC", "CRC errors",
+        PROF_RULE_WORSE, PROF_SLOT_CRC, PROF_SCOPE_ANY, 0, 1, 100, 0),
+    PN(0xE8, PROF_SEM_NONE,       PROF_ENC_PERCENT, "Резервное пространство", "Available reserved space"),
+    PN(0xF1, PROF_SEM_HOST_WRITE, PROF_ENC_BLOCK32, "Записано хостом", "Host written"),
+    PN(0xF2, PROF_SEM_HOST_READ,  PROF_ENC_BLOCK32, "Прочитано хостом", "Host read"),
+    PN(0xF5, PROF_SEM_NAND_WRITE, PROF_ENC_BLOCK32, "Записи Flash", "Flash writes"),
+    PA(0, 0, 0)
+};
+
 static const PROF_ATTR kIntel[] = {
     PN(0xAA, PROF_SEM_WEAR,       PROF_ENC_PERCENT, "Доступное резервное пространство", "Available reserved space"),
     PN(0xE1, PROF_SEM_HOST_WRITE, PROF_ENC_BLOCK32, "Записи хоста", "Host writes"),
@@ -295,6 +389,33 @@ static const PROF_ATTR kCrucialMicron[] = {
     PA(0, 0, 0)
 };
 
+/* Crucial BX/MX SATA SSDs on Silicon Motion controllers (SM2258/SM2259).
+ * Attribute 202 (0xCA) is percent lifetime remaining (Value is remaining %, RAW is % used).
+ * Attribute 246 (0xF6) is host LBAs written.
+ * Attribute 180 (0xB4) is unused reserve NAND blocks.
+ * Attribute 173 (0xAD) is average block erase count.
+ * Attribute 187 (0xBB) is uncorrectable errors (caution from 1). */
+static const PROF_ATTR kCrucialSmi[] = {
+    PN(0x05, PROF_SEM_MEDIA,       PROF_ENC_COUNTER, "Переназначенные блоки NAND", "Reallocated NAND blocks"),
+    PN(0xAB, PROF_SEM_NONE,        PROF_ENC_COUNTER, "Ошибки программирования", "Program fail count"),
+    PN(0xAC, PROF_SEM_NONE,        PROF_ENC_COUNTER, "Ошибки стирания", "Erase fail count"),
+    PN(0xAD, PROF_SEM_ERASE,       PROF_ENC_AVG,     "Среднее число стираний", "Average erase count"),
+    PN(0xAE, PROF_SEM_NONE,        PROF_ENC_COUNTER, "Аварийные отключения", "Unexpected power loss count"),
+    PN(0xB4, PROF_SEM_WEAR,        PROF_ENC_COUNTER, "Резервные блоки NAND", "Unused reserve NAND blocks"),
+    PHN(0xBB, PROF_SEM_MEDIA,      PROF_ENC_COUNTER,
+        "Неисправимые ошибки", "Uncorrectable errors",
+        PROF_RULE_WORSE, PROF_SLOT_NONE, PROF_SCOPE_SSD, 0, 1, 0, 0),
+    PN(0xC2, PROF_SEM_THERMAL,    PROF_ENC_COUNTER, "Температура", "Temperature"),
+    PHN(0xC7, PROF_SEM_INTERFACE,  PROF_ENC_COUNTER,
+        "Ошибки CRC", "CRC errors",
+        PROF_RULE_WORSE, PROF_SLOT_CRC, PROF_SCOPE_ANY, 0, 1, 100, 0),
+    PN(0xCA, PROF_SEM_ENDURANCE,   PROF_ENC_VALUE,   "Остаток ресурса SSD", "SSD life remaining"),
+    PN(0xF6, PROF_SEM_HOST_WRITE,  PROF_ENC_LBA,     "Записано хостом (ГБ)", "Host written (GB)"),
+    PN(0xF7, PROF_SEM_NONE,        PROF_ENC_COUNTER, "Страниц хоста записано", "Host program page count"),
+    PN(0xF8, PROF_SEM_NONE,        PROF_ENC_COUNTER, "Страниц FTL записано", "FTL program page count"),
+    PA(0, 0, 0)
+};
+
 static const PROF_ATTR kSeagateHdd[] = {
     PN(0x01, PROF_SEM_NONE,      PROF_ENC_COUNTER, "Частота ошибок чтения (RAW вендора)", "Read Error Rate (vendor RAW)"),
     PHN(0xBB, PROF_SEM_MEDIA, PROF_ENC_REPORTED,
@@ -302,6 +423,8 @@ static const PROF_ATTR kSeagateHdd[] = {
         PROF_RULE_WORSE, PROF_SLOT_REPORTED, PROF_SCOPE_ANY, 0, 0, 1, 0),
     PN(0xC3, PROF_SEM_NONE,      PROF_ENC_COUNTER, "Восстановлено ECC (чтение)", "Hardware ECC recovered"),
     PN(0xF0, PROF_SEM_NONE,      PROF_ENC_COUNTER, "Часы полёта головок", "Head flying hours"),
+    PN(0xF1, PROF_SEM_HOST_WRITE, PROF_ENC_LBA,    "Всего записано (LBA)", "Total LBAs written"),
+    PN(0xF2, PROF_SEM_HOST_READ,  PROF_ENC_LBA,    "Всего прочитано (LBA)", "Total LBAs read"),
     PA(0, 0, 0)
 };
 
@@ -311,6 +434,10 @@ static const PROF_ATTR kToshibaHdd[] = {
     PHN(0xC7, PROF_SEM_INTERFACE, PROF_ENC_COUNTER,
         "Ошибки CRC", "CRC errors",
         PROF_RULE_WORSE, PROF_SLOT_CRC, PROF_SCOPE_ANY, 0, 1, 100, 0),
+    PN(0xF1, PROF_SEM_HOST_WRITE, PROF_ENC_LBA,
+       "Всего записано (LBA)", "Total LBAs written"),
+    PN(0xF2, PROF_SEM_HOST_READ,  PROF_ENC_LBA,
+       "Всего прочитано (LBA)", "Total LBAs read"),
     PA(0, 0, 0)
 };
 
@@ -338,6 +465,54 @@ static const PROF_ATTR kToshibaSsd[] = {
        "Записано хостом", "Host written"),
     PN(0xF2, PROF_SEM_HOST_READ,  PROF_ENC_BLOCK32,
        "Прочитано хостом", "Host read"),
+    PA(0, 0, 0)
+};
+
+/* SandForce SF-2281 SATA SSDs (Kingston V300/HyperX/KC300 ABBF0, SanDisk Extreme SF-2281, etc.)
+ * 231 (E7h): normalized Value (100..1) is SSD life remaining; RAW is packed/internal.
+ * 241/242 (F1h/F2h): lifetime host writes/reads already in GiB. */
+static const PROF_ATTR kSandForce[] = {
+    PN(0xAA, PROF_SEM_WEAR,       PROF_ENC_COUNTER, "Резервные блоки", "Reserve block count"),
+    PN(0xAB, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Ошибки программирования", "Program fail count"),
+    PN(0xAC, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Ошибки стирания", "Erase fail count"),
+    PN(0xAE, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Аварийные отключения питания", "Unexpected power loss count"),
+    PN(0xE7, PROF_SEM_ENDURANCE,  PROF_ENC_VALUE,   "Остаток ресурса SSD", "SSD life remaining"),
+    PN(0xF1, PROF_SEM_HOST_WRITE, PROF_ENC_GIB,     "Записано хостом (ГиБ)", "Lifetime writes (GiB)"),
+    PN(0xF2, PROF_SEM_HOST_READ,  PROF_ENC_GIB,     "Прочитано хостом (ГиБ)", "Lifetime reads (GiB)"),
+    PA(0, 0, 0)
+};
+
+/* WD Blue / Red / Green SATA SSDs and SanDisk Ultra 3D / SSD Plus / Ultra II.
+ * drivedb: 166/168/173 are Min/Max/Avg P/E cycles, 233/241/242 are already GiB.
+ * 230 (Media_Wearout_Indicator) varies by firmware encoding, so it is not guessed here. */
+static const PROF_ATTR kWdSandiskSsd[] = {
+    PN(0xA6, PROF_SEM_ERASE,      PROF_ENC_MIN,     "Мин. циклов стирания", "Min P/E cycles"),
+    PN(0xA8, PROF_SEM_ERASE,      PROF_ENC_MAX,     "Макс. циклов стирания", "Max P/E cycles"),
+    PN(0xAB, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Ошибки программирования", "Program fail count"),
+    PN(0xAC, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Ошибки стирания", "Erase fail count"),
+    PN(0xAD, PROF_SEM_ERASE,      PROF_ENC_AVG,     "Среднее циклов стирания", "Average P/E cycles"),
+    PN(0xAE, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Неожиданные отключения питания", "Unexpected power loss count"),
+    PN(0xE6, PROF_SEM_NONE,       PROF_ENC_PACKED,  "Индикатор износа", "Media wearout indicator"),
+    PN(0xE8, PROF_SEM_NONE,       PROF_ENC_PERCENT, "Резервное пространство", "Available reserved space"),
+    PN(0xE9, PROF_SEM_NAND_WRITE, PROF_ENC_GIB,     "Записи NAND (ГиБ)", "NAND writes (GiB)"),
+    PN(0xF1, PROF_SEM_HOST_WRITE, PROF_ENC_GIB,     "Записано хостом (ГиБ)", "Host writes (GiB)"),
+    PN(0xF2, PROF_SEM_HOST_READ,  PROF_ENC_GIB,     "Прочитано хостом (ГиБ)", "Host reads (GiB)"),
+    PN(0xF4, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Тепловой троттлинг", "Thermal throttle status"),
+    PA(0, 0, 0)
+};
+
+/* Kingston SSDNow UV400 / UV500 (Marvell 88SS1074).
+ * 231 (E7h): SSD_Life_Left (0..100 % remaining in low RAW byte & Value).
+ * 241/242 (F1h/F2h): Host Writes / Reads in GiB. */
+static const PROF_ATTR kKingstonMarvell[] = {
+    PN(0xAA, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Резервные блоки", "Reserved block count"),
+    PN(0xAB, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Ошибки программирования", "Program fail count"),
+    PN(0xAC, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Ошибки стирания", "Erase fail count"),
+    PN(0xAE, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Аварийные отключения питания", "Unexpected power loss count"),
+    PN(0xE7, PROF_SEM_ENDURANCE,  PROF_ENC_PERCENT, "Остаток ресурса SSD", "SSD life remaining"),
+    PN(0xF1, PROF_SEM_HOST_WRITE, PROF_ENC_GIB,     "Записано хостом (ГиБ)", "Host writes (GiB)"),
+    PN(0xF2, PROF_SEM_HOST_READ,  PROF_ENC_GIB,     "Прочитано хостом (ГиБ)", "Host reads (GiB)"),
+    PN(0xFA, PROF_SEM_NONE,       PROF_ENC_COUNTER, "Повторные чтения", "Read retry count"),
     PA(0, 0, 0)
 };
 
@@ -386,7 +561,7 @@ static const DRIVE_PROFILE kProfiles[] = {
       "Silicon Motion SM2258/SM2259", NULL, kSmi225, 0, NULL },
     { "smi-ve", NULL, PROF_KIND_CONTROLLER, NULL, NULL, PROF_FW_VE,
       VENDOR_UNKNOWN, CONTROLLER_SMI, 0, 0,
-      "Silicon Motion SM2258", NULL, NULL, 0, NULL },
+      "Silicon Motion SM2258", NULL, kApacerSmi, 0, NULL },
     { "samsung-870-svt", "samsung-ssd", PROF_KIND_EXACT, "870", "SVT", PROF_FW_SUBSTR,
       VENDOR_UNKNOWN, CONTROLLER_SAMSUNG, 0, 0, "Samsung MKX", NULL, NULL, 0, NULL },
     { "samsung-mznln", "samsung-ssd", PROF_KIND_EXACT, "MZNLN", NULL, PROF_FW_NONE,
@@ -443,6 +618,48 @@ static const DRIVE_PROFILE kProfiles[] = {
     { "ys9083", "yeestor-sata", PROF_KIND_FAMILY, "YS9083", NULL, PROF_FW_NONE,
       VENDOR_UNKNOWN, CONTROLLER_YEESTOR, 0, 0, "Yeestor YS9083", NULL, kYeestorSata, 0, NULL },
 
+    { "hynix-nvme", NULL, PROF_KIND_CONTROLLER, NULL, NULL, PROF_FW_NONE,
+      VENDOR_SKHYNIX, CONTROLLER_HYNIX, 1, 0, "SK Hynix", NULL, NULL, 0, NULL },
+    { "hynix-bc", "hynix-nvme", PROF_KIND_FAMILY, "HFM", NULL, PROF_FW_NONE,
+      VENDOR_SKHYNIX, CONTROLLER_HYNIX, 1, 0, "SK Hynix ACNS033 / Cepheus", "1.3.0", NULL, 0, NULL },
+    { "hynix-bc5", "hynix-bc", PROF_KIND_FAMILY, "BC5", NULL, PROF_FW_NONE,
+      VENDOR_SKHYNIX, CONTROLLER_HYNIX, 1, 0, "SK Hynix ACNS033 / Cepheus", "1.3.0", NULL, 0, NULL },
+    { "hynix-bc7", "hynix-bc", PROF_KIND_FAMILY, "BC7", NULL, PROF_FW_NONE,
+      VENDOR_SKHYNIX, CONTROLLER_HYNIX, 1, 0, "SK Hynix ACNS033 / Cepheus", "1.4.0", NULL, 0, NULL },
+    { "hynix-pc7", "hynix-nvme", PROF_KIND_FAMILY, "PC7", NULL, PROF_FW_NONE,
+      VENDOR_SKHYNIX, CONTROLLER_HYNIX, 1, 0, "SK Hynix Aries", "1.4.0", NULL, 0, NULL },
+    { "hynix-pc8", "hynix-nvme", PROF_KIND_FAMILY, "PC8", NULL, PROF_FW_NONE,
+      VENDOR_SKHYNIX, CONTROLLER_HYNIX, 1, 0, "SK Hynix Alvord", "1.4.0", NULL, 0, NULL },
+    { "hynix-gold-p31", "hynix-nvme", PROF_KIND_EXACT, "SHGP31", NULL, PROF_FW_NONE,
+      VENDOR_SKHYNIX, CONTROLLER_HYNIX, 1, 0, "SK Hynix ACNS044 / Cepheus", "1.4.0", NULL, 0, NULL },
+    { "hynix-platinum-p41", "hynix-nvme", PROF_KIND_EXACT, "SHPP41", NULL, PROF_FW_NONE,
+      VENDOR_SKHYNIX, CONTROLLER_HYNIX, 1, 0, "SK Hynix Aries", "1.4.0", NULL, 0, NULL },
+
+    { "wd-sandisk-nvme", NULL, PROF_KIND_CONTROLLER, NULL, NULL, PROF_FW_NONE,
+      VENDOR_SANDISK, CONTROLLER_SANDISK, 1, 0, "SanDisk", NULL, NULL, 0, NULL },
+    { "sandisk-sn5100", "wd-sandisk-nvme", PROF_KIND_FAMILY, "SN5100", NULL, PROF_FW_NONE,
+      VENDOR_SANDISK, CONTROLLER_SANDISK, 1, 0, "SanDisk 20-82-10081 (Hermes)", "2.0.0", NULL, 0, NULL },
+    { "sandisk-sdfq", "wd-sandisk-nvme", PROF_KIND_FAMILY, "SDFQ", NULL, PROF_FW_NONE,
+      VENDOR_SANDISK, CONTROLLER_SANDISK, 1, 0, "SanDisk 20-82-10081 (Hermes)", "2.0.0", NULL, 0, NULL },
+    { "wd-sn5000", "wd-sandisk-nvme", PROF_KIND_FAMILY, "SN5000", NULL, PROF_FW_NONE,
+      VENDOR_WDC, CONTROLLER_WD, 1, 0, "SanDisk 20-82-10081 (Hermes)", "2.0.0", NULL, 0, NULL },
+    { "wd-sn580", "wd-sandisk-nvme", PROF_KIND_FAMILY, "SN580", NULL, PROF_FW_NONE,
+      VENDOR_WDC, CONTROLLER_WD, 1, 0, "SanDisk 20-82-10081 (Hermes)", "1.4.0", NULL, 0, NULL },
+    { "wd-sn770", "wd-sandisk-nvme", PROF_KIND_FAMILY, "SN770", NULL, PROF_FW_NONE,
+      VENDOR_WDC, CONTROLLER_WD, 1, 0, "SanDisk 20-82-10081 (Hermes)", "1.4.0", NULL, 0, NULL },
+    { "wd-sn850x", "wd-sandisk-nvme", PROF_KIND_FAMILY, "SN850X", NULL, PROF_FW_NONE,
+      VENDOR_WDC, CONTROLLER_WD, 1, 0, "SanDisk 20-82-20035 (Black)", "1.4.0", NULL, 0, NULL },
+    { "wd-sn850", "wd-sandisk-nvme", PROF_KIND_FAMILY, "SN850", NULL, PROF_FW_NONE,
+      VENDOR_WDC, CONTROLLER_WD, 1, 0, "SanDisk 20-82-10034 (Black)", "1.4.0", NULL, 0, NULL },
+    { "wd-sn750", "wd-sandisk-nvme", PROF_KIND_FAMILY, "SN750", NULL, PROF_FW_NONE,
+      VENDOR_WDC, CONTROLLER_WD, 1, 0, "SanDisk 20-82-007011 (Triton)", "1.3.0", NULL, 0, NULL },
+    { "wd-sn570", "wd-sandisk-nvme", PROF_KIND_FAMILY, "SN570", NULL, PROF_FW_NONE,
+      VENDOR_WDC, CONTROLLER_WD, 1, 0, "SanDisk 20-82-10048 (Hermes)", "1.4.0", NULL, 0, NULL },
+    { "wd-sn550", "wd-sandisk-nvme", PROF_KIND_FAMILY, "SN550", NULL, PROF_FW_NONE,
+      VENDOR_WDC, CONTROLLER_WD, 1, 0, "SanDisk 20-82-01024 (Hermes)", "1.4.0", NULL, 0, NULL },
+    { "wd-sn740", "wd-sandisk-nvme", PROF_KIND_FAMILY, "SN740", NULL, PROF_FW_NONE,
+      VENDOR_WDC, CONTROLLER_WD, 1, 0, "SanDisk 20-82-10081 (Hermes)", "1.4.0", NULL, 0, NULL },
+
     { "crucial-micron", NULL, PROF_KIND_VENDOR, NULL, NULL, PROF_FW_NONE,
       VENDOR_MICRON, CONTROLLER_UNKNOWN, 0, 0, NULL, NULL, kCrucialMicron, 0, NULL },
     { "seagate-hdd", NULL, PROF_KIND_VENDOR, NULL, NULL, PROF_FW_NONE,
@@ -464,11 +681,36 @@ static const DRIVE_PROFILE kProfiles[] = {
      * still covers Crucial_ and Micron_ models that are not MX200. */
     { "mx200", NULL, PROF_KIND_FAMILY, "MX200", NULL, PROF_FW_NONE,
       VENDOR_UNKNOWN, CONTROLLER_UNKNOWN, 0, 0, NULL, NULL, kCrucialMicron, 0, NULL },
+    { "bx500", "crucial-micron", PROF_KIND_FAMILY, "BX500", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 0, 0, "Silicon Motion SM2258XT/SM2259XT", NULL, kCrucialSmi, 0, NULL },
+    { "mx500", "crucial-micron", PROF_KIND_FAMILY, "MX500", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 0, 0, "Silicon Motion SM2258", NULL, kCrucialSmi, 0, NULL },
+    { "bx300", "crucial-micron", PROF_KIND_FAMILY, "BX300", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 0, 0, "Silicon Motion SM2258", NULL, kCrucialSmi, 0, NULL },
 
     { "micron-2400", NULL, PROF_KIND_EXACT, "MICRON_2400", NULL, PROF_FW_NONE,
       VENDOR_UNKNOWN, CONTROLLER_SMI, 1, 0, "Silicon Motion SM2269XT", "1.4.0", NULL, 0, NULL },
     { "micron-2400-mtfd", NULL, PROF_KIND_EXACT, "2400_MTFD", NULL, PROF_FW_NONE,
       VENDOR_UNKNOWN, CONTROLLER_SMI, 1, 0, "Silicon Motion SM2269XT", "1.4.0", NULL, 0, NULL },
+    /* Intel consumer NVMe SSD series (Silicon Motion controllers):
+     * 660p / 665p: Silicon Motion SM2263, NVMe 1.3
+     * 670p: Silicon Motion SM2265, NVMe 1.4
+     * 760p / Pro 7600p: Silicon Motion SM2262, NVMe 1.3
+     * 600p / Pro 6000p: Silicon Motion SM2260, NVMe 1.2 */
+    { "intel-660p", NULL, PROF_KIND_EXACT, "SSDPEKNW", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 1, 0, "Silicon Motion SM2263", "1.3.0", NULL, 0, NULL },
+    { "intel-670p", NULL, PROF_KIND_EXACT, "SSDPEKNU", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 1, 0, "Silicon Motion SM2265", "1.4.0", NULL, 0, NULL },
+    { "intel-670p-4", NULL, PROF_KIND_EXACT, "SSDPEKN4", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 1, 0, "Silicon Motion SM2265", "1.4.0", NULL, 0, NULL },
+    { "intel-760p", NULL, PROF_KIND_EXACT, "SSDPEMKF", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 1, 0, "Silicon Motion SM2262", "1.3.0", NULL, 0, NULL },
+    { "intel-7600p", NULL, PROF_KIND_EXACT, "SSDPEMKE", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 1, 0, "Silicon Motion SM2262", "1.3.0", NULL, 0, NULL },
+    { "intel-600p", NULL, PROF_KIND_EXACT, "SSDPEKKW", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 1, 0, "Silicon Motion SM2260", "1.2.0", NULL, 0, NULL },
+    { "intel-6000p", NULL, PROF_KIND_EXACT, "SSDPEKKF", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 1, 0, "Silicon Motion SM2260", "1.2.0", NULL, 0, NULL },
     { "sx8200pnp", NULL, PROF_KIND_EXACT, "SX8200PNP", NULL, PROF_FW_NONE,
       VENDOR_UNKNOWN, CONTROLLER_SMI, -1, 0,
       "Silicon Motion SM2262EN/SM2262ENG/SM2262G", "1.3.0", NULL, 0, NULL },
@@ -485,21 +727,62 @@ static const DRIVE_PROFILE kProfiles[] = {
      * The row names the chip and does not reinterpret the NVMe log. */
     { "gammix-s50-lite", NULL, PROF_KIND_EXACT, "GAMMIX S50 LITE", NULL, PROF_FW_NONE,
       VENDOR_UNKNOWN, CONTROLLER_SMI, 1, 0, "Silicon Motion SM2267XT", "1.4.0", NULL, 0, NULL },
+    /* ADATA Legend NVMe series:
+     * Legend 900 ships primarily with Phison PS5027-E27T (ERFM firmware),
+     * or alternatively Maxio MAP1602 (SN / H firmware). */
+    { "legend-900-erfm", NULL, PROF_KIND_EXACT, "LEGEND 900", "ERFM", PROF_FW_SUBSTR,
+      VENDOR_UNKNOWN, CONTROLLER_PHISON, 1, 0, "Phison PS5027-E27T", "1.4.0", NULL, 0, NULL },
+    { "legend-900-maxio", NULL, PROF_KIND_EXACT, "LEGEND 900", "SN", PROF_FW_SUBSTR,
+      VENDOR_UNKNOWN, CONTROLLER_MAXIO, 1, 0, "Maxio MAP1602", "2.0.0", NULL, 0, NULL },
+    { "legend-900", NULL, PROF_KIND_EXACT, "LEGEND 900", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_UNKNOWN, 1, 0, NULL, "1.4.0", NULL, 0, NULL },
+    { "legend-970", NULL, PROF_KIND_EXACT, "LEGEND 970", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_PHISON, 1, 0, "Phison PS5026-E26", "2.0.0", NULL, 0, NULL },
+    { "legend-960", NULL, PROF_KIND_EXACT, "LEGEND 960", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 1, 0, "Silicon Motion SM2264", "1.4.0", NULL, 0, NULL },
+    { "legend-850", NULL, PROF_KIND_EXACT, "LEGEND 850", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 1, 0, "Silicon Motion SM2269XT", "1.4.0", NULL, 0, NULL },
+    { "legend-840", NULL, PROF_KIND_EXACT, "LEGEND 840", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_INNOGRIT, 1, 0, "Innogrit IG5220", "1.4.0", NULL, 0, NULL },
+    { "legend-800", NULL, PROF_KIND_EXACT, "LEGEND 800", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 1, 0, "Silicon Motion SM2267XT", "1.4.0", NULL, 0, NULL },
+    { "legend-750", NULL, PROF_KIND_EXACT, "LEGEND 750", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_MAXIO, 1, 0, "Maxio MAP1202", "1.4.0", NULL, 0, NULL },
+    { "legend-700", NULL, PROF_KIND_EXACT, "LEGEND 700", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_REALTEK, 1, 0, "Realtek RTS5766DL", "1.4.0", NULL, 0, NULL },
     { "xpg-s11", NULL, PROF_KIND_EXACT, "XPG S11", NULL, PROF_FW_NONE,
       VENDOR_UNKNOWN, CONTROLLER_SMI, -1, 0,
       "Silicon Motion SM2262EN/SM2262ENG/SM2262G", "1.3.0", NULL, 0, NULL },
     { "su800", NULL, PROF_KIND_EXACT, "SU800", NULL, PROF_FW_NONE,
       VENDOR_UNKNOWN, CONTROLLER_SMI, 0, 0, "Silicon Motion SM2258/SM2259", NULL, NULL, 0, NULL },
-    { "as340", NULL, PROF_KIND_EXACT, "AS340", NULL, PROF_FW_NONE,
-      VENDOR_UNKNOWN, CONTROLLER_SMI, 0, 0, "Silicon Motion SM2258", NULL, NULL, 0, NULL },
+    { "su650-smi225", NULL, PROF_KIND_EXACT, "SU650", NULL, PROF_FW_SMI225,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 0, 0, "Silicon Motion SM2258/SM2259", NULL, kSmi225, 0, NULL },
+    { "su630-smi225", NULL, PROF_KIND_EXACT, "SU630", NULL, PROF_FW_SMI225,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 0, 0, "Silicon Motion SM2258/SM2259", NULL, kSmi225, 0, NULL },
+    { "sp550-smi225", NULL, PROF_KIND_EXACT, "SP550", NULL, PROF_FW_SMI225,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 0, 0, "Silicon Motion SM2258", NULL, kSmi225, 0, NULL },
+    { "hp-s700-smi225", NULL, PROF_KIND_EXACT, "SSD S700", NULL, PROF_FW_SMI225,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 0, 0, "Silicon Motion SM2258", NULL, kSmi225, 0, NULL },
+    { "dexp-c100-smi225", NULL, PROF_KIND_EXACT, "DEXP SSD C100", NULL, PROF_FW_SMI225,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 0, 0, "Silicon Motion SM2258/SM2259", NULL, kSmi225, 0, NULL },
+    { "kc600-smi", NULL, PROF_KIND_EXACT, "SKC600", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 0, 0, "Silicon Motion SM2259", NULL, kSmi225, 0, NULL },
+    { "as340-ap", NULL, PROF_KIND_EXACT, "AS340", NULL, PROF_FW_AP,
+      VENDOR_UNKNOWN, CONTROLLER_UNKNOWN, 0, 0, NULL, NULL, kApacerAp, 0, NULL },
+    { "as340", NULL, PROF_KIND_EXACT, "AS340", NULL, PROF_FW_VE,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 0, 0, "Silicon Motion SM2258", NULL, kApacerSmi, 0, NULL },
+    { "as350-ap", NULL, PROF_KIND_EXACT, "AS350", NULL, PROF_FW_AP,
+      VENDOR_UNKNOWN, CONTROLLER_UNKNOWN, 0, 0, NULL, NULL, kApacerAp, 0, NULL },
     { "as350", NULL, PROF_KIND_EXACT, "AS350", NULL, PROF_FW_NONE,
       VENDOR_UNKNOWN, CONTROLLER_SMI, 0, 0, "Silicon Motion SM2258", NULL, NULL, 0, NULL },
     { "samsung-870-evo", "samsung-ssd", PROF_KIND_EXACT, "870 EVO", NULL, PROF_FW_NONE,
       VENDOR_UNKNOWN, CONTROLLER_SAMSUNG, 0, 0, "Samsung MKX", NULL, NULL, 0, NULL },
     { "samsung-870evo", "samsung-ssd", PROF_KIND_EXACT, "870EVO", NULL, PROF_FW_NONE,
       VENDOR_UNKNOWN, CONTROLLER_SAMSUNG, 0, 0, "Samsung MKX", NULL, NULL, 0, NULL },
-    { "r5sl", "phison", PROF_KIND_EXACT, "R5SL", NULL, PROF_FW_NONE,
+    { "r5sl-sbfm", "phison", PROF_KIND_EXACT, "R5SL", "SBFM", PROF_FW_SUBSTR,
       VENDOR_UNKNOWN, CONTROLLER_PHISON, 0, 0, "Phison PS3111-S11", NULL, NULL, 0, NULL },
+    { "r5sl-smi225", NULL, PROF_KIND_EXACT, "R5SL", NULL, PROF_FW_SMI225,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 0, 0, "Silicon Motion SM2258/SM2259", NULL, kSmi225, 0, NULL },
     { "gammix-s70", NULL, PROF_KIND_EXACT, "GAMMIX S70", NULL, PROF_FW_NONE,
       VENDOR_UNKNOWN, CONTROLLER_INNOGRIT, 1, 0, "Innogrit IG5236", "1.4.0", NULL, 0, NULL },
     { "p210-u11", "phison", PROF_KIND_EXACT, "P210", "U11", PROF_FW_SUBSTR,
@@ -523,8 +806,137 @@ static const DRIVE_PROFILE kProfiles[] = {
       VENDOR_UNKNOWN, CONTROLLER_PHISON, 0, 0, "Phison PS3111-S11", NULL, NULL, 0, NULL },
     { "m450", "phison", PROF_KIND_EXACT, "M450", NULL, PROF_FW_NONE,
       VENDOR_UNKNOWN, CONTROLLER_PHISON, -1, 0, "Phison PS5019-E19T", NULL, NULL, 0, NULL },
+    { "spcc-m2-q0627a0", NULL, PROF_KIND_EXACT, "SPCC M.2 SSD", "Q0627A0", PROF_FW_SUBSTR,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 0, 0, "Silicon Motion SM2258/SM2259", NULL, kSmi225, 0, NULL },
+    { "spcc-m2-u0506a0", NULL, PROF_KIND_EXACT, "SPCC M.2 SSD", "U0506A0", PROF_FW_SUBSTR,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 0, 0, "Silicon Motion SM2258/SM2259", NULL, kSmi225, 0, NULL },
+    { "spcc-m2-u1209a0", NULL, PROF_KIND_EXACT, "SPCC M.2 SSD", "U1209A0", PROF_FW_SUBSTR,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 0, 0, "Silicon Motion SM2258/SM2259", NULL, kSmi225, 0, NULL },
     { "spcc-m2", "phison", PROF_KIND_EXACT, "SPCC M.2 SSD", NULL, PROF_FW_NONE,
-      VENDOR_UNKNOWN, CONTROLLER_PHISON, 0, 0, "Phison PS3111-S11", NULL, NULL, 0, NULL }
+      VENDOR_UNKNOWN, CONTROLLER_PHISON, 0, 0, "Phison PS3111-S11", NULL, NULL, 0, NULL },
+
+    { "sv300-sf", NULL, PROF_KIND_EXACT, "SV300", "ABBF0", PROF_FW_SUBSTR,
+      VENDOR_UNKNOWN, CONTROLLER_SANDFORCE, 0, 0, "SandForce SF-2281", NULL, kSandForce, 0, NULL },
+    { "sh103s3-sf", NULL, PROF_KIND_EXACT, "SH103S3", "ABBF0", PROF_FW_SUBSTR,
+      VENDOR_UNKNOWN, CONTROLLER_SANDFORCE, 0, 0, "SandForce SF-2281", NULL, kSandForce, 0, NULL },
+    { "skc300-sf", NULL, PROF_KIND_EXACT, "SKC300", "ABBF0", PROF_FW_SUBSTR,
+      VENDOR_UNKNOWN, CONTROLLER_SANDFORCE, 0, 0, "SandForce SF-2281", NULL, kSandForce, 0, NULL },
+    { "sdssdx-sf", NULL, PROF_KIND_EXACT, "SDSSDX", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_SANDFORCE, 0, 0, "SandForce SF-2281", NULL, kSandForce, 0, NULL },
+    { "patriot-pyro", NULL, PROF_KIND_EXACT, "Patriot Pyro", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_SANDFORCE, 0, 0, "SandForce SF-2281", NULL, kSandForce, 0, NULL },
+
+    { "sandisk-ultra3d", NULL, PROF_KIND_EXACT, "SDSSDH3", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_MARVELL, 0, 0, "Marvell 88SS1074", NULL, kWdSandiskSsd, 0, NULL },
+    { "sandisk-ultra2", NULL, PROF_KIND_EXACT, "SDSSDHII", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_MARVELL, 0, 0, "Marvell 88SS9189/88SS9190", NULL, kWdSandiskSsd, 0, NULL },
+    { "sandisk-ssd-plus", NULL, PROF_KIND_EXACT, "SSD PLUS", NULL, PROF_FW_NONE,
+      VENDOR_SANDISK, CONTROLLER_UNKNOWN, 0, 0, NULL, NULL, kWdSandiskSsd, 0, NULL },
+    { "wd-wdbnce", NULL, PROF_KIND_EXACT, "WDBNCE", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_MARVELL, 0, 0, "Marvell 88SS1074", NULL, kWdSandiskSsd, 0, NULL },
+    { "wd-blue-sa510", NULL, PROF_KIND_EXACT, "WD Blue SA510", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_UNKNOWN, 0, 0, NULL, NULL, kWdSandiskSsd, 0, NULL },
+    { "wd-red-sa500", NULL, PROF_KIND_EXACT, "WD Red SA500", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_MARVELL, 0, 0, "Marvell 88SS1074", NULL, kWdSandiskSsd, 0, NULL },
+    { "wd-green-25", NULL, PROF_KIND_EXACT, "WD Green 2.5", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_UNKNOWN, 0, 0, NULL, NULL, kWdSandiskSsd, 0, NULL },
+    { "wd-green-m2", NULL, PROF_KIND_EXACT, "WD Green M.2", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_UNKNOWN, 0, 0, NULL, NULL, kWdSandiskSsd, 0, NULL },
+    { "wd-blue-1b0a", NULL, PROF_KIND_EXACT, "1B0A", NULL, PROF_FW_NONE,
+      VENDOR_WDC, CONTROLLER_MARVELL, 0, 0, "Marvell 88SS1074", NULL, kWdSandiskSsd, 0, NULL },
+    { "wd-blue-2b0a", NULL, PROF_KIND_EXACT, "2B0A", NULL, PROF_FW_NONE,
+      VENDOR_WDC, CONTROLLER_MARVELL, 0, 0, "Marvell 88SS1074", NULL, kWdSandiskSsd, 0, NULL },
+    { "wd-green-1g0a", NULL, PROF_KIND_EXACT, "1G0A", NULL, PROF_FW_NONE,
+      VENDOR_WDC, CONTROLLER_UNKNOWN, 0, 0, NULL, NULL, kWdSandiskSsd, 0, NULL },
+    { "wd-green-2g0a", NULL, PROF_KIND_EXACT, "2G0A", NULL, PROF_FW_NONE,
+      VENDOR_WDC, CONTROLLER_UNKNOWN, 0, 0, NULL, NULL, kWdSandiskSsd, 0, NULL },
+    { "wd-green-3g0a", NULL, PROF_KIND_EXACT, "3G0A", NULL, PROF_FW_NONE,
+      VENDOR_WDC, CONTROLLER_UNKNOWN, 0, 0, NULL, NULL, kWdSandiskSsd, 0, NULL },
+    { "wd-red-1r0a", NULL, PROF_KIND_EXACT, "1R0A", NULL, PROF_FW_NONE,
+      VENDOR_WDC, CONTROLLER_MARVELL, 0, 0, "Marvell 88SS1074", NULL, kWdSandiskSsd, 0, NULL },
+    { "wd-red-2r0a", NULL, PROF_KIND_EXACT, "2R0A", NULL, PROF_FW_NONE,
+      VENDOR_WDC, CONTROLLER_MARVELL, 0, 0, "Marvell 88SS1074", NULL, kWdSandiskSsd, 0, NULL },
+
+    { "suv400", NULL, PROF_KIND_EXACT, "SUV400", NULL, PROF_FW_NONE,
+      VENDOR_KINGSTON, CONTROLLER_MARVELL, 0, 0, "Marvell 88SS1074", NULL, kKingstonMarvell, 0, NULL },
+    { "suv500", NULL, PROF_KIND_EXACT, "SUV500", NULL, PROF_FW_NONE,
+      VENDOR_KINGSTON, CONTROLLER_MARVELL, 0, 0, "Marvell 88SS1074", NULL, kKingstonMarvell, 0, NULL },
+
+    { "patriot-burst-sbfm", "phison", PROF_KIND_EXACT, "Patriot Burst", "SBFM", PROF_FW_SUBSTR,
+      VENDOR_UNKNOWN, CONTROLLER_PHISON, 0, 0, "Phison PS3111-S11", NULL, NULL, 0, NULL },
+    { "patriot-flare-sbfm", "phison", PROF_KIND_EXACT, "Patriot Flare", "SBFM", PROF_FW_SUBSTR,
+      VENDOR_UNKNOWN, CONTROLLER_PHISON, 0, 0, "Phison PS3111-S11", NULL, NULL, 0, NULL },
+    { "patriot-blast-safm", "phison", PROF_KIND_EXACT, "Patriot Blast", "SAFM", PROF_FW_SUBSTR,
+      VENDOR_UNKNOWN, CONTROLLER_PHISON, 0, 0, "Phison PS3110-S10", NULL, NULL, 0, NULL },
+    { "patriot-ignite-safm", "phison", PROF_KIND_EXACT, "Patriot Ignite", "SAFM", PROF_FW_SUBSTR,
+      VENDOR_UNKNOWN, CONTROLLER_PHISON, 0, 0, "Phison PS3110-S10", NULL, NULL, 0, NULL },
+    { "team-l3evo-sbfm", "phison", PROF_KIND_EXACT, "TEAM L3 EVO", "SBFM", PROF_FW_SUBSTR,
+      VENDOR_UNKNOWN, CONTROLLER_PHISON, 0, 0, "Phison PS3111-S11", NULL, NULL, 0, NULL },
+    { "smartbuy-sbfm", "phison", PROF_KIND_EXACT, "Smartbuy", "SBFM", PROF_FW_SUBSTR,
+      VENDOR_UNKNOWN, CONTROLLER_PHISON, 0, 0, "Phison PS3111-S11", NULL, NULL, 0, NULL },
+    { "cx400-sbfm", "phison", PROF_KIND_EXACT, "SSDPR-CX400", "SBFM", PROF_FW_SUBSTR,
+      VENDOR_UNKNOWN, CONTROLLER_PHISON, 0, 0, "Phison PS3111-S11", NULL, NULL, 0, NULL },
+    { "msi-s270-sbfm", "phison", PROF_KIND_EXACT, "MSI S270", "SBFM", PROF_FW_SUBSTR,
+      VENDOR_UNKNOWN, CONTROLLER_PHISON, 0, 0, "Phison PS3111-S11", NULL, NULL, 0, NULL },
+
+    { "burst-elite-sn", NULL, PROF_KIND_EXACT, "Patriot Burst Elite", "SN", PROF_FW_SUBSTR,
+      VENDOR_UNKNOWN, CONTROLLER_MAXIO, 0, 0, "Maxio MAS0902/MAS1102", NULL, kMaxioSata, 0, NULL },
+    { "cx400-sn", NULL, PROF_KIND_EXACT, "SSDPR-CX400", "SN", PROF_FW_SUBSTR,
+      VENDOR_UNKNOWN, CONTROLLER_MAXIO, 0, 0, "Maxio MAS0902/MAS1102", NULL, kMaxioSata, 0, NULL },
+    { "lexar-nq100-sn", NULL, PROF_KIND_EXACT, "Lexar SSD NQ100", "SN", PROF_FW_SUBSTR,
+      VENDOR_UNKNOWN, CONTROLLER_MAXIO, 0, 0, "Maxio MAS1102", NULL, kMaxioSata, 0, NULL },
+
+    { "burst-elite-smi225", NULL, PROF_KIND_EXACT, "Patriot Burst Elite", NULL, PROF_FW_SMI225,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 0, 0, "Silicon Motion SM2258/SM2259", NULL, kSmi225, 0, NULL },
+    { "patriot-p200-smi225", NULL, PROF_KIND_EXACT, "Patriot P200", NULL, PROF_FW_SMI225,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 0, 0, "Silicon Motion SM2258", NULL, kSmi225, 0, NULL },
+    { "vi550-smi225", NULL, PROF_KIND_EXACT, "Vi550 S3", NULL, PROF_FW_SMI225,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 0, 0, "Silicon Motion SM2258/SM2259", NULL, kSmi225, 0, NULL },
+    { "team-l5lite3d-smi225", NULL, PROF_KIND_EXACT, "TEAML5Lite3D", NULL, PROF_FW_SMI225,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 0, 0, "Silicon Motion SM2258", NULL, kSmi225, 0, NULL },
+    { "team-t253-smi225", NULL, PROF_KIND_EXACT, "T253", NULL, PROF_FW_SMI225,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 0, 0, "Silicon Motion SM2258/SM2259", NULL, kSmi225, 0, NULL },
+
+    { "ts-ssd220s-smi225", NULL, PROF_KIND_EXACT, "SSD220S", NULL, PROF_FW_SMI225,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 0, 0, "Silicon Motion SM2258/SM2259", NULL, kSmi225, 0, NULL },
+    { "ts-ssd230s-smi225", NULL, PROF_KIND_EXACT, "SSD230S", NULL, PROF_FW_SMI225,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 0, 0, "Silicon Motion SM2258/SM2259", NULL, kSmi225, 0, NULL },
+    { "ts-ssd230s-22z", NULL, PROF_KIND_EXACT, "SSD230S", "22Z", PROF_FW_SUBSTR,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 0, 0, "Silicon Motion SM2258/SM2259", NULL, kSmi225, 0, NULL },
+    { "ts-ssd370-smi225", NULL, PROF_KIND_EXACT, "SSD370", NULL, PROF_FW_SMI225,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 0, 0, "Silicon Motion SM2246/SM2258", NULL, kSmi225, 0, NULL },
+    { "ts-mts430-smi225", NULL, PROF_KIND_EXACT, "MTS430", NULL, PROF_FW_SMI225,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 0, 0, "Silicon Motion SM2258", NULL, kSmi225, 0, NULL },
+    { "ts-mts820-smi225", NULL, PROF_KIND_EXACT, "MTS820", NULL, PROF_FW_SMI225,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 0, 0, "Silicon Motion SM2258", NULL, kSmi225, 0, NULL },
+    { "ts-mts830-smi225", NULL, PROF_KIND_EXACT, "MTS830", NULL, PROF_FW_SMI225,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 0, 0, "Silicon Motion SM2258/SM2259", NULL, kSmi225, 0, NULL },
+    { "ts-mts830s-02j0", NULL, PROF_KIND_EXACT, "MTS830S", "02J0", PROF_FW_SUBSTR,
+      VENDOR_UNKNOWN, CONTROLLER_SMI, 0, 0, "Silicon Motion SM2258", NULL, kSmi225, 0, NULL },
+
+    /* Phison PS3111-S11 ROM/Safe mode */
+    { "ps3111-rom", NULL, PROF_KIND_EXACT, "PS3111", "SBRM", PROF_FW_SUBSTR,
+      VENDOR_UNKNOWN, CONTROLLER_PHISON, 0, 0, "Phison PS3111-S11 (ROM)", NULL, NULL, 0, NULL },
+    { "satafirm-s11", NULL, PROF_KIND_EXACT, "SATAFIRM", NULL, PROF_FW_NONE,
+      VENDOR_UNKNOWN, CONTROLLER_PHISON, 0, 0, "Phison PS3111-S11 (ROM)", NULL, NULL, 0, NULL },
+
+    /* Generic "SATA SSD" / OEM model string paired with confirmed Phison S8/S9/S10/S11 FW */
+    { "sata-ssd-sbfa", "phison", PROF_KIND_EXACT, "SATA SSD", "SBFA", PROF_FW_SUBSTR,
+      VENDOR_UNKNOWN, CONTROLLER_PHISON, 0, 0, "Phison PS3111-S11", NULL, kPhisonS11, 0, NULL },
+    { "sata-ssd-sbfm", "phison", PROF_KIND_EXACT, "SATA SSD", "SBFM", PROF_FW_SUBSTR,
+      VENDOR_UNKNOWN, CONTROLLER_PHISON, 0, 0, "Phison PS3111-S11", NULL, kPhisonS11, 0, NULL },
+    { "sata-ssd-sbfk", "phison", PROF_KIND_EXACT, "SATA SSD", "SBFK", PROF_FW_SUBSTR,
+      VENDOR_UNKNOWN, CONTROLLER_PHISON, 0, 0, "Phison PS3111-S11", NULL, kPhisonS11, 0, NULL },
+    { "sata-ssd-safm", "phison", PROF_KIND_EXACT, "SATA SSD", "SAFM", PROF_FW_SUBSTR,
+      VENDOR_UNKNOWN, CONTROLLER_PHISON, 0, 0, "Phison PS3110-S10", NULL, kPhisonS11, 0, NULL },
+    { "sata-ssd-s9fm", "phison", PROF_KIND_EXACT, "SATA SSD", "S9FM", PROF_FW_SUBSTR,
+      VENDOR_UNKNOWN, CONTROLLER_PHISON, 0, 0, "Phison PS3109-S9", NULL, kPhisonS11, 0, NULL },
+    { "sata-ssd-s8fm", "phison", PROF_KIND_EXACT, "SATA SSD", "S8FM", PROF_FW_SUBSTR,
+      VENDOR_UNKNOWN, CONTROLLER_PHISON, 0, 0, "Phison PS3108-S8", NULL, kPhisonS11, 0, NULL },
+
+    /* Neo Forza Zion NFS12 series with HCS* FW (Yeestor YS9082HP) */
+    { "neoforza-nfs12-hcs", NULL, PROF_KIND_EXACT, "NFS12", "HCS", PROF_FW_SUBSTR,
+      VENDOR_UNKNOWN, CONTROLLER_YEESTOR, 0, 0, "Yeestor YS9082HP", NULL, kYeestorHp, 0, NULL }
 };
 
 enum { PROF_EXTRA_MAX = 8, PROF_TOP_MAX = 64 };
@@ -548,6 +960,20 @@ static const DRIVE_PROFILE* ProfileAt(int i)
     return &g_extra[i - BuiltinCount()];
 }
 
+static int HasSubstrUpper(const char* hayU, const char* needle)
+{
+    int i, j;
+    if (!hayU || !hayU[0] || !needle || !needle[0]) return 0;
+    for (i = 0; hayU[i]; i++) {
+        for (j = 0; needle[j]; j++) {
+            char c = (char)toupper((unsigned char)needle[j]);
+            if (hayU[i + j] != c) break;
+        }
+        if (!needle[j]) return 1;
+    }
+    return 0;
+}
+
 static int FwHits(const DRIVE_PROFILE* pr, const char* fwU)
 {
     if (pr->fwMode == PROF_FW_SMI225)
@@ -555,15 +981,18 @@ static int FwHits(const DRIVE_PROFILE* pr, const char* fwU)
     if (pr->fwMode == PROF_FW_VE)
         return fwU[0] == 'V' && fwU[1] == 'E' &&
                fwU[2] >= '0' && fwU[2] <= '9';
+    if (pr->fwMode == PROF_FW_AP)
+        return fwU[0] == 'A' && fwU[1] == 'P' &&
+               fwU[2] >= '0' && fwU[2] <= '9';
     if (pr->fwMode == PROF_FW_SUBSTR)
-        return pr->fw && fwU[0] && strstr(fwU, pr->fw) != NULL;
+        return HasSubstrUpper(fwU, pr->fw);
     return 1;
 }
 
 static int HasFwKey(const DRIVE_PROFILE* pr)
 {
     return pr->fwMode == PROF_FW_SMI225 || pr->fwMode == PROF_FW_VE ||
-           pr->fwMode == PROF_FW_SUBSTR;
+           pr->fwMode == PROF_FW_AP || pr->fwMode == PROF_FW_SUBSTR;
 }
 
 static int TransportOk(const DRIVE_PROFILE* pr, const DRIVE_INFO* p)
@@ -580,7 +1009,7 @@ static int ScoreProfile(const DRIVE_PROFILE* pr, const DRIVE_INFO* p,
 {
     int modelHit, fwHit;
     if (!TransportOk(pr, p)) return 0;
-    modelHit = pr->model && pr->model[0] && strstr(modelU, pr->model) != NULL;
+    modelHit = HasSubstrUpper(modelU, pr->model);
     fwHit = HasFwKey(pr) && FwHits(pr, fwU);
 
     if (pr->model && pr->model[0] && !modelHit) return 0;
@@ -622,6 +1051,7 @@ static int Specificity(const DRIVE_PROFILE* pr)
     if (pr->fw) n += (int)strlen(pr->fw);
     if (pr->fwMode == PROF_FW_SMI225) n += 7;
     if (pr->fwMode == PROF_FW_VE) n += 3;
+    if (pr->fwMode == PROF_FW_AP) n += 3;
     return n;
 }
 
@@ -1263,9 +1693,6 @@ BOOL FirmwareIsSmi225x(const char* fw)
         return FALSE;
     if (strncmp(fw, "U11", 3) == 0 || strncmp(fw, "U10", 3) == 0 ||
         strncmp(fw, "T07", 3) == 0)
-        return FALSE;
-    if (fw[0] == 'S' && fw[1] == '1' && fw[2] == '1' &&
-        fw[3] >= '0' && fw[3] <= '9')
         return FALSE;
     return TRUE;
 }

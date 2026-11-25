@@ -202,6 +202,30 @@ BOOL RemapRawIsFlyingHours(const DRIVE_INFO* pInfo, const BYTE* pRaw)
     return GetRawValue48(fly->bRawValue) == v;
 }
 
+/* Seagate and standard ATA attribute 188 packs 3 16-bit words into 48 bits:
+ * Word 0: total command timeouts (or aborted commands)
+ * Word 1: command completions taking > 5 seconds
+ * Word 2: command completions taking > 7.5 seconds
+ * If Word 0 is 0 but Word 1/2 are > 0 (e.g. Toshiba DT01ACA 004D00BB0000),
+ * effective total timeouts is at least max(Word 1, Word 2). */
+void FormatCommandTimeout(const BYTE* pRaw, char* szBuf, int nBufLen)
+{
+    unsigned wTotal, wOver5, wOver75, wEffectiveTotal;
+    if (!pRaw || !szBuf || nBufLen <= 0) return;
+    wTotal = (unsigned)pRaw[0] | ((unsigned)pRaw[1] << 8);
+    wOver5 = (unsigned)pRaw[2] | ((unsigned)pRaw[3] << 8);
+    wOver75 = (unsigned)pRaw[4] | ((unsigned)pRaw[5] << 8);
+    wEffectiveTotal = wTotal;
+    if (wEffectiveTotal < wOver5) wEffectiveTotal = wOver5;
+    if (wEffectiveTotal < wOver75) wEffectiveTotal = wOver75;
+    if (wEffectiveTotal == 0)
+        safe_snprintf_n(szBuf, nBufLen, "%s", TN("0  (ОК)", "0 (OK)"));
+    else
+        safe_snprintf_n(szBuf, nBufLen, TN("%u таймаутов (за 5 с: %u, за 7.5 с: %u)",
+                                           "%u timeouts (over 5 s: %u, over 7.5 s: %u)"),
+                        wEffectiveTotal, wOver5, wOver75);
+}
+
 int DecodeRemapEvents(const DRIVE_INFO* pInfo, const BYTE* pRaw)
 {
     unsigned __int64 v;
@@ -313,12 +337,42 @@ BOOL DriveDbAttrIsProtect(const DRIVE_INFO* p, BYTE id)
     return FALSE;
 }
 
+#ifndef IOCTL_DISK_GET_DISK_ATTRIBUTES
+#define IOCTL_DISK_GET_DISK_ATTRIBUTES CTL_CODE(IOCTL_DISK_BASE, 0x003c, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#endif
+#ifndef DISK_ATTRIBUTE_READ_ONLY
+#define DISK_ATTRIBUTE_READ_ONLY 0x0000000000000002ULL
+#endif
+
+typedef struct _DM_GET_DISK_ATTRIBUTES {
+    DWORD     Version;
+    DWORD     Reserved1;
+    DWORDLONG Attributes;
+} DM_GET_DISK_ATTRIBUTES;
+
 void CheckDriveWritability(HANDLE hDrive, DRIVE_INFO* pInfo)
 {
     DWORD dwBytesReturned = 0;
     if (!pInfo) return;
     pInfo->bWriteProtected = FALSE;
     if (hDrive == INVALID_HANDLE_VALUE || hDrive == NULL) return;
+
+    /* 1. Check partition manager disk attributes (authoritative state, Get-Disk / diskpart).
+     * USB bridges (like Realtek RTL9210/RTL9210B) frequently return WP=1 in SCSI MODE SENSE
+     * due to floating/unconnected SCSI_WP_PIN in bridge firmware, which causes IOCTL_DISK_IS_WRITABLE
+     * to return ERROR_WRITE_PROTECT even though the disk is completely writable in Windows. */
+    DM_GET_DISK_ATTRIBUTES diskAttr;
+    ZeroMemory(&diskAttr, sizeof(diskAttr));
+    diskAttr.Version = sizeof(diskAttr);
+    if (DeviceIoControl(hDrive, IOCTL_DISK_GET_DISK_ATTRIBUTES, NULL, 0,
+                        &diskAttr, sizeof(diskAttr), &dwBytesReturned, NULL)) {
+        if (diskAttr.Attributes & DISK_ATTRIBUTE_READ_ONLY) {
+            pInfo->bWriteProtected = TRUE;
+        }
+        return;
+    }
+
+    /* 2. Fallback for legacy environments (e.g. Windows XP where GET_DISK_ATTRIBUTES is unsupported). */
     if (!DeviceIoControl(hDrive, IOCTL_DISK_IS_WRITABLE, NULL, 0, NULL, 0, &dwBytesReturned, NULL)) {
         DWORD dwErr = GetLastError();
         if (dwErr == ERROR_WRITE_PROTECT) {
@@ -511,8 +565,8 @@ static const ATTR_NAME g_AttrNames[] = {
     { 0xB2, "Атрибут B2h (vendor-specific)",      ATTR_CRIT_NONE,      INTERP_COUNTER32    },
     { 0xB3, "Использовано резервных блоков (всего)", ATTR_CRIT_ADVISORY, INTERP_COUNTER32 },
     { 0xB4, "Свободные резервные блоки",         ATTR_CRIT_NONE,      INTERP_COUNTER32    },
-    { 0xB5, "Ошибки программирования (всего)",   ATTR_CRIT_CRITICAL,  INTERP_COUNTER32    },
-    { 0xB6, "Ошибки стирания (всего)",           ATTR_CRIT_CRITICAL,  INTERP_COUNTER32    },
+    { 0xB5, "Число программирований (всего)",   ATTR_CRIT_NONE,      INTERP_COUNTER32    },
+    { 0xB6, "Число стираний (всего)",           ATTR_CRIT_NONE,      INTERP_COUNTER32    },
     { 0xB7, "Ошибки понижения SATA",             ATTR_CRIT_ADVISORY,  INTERP_COUNTER32    },
     { 0xB8, "Ошибка End-to-End",                 ATTR_CRIT_CRITICAL,  INTERP_COUNTER32    },
     { 0xB9, "Стабильность головок",              ATTR_CRIT_NONE,      INTERP_NORMAL       },
@@ -902,8 +956,8 @@ static const char* AttrNameEn(BYTE id)
     case 0xAF: return "Power-Loss Protection Fail";
     case 0xB1: return "Wear Leveling";
     case 0xB3: return "Used Reserved Blocks";
-    case 0xB5: return "Program Fail Count (total)";
-    case 0xB6: return "Erase Fail Count (total)";
+    case 0xB5: return "Program Count (total)";
+    case 0xB6: return "Erase Count (total)";
     case 0xB7: return "SATA Downshift Errors";
     case 0xB8: return "End-to-End Error";
     case 0xBB: return "Reported Uncorrectable";
@@ -1439,7 +1493,8 @@ void GetAttrDecode(BYTE bID, const DRIVE_INFO* pInfo, ATTR_DECODE* out)
         }
     }
 
-    /* 241-244 are LBA only when a profile or a -v line names them.
+    /* 241-244 are LBA only when a profile or a -v line names them,
+     * or on HDDs where 241/242 are standard ATA Total LBAs Written/Read.
      * The generic "Записано LBA" label is not a unit. */
     if (pInfo && bID >= 0xF1 && bID <= 0xF4) {
         int semL = PROF_SEM_NONE, encL = PROF_ENC_NONE;
@@ -1457,6 +1512,16 @@ void GetAttrDecode(BYTE bID, const DRIVE_INFO* pInfo, ATTR_DECODE* out)
             const char* dbName = DbDisplayName(dbRaw);
             if (dbName && dbName[0])
                 named = 1;
+            else if (DriveIsHdd(pInfo) && (bID == 0xF1 || bID == 0xF2)) {
+                /* Standard ATA HDD sector counters: Total LBAs Written / Read */
+                named = 1;
+                out->szName = (bID == 0xF1)
+                    ? TN("Всего записано (LBA)", "Total LBAs written")
+                    : TN("Всего прочитано (LBA)", "Total LBAs read");
+                out->eEnc = RAW_ENC_LBA;
+                if (out->nSemanticConfidence < 80)
+                    out->nSemanticConfidence = 80;
+            }
         }
         if (!named) {
             out->szName = VendorSpecificAttrName(bID);
@@ -1568,6 +1633,7 @@ const char* GetVendorName(DRIVE_VENDOR eVendor)
     case VENDOR_MSI:           return "MSI";
     case VENDOR_RADEON:        return "Radeon";
     case VENDOR_APACER:        return "Apacer";
+    case VENDOR_TRANSCEND:     return "Transcend";
     case VENDOR_OTHER:         return "Other";
     default:                   return "Unknown";
     }
@@ -1582,6 +1648,18 @@ const char* VendorLabel(const DRIVE_INFO* p)
         ToUpperCopy(u, (int)sizeof(u), p->szModel);
         if (strstr(u, "HITACHI") && !strstr(u, "HGST"))
             return "Hitachi";
+    }
+    if (p->eVendor == VENDOR_MICRON) {
+        ToUpperCopy(u, (int)sizeof(u), p->szModel);
+        if (strstr(u, "CRUCIAL") || (u[0] == 'C' && u[1] == 'T') ||
+            strstr(u, "BX") || strstr(u, "MX"))
+            return "Crucial";
+        return "Micron";
+    }
+    if (p->eVendor == VENDOR_OTHER) {
+        ToUpperCopy(u, (int)sizeof(u), p->szModel);
+        if (strstr(u, "TWSC"))
+            return "TWSC";
     }
     return GetVendorName(p->eVendor);
 }
@@ -1607,6 +1685,7 @@ const char* GetControllerName(DRIVE_CONTROLLER eController)
     case CONTROLLER_MAXIO:    return "Maxio";
     case CONTROLLER_INNOGRIT: return "Innogrit";
     case CONTROLLER_YEESTOR:  return "Yeestor";
+    case CONTROLLER_SANDFORCE: return "SandForce";
     default:                  return "—";
     }
 }
@@ -1704,7 +1783,13 @@ DRIVE_VENDOR DetectDriveVendor(const char* szModel)
 
     /* CT/MX match inside other model strings (and sit above ADATA). */
     if (strstr(szUpper, "MICRON") || strstr(szUpper, "CRUCIAL") ||
-        strstr(szUpper, "M4-") || strstr(szUpper, "MTF"))
+        strstr(szUpper, "M4-") || strstr(szUpper, "MTF") ||
+        (szUpper[0] == 'C' && szUpper[1] == 'T' && isdigit((unsigned char)szUpper[2])) ||
+        strstr(szUpper, "BX500") || strstr(szUpper, "MX500") ||
+        strstr(szUpper, "BX300") || strstr(szUpper, "MX300") ||
+        strstr(szUpper, "BX100") || strstr(szUpper, "MX100") ||
+        strstr(szUpper, "MX200") || strstr(szUpper, "M500SSD") ||
+        strstr(szUpper, "M550SSD"))
         return VENDOR_MICRON;
 
     if (strstr(szUpper, "KINGSTON") || strstr(szUpper, "SA400") ||
@@ -1780,6 +1865,14 @@ DRIVE_VENDOR DetectDriveVendor(const char* szModel)
         strstr(szUpper, "AS350"))
         return VENDOR_APACER;
 
+    if (strstr(szUpper, "TRANSCEND") || strstr(szUpper, "TS128G") ||
+        strstr(szUpper, "TS256G") || strstr(szUpper, "TS512G") ||
+        strstr(szUpper, "TS1T") || strstr(szUpper, "TS2T"))
+        return VENDOR_TRANSCEND;
+
+    if (strstr(szUpper, "TWSC"))
+        return VENDOR_OTHER;
+
     /* If model has SSD keyword but vendor unknown */
     if (strstr(szUpper, "SSD") || strstr(szUpper, "NVME"))
         return VENDOR_OTHER;
@@ -1850,6 +1943,28 @@ static BOOL ModelHasChipToken(const char* u, const char* tok)
     return FALSE;
 }
 
+BOOL IsUsbBridgeNoMedia(const DRIVE_INFO* pInfo)
+{
+    if (!pInfo) return FALSE;
+    return pInfo->bIsUSB && !pInfo->bSMART_Supported && !pInfo->bIsNVMe &&
+           pInfo->dwCapacityMB == 0;
+}
+
+BOOL IsPhisonRomMode(const DRIVE_INFO* pInfo)
+{
+    char mU[48], fwU[16];
+    if (!pInfo || pInfo->bIsNVMe) return FALSE;
+    ToUpperCopy(mU, sizeof(mU), pInfo->szModel);
+    ToUpperCopy(fwU, sizeof(fwU), pInfo->szFirmware);
+    if (strstr(mU, "SATAFIRM") != NULL)
+        return TRUE;
+    if (strstr(mU, "PS3111") != NULL &&
+        (strstr(fwU, "SBRM") != NULL ||
+         (!pInfo->bSMART_Supported && pInfo->dwCapacityMB <= 64)))
+        return TRUE;
+    return FALSE;
+}
+
 static DRIVE_CONTROLLER DetectDriveController(const DRIVE_INFO* p)
 {
     USHORT vid;
@@ -1877,6 +1992,10 @@ static DRIVE_CONTROLLER DetectDriveController(const DRIVE_INFO* p)
     if (p->bIsUSB && !p->bSMART_Supported && !p->bIsNVMe)
         return CONTROLLER_UNKNOWN;
 
+    /* Phison PS3111-S11 ROM/safe mode (e.g. PS3111 + SBRM02.0 or SATAFIRM S11). */
+    if (IsPhisonRomMode(p))
+        return CONTROLLER_PHISON;
+
     /* 2. A model, or a token that names the ASIC (SM225, RTS576).
      * PCI VID was handled above. A firmware shape is not an identifier:
      * U0524A0, VE+digit, SANA, SVT, U11, SBFK. The profile table uses
@@ -1886,7 +2005,9 @@ static DRIVE_CONTROLLER DetectDriveController(const DRIVE_INFO* p)
     if (ModelHasChipToken(szModelU, "SM226") || ModelHasChipToken(szModelU, "SM225") ||
         ModelHasChipToken(szModelU, "SM232") || ModelHasChipToken(szModelU, "SM250") ||
         strstr(szFwU, "SM226") || strstr(szFwU, "SM225") ||
-        strstr(szFwU, "SM232"))
+        strstr(szFwU, "SM232") ||
+        strstr(szModelU, "BX500") || strstr(szModelU, "BX300") ||
+        strstr(szModelU, "MX500"))
         return CONTROLLER_SMI;
 
     /* ADATA/XPG model names. PCI VID is ADATA 1CC1, so the model is the
@@ -1912,6 +2033,21 @@ static DRIVE_CONTROLLER DetectDriveController(const DRIVE_INFO* p)
     if (strstr(szModelU, "YS908") || strstr(szModelU, "YS920") ||
         strstr(szModelU, "YEESTOR") || strstr(szFwU, "YS908"))
         return CONTROLLER_YEESTOR;
+
+    if (strstr(szModelU, "HFM") || strstr(szModelU, "SHGP31") ||
+        strstr(szModelU, "SHPP41") || strstr(szModelU, "BC711") ||
+        strstr(szModelU, "BC511") || strstr(szModelU, "BC501"))
+        return CONTROLLER_HYNIX;
+
+    if (strstr(szModelU, "SN850") || strstr(szModelU, "SN770") ||
+        strstr(szModelU, "SN580") || strstr(szModelU, "SN570") ||
+        strstr(szModelU, "SN550") || strstr(szModelU, "SN5000") ||
+        strstr(szModelU, "SN5100") || strstr(szModelU, "SN740") ||
+        strstr(szModelU, "SDFQ")) {
+        if (strstr(szModelU, "SANDISK") || strstr(szModelU, "SDFQ"))
+            return CONTROLLER_SANDISK;
+        return CONTROLLER_WD;
+    }
 
     /* 3. HDD MCU follows the brand. Those makers build the drive.
      * SSD brand is a label: Kingston is not Phison, SanDisk is not one ASIC.
@@ -1943,6 +2079,9 @@ void IdentifyDriveParts(DRIVE_INFO* pInfo)
         ToUpperCopy(szFw, sizeof(szFw), pInfo->szFirmware);
         if (strncmp(szFw, "OOS", 3) == 0)
             pInfo->eVendor = VENDOR_UTANIA;
+    }
+    if (pInfo->eVendor == VENDOR_UNKNOWN && pInfo->wUsbVid == 0x8564) {
+        pInfo->eVendor = VENDOR_TRANSCEND;
     }
     /* USB dock + old IDENTIFY without word 217 still has HDD SMART. */
     if (pInfo->eType == DRIVE_TYPE_USB && !pInfo->bIsNVMe &&
@@ -2721,14 +2860,45 @@ BOOL GetDeviceDescriptor(HANDLE hDrive, DRIVE_INFO* pInfo)
 
 BOOL GetCapacityFromGeometry(HANDLE hDrive, DRIVE_INFO* pInfo)
 {
-    DISK_GEOMETRY_EX geo;
-    ZeroMemory(&geo, sizeof(geo));
+    if (!hDrive || hDrive == INVALID_HANDLE_VALUE || !pInfo)
+        return FALSE;
+
+    /* Primary: IOCTL_DISK_GET_DRIVE_GEOMETRY_EX with 512-byte buffer
+     * to safely accommodate DISK_GEOMETRY_EX + partition + detection info. */
+    BYTE buf[512];
+    ZeroMemory(buf, sizeof(buf));
     DWORD dwBytes = 0;
     if (DeviceIoControl(hDrive, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
-                        NULL, 0, &geo, sizeof(geo), &dwBytes, NULL)) {
-        DWORD dwCapMB = (DWORD)(geo.DiskSize.QuadPart / (1024 * 1024));
-        if (dwCapMB > pInfo->dwCapacityMB) pInfo->dwCapacityMB = dwCapMB;
-        return TRUE;
+                        NULL, 0, buf, sizeof(buf), &dwBytes, NULL)) {
+        DISK_GEOMETRY_EX* pGeo = (DISK_GEOMETRY_EX*)buf;
+        if (pGeo->DiskSize.QuadPart > 0) {
+            pInfo->dwCapacityMB = (DWORD)(pGeo->DiskSize.QuadPart / (1024 * 1024));
+            return TRUE;
+        }
+    }
+
+    /* Fallback 1: IOCTL_DISK_GET_LENGTH_INFO */
+    GET_LENGTH_INFORMATION gli;
+    ZeroMemory(&gli, sizeof(gli));
+    if (DeviceIoControl(hDrive, IOCTL_DISK_GET_LENGTH_INFO,
+                        NULL, 0, &gli, sizeof(gli), &dwBytes, NULL)) {
+        if (gli.Length.QuadPart > 0) {
+            pInfo->dwCapacityMB = (DWORD)(gli.Length.QuadPart / (1024 * 1024));
+            return TRUE;
+        }
+    }
+
+    /* Fallback 2: Legacy IOCTL_DISK_GET_DRIVE_GEOMETRY (CHS) */
+    DISK_GEOMETRY g;
+    ZeroMemory(&g, sizeof(g));
+    if (DeviceIoControl(hDrive, IOCTL_DISK_GET_DRIVE_GEOMETRY,
+                        NULL, 0, &g, sizeof(g), &dwBytes, NULL)) {
+        unsigned __int64 total = (unsigned __int64)g.Cylinders.QuadPart *
+                                 g.TracksPerCylinder * g.SectorsPerTrack * g.BytesPerSector;
+        if (total > 0) {
+            pInfo->dwCapacityMB = (DWORD)(total / (1024 * 1024));
+            return TRUE;
+        }
     }
     return FALSE;
 }
@@ -2800,9 +2970,45 @@ DRIVE_TYPE DetectDriveType(HANDLE hDrive, DRIVE_INFO* pInfo)
     }
     }
 
+    /* Windows StorageDeviceSeekPenaltyProperty: Standard query supported since Win7 without admin rights */
+    if (hDrive && hDrive != INVALID_HANDLE_VALUE) {
+        STORAGE_PROPERTY_QUERY spq;
+        ZeroMemory(&spq, sizeof(spq));
+        spq.PropertyId = (STORAGE_PROPERTY_ID)7; /* StorageDeviceSeekPenaltyProperty */
+        spq.QueryType = PropertyStandardQuery;
+        struct {
+            DWORD Version;
+            DWORD Size;
+            BOOLEAN IncursSeekPenalty;
+        } dspd;
+        ZeroMemory(&dspd, sizeof(dspd));
+        DWORD dwRet = 0;
+        if (DeviceIoControl(hDrive, IOCTL_STORAGE_QUERY_PROPERTY,
+                            &spq, sizeof(spq),
+                            &dspd, sizeof(dspd), &dwRet, NULL) && dwRet >= sizeof(dspd)) {
+            if (!dspd.IncursSeekPenalty) {
+                if (bus == 7) return DRIVE_TYPE_USB;
+                return DRIVE_TYPE_SSD_SATA;
+            }
+        }
+    }
+
+    if (pInfo->trimInfo.bDeviceTrimSupported) {
+        if (bus == 7) return DRIVE_TYPE_USB;
+        return DRIVE_TYPE_SSD_SATA;
+    }
+
     /* Heuristic from model name */
     const char* m = pInfo->szModel;
     if (m[0]) {
+        char szMU[48];
+        ToUpperCopy(szMU, sizeof(szMU), m);
+        if (strstr(szMU, "PS3111") || strstr(szMU, "SATAFIRM") ||
+            strstr(szMU, "R5SL") || strstr(szMU, "R3SL") || strstr(szMU, "R7SL") ||
+            strstr(szMU, "SA400") || strstr(szMU, "SU650") || strstr(szMU, "SU800") ||
+            strstr(szMU, "AS340") || strstr(szMU, "AS350") || strstr(szMU, "A400") ||
+            strstr(szMU, "V400") || strstr(szMU, "UV400") || strstr(szMU, "UV500"))
+            return DRIVE_TYPE_SSD_SATA;
         if (strstr(m, "SSD") || strstr(m, "Solid") || strstr(m, "SOLID") ||
             strstr(m, "FLASH") || strstr(m, "Flash") || strstr(m, "flash") ||
             strstr(m, "MX") || strstr(m, "860") || strstr(m, "870") ||
@@ -2849,12 +3055,22 @@ int DriveCheckPowerMode(HANDLE hDrive, const DRIVE_INFO* pInfo)
 
 int ScanDrives(DRIVE_INFO* pDrives, int nMaxDrives)
 {
-    return ScanDrivesEx(pDrives, nMaxDrives, NULL, 0, FALSE);
+    return ScanDrivesWithProgress(pDrives, nMaxDrives, NULL, 0, FALSE, NULL, NULL);
 }
 
 int ScanDrivesEx(DRIVE_INFO* pDrives, int nMaxDrives,
                  const DRIVE_INFO* pPrevDrives, int nPrevCount,
                  BOOL bBackground)
+{
+    return ScanDrivesWithProgress(pDrives, nMaxDrives,
+                                  pPrevDrives, nPrevCount, bBackground,
+                                  NULL, NULL);
+}
+
+int ScanDrivesWithProgress(DRIVE_INFO* pDrives, int nMaxDrives,
+                           const DRIVE_INFO* pPrevDrives, int nPrevCount,
+                           BOOL bBackground,
+                           PFN_SCAN_PROGRESS pfnProgress, void* pUser)
 {
     int nFound = 0;
     int nDrive;
@@ -2886,6 +3102,7 @@ int ScanDrivesEx(DRIVE_INFO* pDrives, int nMaxDrives,
                     pInfo->bStandby = TRUE;
                     CloseHandle(hDrive);
                     nFound++;
+                    if (pfnProgress) pfnProgress(pDrives, nFound, nDrive, pUser);
                     continue;
                 }
             }
@@ -2903,6 +3120,7 @@ int ScanDrivesEx(DRIVE_INFO* pDrives, int nMaxDrives,
             }
         }
         pInfo->nScsiPort      = -1;
+        pInfo->nCsmiPhy       = -1;
         {
             SCSI_ADDRESS scsiAddr;
             DWORD dwRet = 0;
@@ -2979,11 +3197,15 @@ int ScanDrivesEx(DRIVE_INFO* pDrives, int nMaxDrives,
                 HANDLE hScsi = OpenScsiAdapterFromDrive(hDrive, &addr);
                 if (hScsi != INVALID_HANDLE_VALUE) {
                     BYTE bPhy = (BYTE)addr.TargetId;
+                    pInfo->nScsiPort = (int)addr.PortNumber;
+                    pInfo->nCsmiPhy = (int)bPhy;
                     if (CsmiGetIdentifyData(hScsi, bPhy, pInfo)) {
-                        pInfo->bSMART_Supported = TRUE;
                         pInfo->eAccessMethod = SMART_ACCESS_CSMI;
                         pInfo->eType = DetectDriveType(hDrive, pInfo);
-                        CsmiGetSMARTAttributes(hScsi, bPhy, pInfo);
+                        if (CsmiGetSMARTAttributes(hScsi, bPhy, pInfo))
+                            pInfo->bSMART_Supported = TRUE;
+                        else
+                            pInfo->bSMART_Supported = FALSE;
                         CsmiGetSMARTThresholds(hScsi, bPhy, pInfo);
                         ExtractTemperatureFromATA(pInfo);
                         ExtractCommonATACounters(pInfo);
@@ -2993,7 +3215,7 @@ int ScanDrivesEx(DRIVE_INFO* pDrives, int nMaxDrives,
                     CloseHandle(hScsi);
                 }
                 if (!pInfo->bSMART_Supported) {
-                    pInfo->eType = DRIVE_TYPE_UNKNOWN;
+                    pInfo->eType = DetectDriveType(hDrive, pInfo);
                 }
             }
             /* Confidence is frozen inside Assess; name the chip first. */
@@ -3004,6 +3226,7 @@ int ScanDrivesEx(DRIVE_INFO* pDrives, int nMaxDrives,
             FillDriveProtocol(pInfo);
             CloseHandle(hDrive);
             nFound++;
+            if (pfnProgress) pfnProgress(pDrives, nFound, nDrive, pUser);
             continue;
         }
 
@@ -3024,6 +3247,7 @@ int ScanDrivesEx(DRIVE_INFO* pDrives, int nMaxDrives,
 
             CloseHandle(hDrive);
             nFound++;
+            if (pfnProgress) pfnProgress(pDrives, nFound, nDrive, pUser);
             continue;
         }
 
@@ -3039,6 +3263,7 @@ int ScanDrivesEx(DRIVE_INFO* pDrives, int nMaxDrives,
             FillDriveProtocol(pInfo);
             CloseHandle(hDrive);
             nFound++;
+            if (pfnProgress) pfnProgress(pDrives, nFound, nDrive, pUser);
             continue;
         }
 
@@ -3056,7 +3281,7 @@ int ScanDrivesEx(DRIVE_INFO* pDrives, int nMaxDrives,
             } else if (busType == 10) {
                 pInfo->eType = DRIVE_TYPE_SCSI;
             } else {
-                pInfo->eType = DRIVE_TYPE_UNKNOWN;
+                pInfo->eType = DetectDriveType(hDrive, pInfo);
             }
             IdentifyDriveParts(pInfo);
             CheckDriveWritability(hDrive, pInfo);
@@ -3065,6 +3290,7 @@ int ScanDrivesEx(DRIVE_INFO* pDrives, int nMaxDrives,
             FillDriveProtocol(pInfo);
             CloseHandle(hDrive);
             nFound++;
+            if (pfnProgress) pfnProgress(pDrives, nFound, nDrive, pUser);
             continue;
         }
 
@@ -3214,8 +3440,10 @@ int ScanDrivesEx(DRIVE_INFO* pDrives, int nMaxDrives,
                         pInfo->bIsUSB = TRUE;
                         pInfo->eType = DRIVE_TYPE_NVME;
                         pInfo->bSMART_Supported = TRUE;
+                        pInfo->bCapAtaIdentify = FALSE;
+                        GetCapacityFromGeometry(hDrive, pInfo);
                         got = TRUE;
-            }
+                    }
                 }
 
                 if (!got) {
@@ -3249,8 +3477,10 @@ int ScanDrivesEx(DRIVE_INFO* pDrives, int nMaxDrives,
                         pInfo->bIsUSB = TRUE;
                         pInfo->eType = DRIVE_TYPE_NVME;
                         pInfo->bSMART_Supported = TRUE;
+                        pInfo->bCapAtaIdentify = FALSE;
+                        GetCapacityFromGeometry(hDrive, pInfo);
                         got = TRUE;
-            }
+                    }
                 }
 
                 if (!got) {
@@ -3283,8 +3513,10 @@ int ScanDrivesEx(DRIVE_INFO* pDrives, int nMaxDrives,
                         pInfo->bIsUSB = TRUE;
                         pInfo->eType = DRIVE_TYPE_NVME;
                         pInfo->bSMART_Supported = TRUE;
+                        pInfo->bCapAtaIdentify = FALSE;
+                        GetCapacityFromGeometry(hDrive, pInfo);
                         got = TRUE;
-            }
+                    }
                 }
 
                 if (!got) {
@@ -3300,7 +3532,9 @@ int ScanDrivesEx(DRIVE_INFO* pDrives, int nMaxDrives,
                         ExtractNVMeExtendedInfo(pInfo);
                         pInfo->bIsNVMe = TRUE;
                         pInfo->eType = DRIVE_TYPE_NVME;
-            }
+                        pInfo->bCapAtaIdentify = FALSE;
+                        GetCapacityFromGeometry(hDrive, pInfo);
+                    }
                 }
             }
 
@@ -3340,24 +3574,27 @@ int ScanDrivesEx(DRIVE_INFO* pDrives, int nMaxDrives,
                         ExtractTemperatureFromATA(pInfo);
                         ExtractCommonATACounters(pInfo);
                         ExtractSSDIndicators(pInfo);
-                        GetSMARTErrorLogSAT(hDrive, pInfo);
-                        GetSMARTSelfTestLogSAT(hDrive, pInfo);
-                        AcquireAtaLogs(hDrive, TRUE, pInfo);
-                    } else if (GetSMARTAttributesCypress(hDrive, pInfo)) {
+                        if (!pInfo->bCapAtaIdentify || pInfo->bCapSmartErrLog)
+                            GetSMARTErrorLogSAT(hDrive, pInfo);
+                        if (!pInfo->bScanIoTimedOut && (!pInfo->bCapAtaIdentify || pInfo->bSelfTestSupported))
+                            GetSMARTSelfTestLogSAT(hDrive, pInfo);
+                        if (DriveShouldQueryAtaGplLogs(pInfo))
+                            AcquireAtaLogs(hDrive, TRUE, pInfo);
+                    } else if (BridgeAllowsVendorProbes(pInfo, USB_BRIDGE_CYPRESS) && GetSMARTAttributesCypress(hDrive, pInfo)) {
                         GetSMARTThresholdsCypress(hDrive, pInfo);
                         pInfo->bSMART_Supported = TRUE;
                         pInfo->eAccessMethod = SMART_ACCESS_CYPRESS;
                         ExtractTemperatureFromATA(pInfo);
                         ExtractCommonATACounters(pInfo);
                         ExtractSSDIndicators(pInfo);
-                    } else if (GetSMARTAttributesSunplus(hDrive, pInfo)) {
+                    } else if (BridgeAllowsVendorProbes(pInfo, USB_BRIDGE_SUNPLUS) && GetSMARTAttributesSunplus(hDrive, pInfo)) {
                         GetSMARTThresholdsSunplus(hDrive, pInfo);
                         pInfo->bSMART_Supported = TRUE;
                         pInfo->eAccessMethod = SMART_ACCESS_SUNPLUS;
                         ExtractTemperatureFromATA(pInfo);
                         ExtractCommonATACounters(pInfo);
                         ExtractSSDIndicators(pInfo);
-                    } else if (GetSMARTAttributesProlific(hDrive, pInfo)) {
+                    } else if (BridgeAllowsVendorProbes(pInfo, USB_BRIDGE_PROLIFIC) && GetSMARTAttributesProlific(hDrive, pInfo)) {
                         GetSMARTThresholdsProlific(hDrive, pInfo);
                         pInfo->bSMART_Supported = TRUE;
                         pInfo->eAccessMethod = SMART_ACCESS_PROLIFIC;
@@ -3401,6 +3638,7 @@ int ScanDrivesEx(DRIVE_INFO* pDrives, int nMaxDrives,
 
         CloseHandle(hDrive);
         nFound++;
+        if (pfnProgress) pfnProgress(pDrives, nFound, nDrive, pUser);
     }
 
     if (nFound > 0) {
@@ -3410,15 +3648,6 @@ int ScanDrivesEx(DRIVE_INFO* pDrives, int nMaxDrives,
         if (bDoQuery) {
             QueryStorageEventLogs(pDrives, nFound, 30);
             s_dwLastEventLogQuery = dwNow;
-            for (int i = 0; i < nFound; i++) {
-                if (pDrives[i].eventStats.bQueried &&
-                    (pDrives[i].eventStats.nEvent153Count > 0 ||
-                     pDrives[i].eventStats.nEvent129Count > 0 ||
-                     pDrives[i].eventStats.nEvent51Count > 0 ||
-                     pDrives[i].eventStats.nEventHwErrCount > 0)) {
-                    AssessDriveHealth(&pDrives[i]);
-                }
-            }
         } else if (pPrevDrives && nPrevCount > 0) {
             for (int i = 0; i < nFound; i++) {
                 for (int pi = 0; pi < nPrevCount; pi++) {
@@ -3429,8 +3658,10 @@ int ScanDrivesEx(DRIVE_INFO* pDrives, int nMaxDrives,
             }
             }
         }
-
-        /* Query TRIM status and filesystem volume capacities */
+        for (int i = 0; i < nFound; i++) {
+            AssessDriveHealth(&pDrives[i]);
+            FillDriveProtocol(&pDrives[i]);
+        }
         /* Scan CSMI RAID controllers for physical member drives */
         nFound = CsmiScanRaidDrives(pDrives, nMaxDrives, nFound);
 

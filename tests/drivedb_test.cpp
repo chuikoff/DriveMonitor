@@ -1,4 +1,4 @@
-﻿/* DriveMonitor - drivedb integration tests. GPL-2.0-or-later. See LICENSE.
+/* DriveMonitor - drivedb integration tests. GPL-2.0-or-later. See LICENSE.
  * Links the real drivedb.cpp, identification, decoder, and health engine.
  * profile_test.cpp still stubs DriveDbApply and DriveDbLookup.
  * Ranking stays heuristic: assertions name the winning family and the
@@ -2885,6 +2885,7 @@ static void TestVolumeTrimMonitoring(void)
     Expect(strstr(ssd.szEvidence, "ДЕФИЦИТ МЕСТА") != NULL || strstr(ssd.szEvidence, "LOW SPACE") != NULL, "szEvidence has low space note");
 
     /* Case C: Low space warning (< 7% free space, e.g. 6.2%) */
+    ssd.trimInfo.volumes[0].qwFreeBytes = (unsigned __int64)(240ULL * 1024ULL * 1024ULL * 1024ULL * 0.062);
     ssd.trimInfo.volumes[0].fFreePercent = 6.2f;
     EvaluateDriveTrimAndCapacity(&ssd);
     Expect(!ssd.trimInfo.bPanicLowSpace, "6.2% is not panic");
@@ -2893,6 +2894,7 @@ static void TestVolumeTrimMonitoring(void)
     ExpectInt((int)ssd.eWear, (int)HEALTH_STATUS_OBSERVE, "<7% free space elevates eWear to OBSERVE");
 
     /* Case D: Non-TRIM filesystem (FAT32) on SSD */
+    ssd.trimInfo.volumes[0].qwFreeBytes = 120ULL * 1024ULL * 1024ULL * 1024ULL;
     ssd.trimInfo.volumes[0].fFreePercent = 50.0f;
     lstrcpynA(ssd.trimInfo.volumes[0].szFileSystem, "FAT32", (int)sizeof(ssd.trimInfo.volumes[0].szFileSystem));
     ssd.trimInfo.volumes[0].bTrimSupportedFs = FALSE;
@@ -3538,6 +3540,27 @@ static void TestSeagateFarmCounterfeitDetection(void)
     DetectCounterfeitMismatch(&g);
     Expect(!g.bCounterfeitSuspected, "New Seagate drive is NOT flagged as counterfeit");
 
+    /* Hours were never read. Zero is not a wiped counter. */
+    Base(DRIVE_TYPE_HDD, "ST2000DM008-2FR102", "0001");
+    g.wRotationRate = 7200;
+    g.dwPowerOnHours = 0;
+    g.dwPowerCycleCount = 0;
+    g.bFarmLogSupported = TRUE;
+    g.qwFarmPowerOnHours = 5000;
+    DetectCounterfeitMismatch(&g);
+    Expect(!g.bCounterfeitSuspected, "Missing SMART hours are not a wiped counter");
+
+    /* Attribute 9 is present, raw 0. That counter was read. */
+    Base(DRIVE_TYPE_HDD, "ST2000DM008-2FR102", "0001");
+    g.wRotationRate = 7200;
+    g.dwPowerOnHours = 0;
+    g.bFarmLogSupported = TRUE;
+    g.qwFarmPowerOnHours = 5000;
+    AddAttr(0x09, 100, 0);
+    DetectCounterfeitMismatch(&g);
+    Expect(g.bCounterfeitSuspected, "Attribute 9 raw 0 still compares with FARM hours");
+    ExpectInt(g.nAnomalyType, (int)ANOMALY_SMART_WIPED, "Attribute 9 raw 0 is ANOMALY_SMART_WIPED");
+
     CaseEnd("seagate-farm-counterfeit-detection", before);
 }
 
@@ -3684,6 +3707,18 @@ static void TestDeviceStatisticsParsing(void)
     Expect(ParseDeviceStatisticsPage(7, pageBuf, &di), "Parse Page 07h succeeds");
     ExpectInt(di.nDevStatPercentUsed, 8, "nDevStatPercentUsed parsed correctly");
 
+    /* 200 must stay 200. Bit 7 is part of the value, not a flag. */
+    memset(&di, 0, sizeof(di));
+    di.nEndurancePercent = -1;
+    memset(pageBuf, 0, sizeof(pageBuf));
+    pageBuf[0] = 0x01;
+    pageBuf[2] = 0x07;
+    pageBuf[0x08] = 200;
+    pageBuf[0x08 + 7] = 0xC0;
+    Expect(ParseDeviceStatisticsPage(7, pageBuf, &di), "Parse Page 07h accepts percent used 200");
+    ExpectInt(di.nDevStatPercentUsed, 200, "percent used 200 is not masked to 7 bits");
+    ExpectInt(di.nEndurancePercent, 0, "remaining life clamps at 0 past 100 percent used");
+
     CaseEnd("device-statistics-parsing", before);
 }
 
@@ -3730,6 +3765,11 @@ static void TestAtaLogsIntegration(void)
     AssessDriveHealth(&g);
     ExpectInt(g.nEndurancePercent, 85, "SSD endurance derived from Device Statistics Page 07h");
     ExpectInt(g.nHealthPercent, 85, "Health percent derived from Device Statistics endurance");
+
+    g.nDevStatPercentUsed = 200;
+    AssessDriveHealth(&g);
+    ExpectInt(g.nEndurancePercent, 0, "Health clamps percent used above 100");
+    ExpectInt(g.nHealthPercent, 0, "Health percent clamps percent used above 100");
 
     CaseEnd("ata-logs-integration", before);
 }
@@ -4600,6 +4640,2075 @@ static void TestBuild56Regressions(void)
 
 
 
+static void TestBuild62Regressions(void)
+{
+    int before = g_fail;
+    DRIVE_INFO info;
+    char buf[4096];
+
+    /* 1. NVMe controller reports DST support (bSelfTestSupported == TRUE),
+     * but self-test log was not read or returned yet (!bGotNvmeSelfTestLog).
+     * Must NOT state that the self-test log is unsupported by the drive;
+     * must state that the log is empty or was not returned by driver,
+     * and invite the user to start a test. */
+    ZeroMemory(&info, sizeof(info));
+    info.bIsNVMe = TRUE;
+    info.bSelfTestSupported = TRUE;
+    info.bGotNvmeSelfTestLog = FALSE;
+
+    UiSetLang(UI_LANG_RU);
+    int nLen = DstFormatSelfTestHistory(&info, buf, (int)sizeof(buf));
+    Expect(nLen > 0, "Build 62: NVMe self-test formatting returned non-zero length (RU)");
+    ExpectHas(buf, "пуст или не был возвращён", "Build 62: NVMe supported but unreturned log mentions empty/unreturned (RU)");
+    Expect(strstr(buf, "не поддерживается данным накопителем") == NULL,
+           "Build 62: NVMe supported drive does NOT claim unsupported by drive (RU)");
+
+    UiSetLang(UI_LANG_EN);
+    nLen = DstFormatSelfTestHistory(&info, buf, (int)sizeof(buf));
+    Expect(nLen > 0, "Build 62: NVMe self-test formatting returned non-zero length (EN)");
+    ExpectHas(buf, "empty or was not returned", "Build 62: NVMe supported but unreturned log mentions empty/unreturned (EN)");
+    Expect(strstr(buf, "not supported by this drive") == NULL,
+           "Build 62: NVMe supported drive does NOT claim unsupported by drive (EN)");
+
+    /* 2. NVMe controller does NOT support DST (bSelfTestSupported == FALSE).
+     * Must state that self-test is not supported (OACS bit 4 = 0). */
+    info.bSelfTestSupported = FALSE;
+    UiSetLang(UI_LANG_RU);
+    nLen = DstFormatSelfTestHistory(&info, buf, (int)sizeof(buf));
+    Expect(nLen > 0, "Build 62: NVMe unsupported DST length (RU)");
+    ExpectHas(buf, "не поддерживается", "Build 62: NVMe unsupported DST mentions unsupported (RU)");
+    ExpectHas(buf, "OACS bit 4 = 0", "Build 62: NVMe unsupported DST mentions OACS bit 4 (RU)");
+
+    /* 3. ATA drive reports DST support (bSelfTestSupported == TRUE),
+     * but self-test log was not read or returned yet (!bGotSelfTestLog). */
+    ZeroMemory(&info, sizeof(info));
+    info.bIsNVMe = FALSE;
+    info.bSelfTestSupported = TRUE;
+    info.bGotSelfTestLog = FALSE;
+
+    UiSetLang(UI_LANG_RU);
+    nLen = DstFormatSelfTestHistory(&info, buf, (int)sizeof(buf));
+    Expect(nLen > 0, "Build 62: ATA self-test formatting returned non-zero length (RU)");
+    ExpectHas(buf, "пуст или не был возвращён", "Build 62: ATA supported but unreturned log mentions empty/unreturned (RU)");
+    Expect(strstr(buf, "не поддерживается накопителем") == NULL,
+           "Build 62: ATA supported drive does NOT claim unsupported by drive (RU)");
+
+    /* 4. ATA drive does NOT support DST (bSelfTestSupported == FALSE). */
+    info.bSelfTestSupported = FALSE;
+    nLen = DstFormatSelfTestHistory(&info, buf, (int)sizeof(buf));
+    Expect(nLen > 0, "Build 62: ATA unsupported DST length (RU)");
+    ExpectHas(buf, "не поддерживается", "Build 62: ATA unsupported DST mentions unsupported (RU)");
+    ExpectHas(buf, "Identify word 84/87", "Build 62: ATA unsupported DST mentions Identify word 84/87 (RU)");
+
+    CaseEnd("build-62-regressions", before);
+}
+
+static void TestBuild63Regressions(void)
+{
+    int before = g_fail;
+    DRIVE_INFO info;
+    char szPlain[8192];
+
+    /* 1. ANOMALY_REFLASHED_REPAIRED recommendation must NOT mention removed 'Тест DRAM' button */
+    ZeroMemory(&info, sizeof(info));
+    info.bCounterfeitSuspected = TRUE;
+    info.nAnomalyType = ANOMALY_REFLASHED_REPAIRED;
+    lstrcpyA(info.szModel, "Kingston A400 240GB");
+
+    UiSetLang(UI_LANG_RU);
+    FormatHealthLecturePlain(&info, szPlain, (int)sizeof(szPlain));
+    Expect(strstr(szPlain, "Тест DRAM") == NULL, "Build 63: RU lecture does not mention removed 'Тест DRAM' button");
+    Expect(strstr(szPlain, "Ctrl+D") == NULL, "Build 63: RU lecture does not mention Ctrl+D");
+
+    UiSetLang(UI_LANG_EN);
+    FormatHealthLecturePlain(&info, szPlain, (int)sizeof(szPlain));
+    Expect(strstr(szPlain, "DRAM Test") == NULL, "Build 63: EN lecture does not mention removed 'DRAM Test' button");
+
+    /* 2. ANOMALY_SMART_WIPED recommendation must NOT mention removed 'Тест DST' button */
+    info.nAnomalyType = ANOMALY_SMART_WIPED;
+    UiSetLang(UI_LANG_RU);
+    FormatHealthLecturePlain(&info, szPlain, (int)sizeof(szPlain));
+    Expect(strstr(szPlain, "Тест DST") == NULL, "Build 63: RU lecture does not mention removed 'Тест DST' button");
+
+    UiSetLang(UI_LANG_EN);
+    FormatHealthLecturePlain(&info, szPlain, (int)sizeof(szPlain));
+    Expect(strstr(szPlain, "Extended DST") == NULL, "Build 63: EN lecture does not mention Extended DST button");
+
+    /* 3. ANOMALY_RELABELED recommendation must NOT mention removed DST button */
+    info.nAnomalyType = ANOMALY_RELABELED;
+    UiSetLang(UI_LANG_RU);
+    FormatHealthLecturePlain(&info, szPlain, (int)sizeof(szPlain));
+    Expect(strstr(szPlain, "самотест DST") == NULL, "Build 63: RU lecture does not mention 'самотест DST'");
+
+    UiSetLang(UI_LANG_EN);
+    FormatHealthLecturePlain(&info, szPlain, (int)sizeof(szPlain));
+    Expect(strstr(szPlain, "hardware DST") == NULL, "Build 63: EN lecture does not mention 'hardware DST'");
+
+    /* 4. Build number check */
+    Expect(DRIVEMONITOR_BUILD >= 63, "Build number is at least 63");
+
+    CaseEnd("build-63-regressions", before);
+}
+
+static void TestBuild64Regressions(void)
+{
+    int before = g_fail;
+    char szPlain[8192];
+    char szExpert[8192];
+
+    /* 1. Seagate ST2000DM008 fixture reproduction:
+     * 192,901 park cycles, Value 4, Worst 4, Threshold 0, pristine media (0 reallocated, 0 pending, 0 uncorrectable).
+     * Must NOT downgrade overall health to CAUTION or declare mechanical failure. */
+    Base(DRIVE_TYPE_HDD, "ST2000DM008-2FR102", "0001");
+    g.bSMART_Supported = TRUE;
+    g.bPredictFailure = FALSE;
+    Expect(AddAttr(1, 78, 0x000004198D97ULL), "st2000 attr 1");
+    Expect(AddAttr(5, 100, 0), "st2000 attr 5 clean");
+    SetThresh(5, 10);
+    Expect(AddAttr(7, 83, 0x00000BA9CA2CULL), "st2000 attr 7 clean");
+    SetThresh(7, 45);
+    Expect(AddAttr(187, 100, 0), "st2000 attr 187 clean");
+    Expect(AddAttr(188, 100, 0x000200020042ULL), "st2000 attr 188 timeouts");
+    Expect(AddAttr(191, 100, 0), "st2000 attr 191 no g-sense");
+    Expect(AddAttr(192, 100, 1315), "st2000 attr 192 retracts");
+    Expect(AddAttr(193, 4, 192901), "st2000 attr 193 192k cycles val 4");
+    SetThresh(193, 0);
+    Expect(AddAttr(197, 100, 0), "st2000 attr 197 clean");
+    Expect(AddAttr(198, 100, 0), "st2000 attr 198 clean");
+    Expect(AddAttr(199, 200, 0), "st2000 attr 199 clean crc");
+    Run();
+
+    Expect(UseSeagateRateRaw(&g), "st2000 uses seagate rate raw");
+    ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_GOOD, "st2000 reliability good");
+    ExpectInt((int)g.eMechanics, (int)HEALTH_STATUS_GOOD, "st2000 mechanics good under 600k cycles");
+    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_GOOD, "st2000 headline is GOOD (not CAUTION)");
+
+    UiSetLang(UI_LANG_RU);
+    FormatHealthLecturePlain(&g, szPlain, (int)sizeof(szPlain));
+    ExpectHas(szPlain, "Критических проблем не обнаружено", "st2000 plain lecture confirms healthy status");
+    Expect(strstr(szPlain, "Механика требует внимания") == NULL, "st2000 plain lecture does not claim mechanics caution");
+    Expect(strstr(szPlain, "Парковка головок: значение 4") == NULL, "st2000 plain lecture does not claim park cause");
+
+    FormatHealthLectureExpert(&g, szExpert, (int)sizeof(szExpert));
+    Expect(strstr(szExpert, "ТРЕБУЕТ ВНИМАНИЯ") == NULL, "st2000 expert lecture summary does not say CAUTION");
+    Expect(strstr(szExpert, "Парковка (193)") == NULL, "st2000 expert evidence matrix does not penalize 193");
+
+    /* 2. Seagate HDD exceeding 600,000 rated cycles (thresh 0, pristine media):
+     * Mechanics moves to OBSERVE, but headline stays GOOD (never raised to CAUTION). */
+    Base(DRIVE_TYPE_HDD, "ST2000DM008-2FR102", "0001");
+    g.bSMART_Supported = TRUE;
+    g.bPredictFailure = FALSE;
+    Expect(AddAttr(5, 100, 0), "st2000 high park attr 5 clean");
+    Expect(AddAttr(191, 100, 0), "st2000 high park gsense 0");
+    Expect(AddAttr(193, 1, 650000), "st2000 attr 193 650k cycles");
+    SetThresh(193, 0);
+    Run();
+    ExpectInt((int)g.eMechanics, (int)HEALTH_STATUS_OBSERVE, "st2000 650k cycles mechanics is OBSERVE");
+    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_GOOD, "st2000 650k cycles headline stays GOOD");
+    FormatHealthLectureExpert(&g, szExpert, (int)sizeof(szExpert));
+    ExpectHas(szExpert, "повышенный износ парковки", "st2000 650k cycles expert lecture notes park wear");
+    Expect(strstr(szExpert, "G-Sense фиксирует события") == NULL, "st2000 650k cycles does not claim G-Sense events");
+
+    /* 3. Non-Seagate HDD (e.g. WDC) with 350,000 cycles (thresh 0, pristine media):
+     * Exceeds generic 300,000 limit -> OBSERVE, headline stays GOOD. */
+    Base(DRIVE_TYPE_HDD, "WDC WD20EZBX-00AYRA0", "01.01A01");
+    g.bSMART_Supported = TRUE;
+    g.bPredictFailure = FALSE;
+    Expect(AddAttr(5, 100, 0), "wdc attr 5 clean");
+    Expect(AddAttr(191, 100, 0), "wdc gsense 0");
+    Expect(AddAttr(193, 10, 350000), "wdc attr 193 350k cycles");
+    SetThresh(193, 0);
+    Run();
+    ExpectInt((int)g.eMechanics, (int)HEALTH_STATUS_OBSERVE, "wdc 350k cycles mechanics is OBSERVE");
+    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_GOOD, "wdc 350k cycles headline stays GOOD");
+
+    /* 4. Non-zero threshold breach on attribute 193:
+     * When threshold > 0 and value <= threshold, mechanics MUST be CAUTION and elevate headline. */
+    Base(DRIVE_TYPE_HDD, "ST2000DM008-2FR102", "0001");
+    g.bSMART_Supported = TRUE;
+    g.bPredictFailure = FALSE;
+    Expect(AddAttr(5, 100, 0), "st2000 breached attr 5 clean");
+    Expect(AddAttr(193, 4, 192901), "st2000 breached attr 193 val 4");
+    SetThresh(193, 10);
+    Run();
+    ExpectInt((int)g.eMechanics, (int)HEALTH_STATUS_CAUTION, "breached thresh 193 mechanics is CAUTION");
+    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_CAUTION, "breached thresh 193 elevates headline to CAUTION");
+
+    /* 5. Build number verification */
+    Expect(DRIVEMONITOR_BUILD >= 64, "Build number is at least 64");
+
+    CaseEnd("build-64-regressions", before);
+}
+
+/* Regression tests for Build 65:
+ * 1. Seagate HDD (ST2000DM008 BarraCuda) attributes 241 (F1h) and 242 (F2h)
+ *    are mapped via kSeagateHdd profile to PROF_SEM_HOST_WRITE / PROF_SEM_HOST_READ
+ *    and PROF_ENC_LBA, removing false vendor-specific markers and warnings.
+ * 2. Generic HDD fallback maps 241/242 to Total LBAs Written/Read.
+ * 3. Unknown SATA SSDs with 241/242 remain vendor-specific (no blind guessing).
+ * 4. Build number is 65. */
+static void TestBuild65Regressions(void)
+{
+    int before = g_fail;
+    char szExpert[16384];
+    ATTR_DECODE dec241, dec242;
+
+    /* 1. Seagate ST2000DM008-2FR102 with attributes 241 and 242 */
+    Base(DRIVE_TYPE_HDD, "ST2000DM008-2FR102", "0001");
+    g.bSMART_Supported = TRUE;
+    g.bPredictFailure = FALSE;
+    Expect(AddAttr(1, 78, 0x00000419DCC2ULL), "st2000 b65 attr 1");
+    Expect(AddAttr(5, 100, 0), "st2000 b65 attr 5 clean");
+    Expect(AddAttr(7, 83, 0x00000BA9D4F1ULL), "st2000 b65 attr 7");
+    Expect(AddAttr(9, 77, 0xA1E4000051AEULL), "st2000 b65 attr 9");
+    Expect(AddAttr(187, 100, 0), "st2000 b65 attr 187 clean");
+    Expect(AddAttr(188, 100, 0x000200020042ULL), "st2000 b65 attr 188");
+    Expect(AddAttr(191, 100, 0), "st2000 b65 attr 191");
+    Expect(AddAttr(192, 100, 1315), "st2000 b65 attr 192");
+    Expect(AddAttr(193, 4, 192914), "st2000 b65 attr 193");
+    Expect(AddAttr(194, 34, 34), "st2000 b65 attr 194");
+    Expect(AddAttr(195, 78, 0x00000419DCC2ULL), "st2000 b65 attr 195");
+    Expect(AddAttr(197, 100, 0), "st2000 b65 attr 197 clean");
+    Expect(AddAttr(198, 100, 0), "st2000 b65 attr 198 clean");
+    Expect(AddAttr(199, 200, 0), "st2000 b65 attr 199 clean");
+    Expect(AddAttr(240, 100, 2928), "st2000 b65 attr 240");
+    Expect(AddAttr(241, 100, 28892224523ULL), "st2000 b65 attr 241 lba");
+    Expect(AddAttr(242, 100, 35118432540ULL), "st2000 b65 attr 242 lba");
+    Run();
+
+    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_GOOD, "st2000 b65 headline is GOOD");
+
+    memset(&dec241, 0, sizeof(dec241));
+    memset(&dec242, 0, sizeof(dec242));
+    GetAttrDecode(241, &g, &dec241);
+    GetAttrDecode(242, &g, &dec242);
+
+    ExpectInt((int)dec241.eState, (int)ATTR_DECODE_KNOWN, "st2000 attr 241 decode state KNOWN");
+    ExpectInt((int)dec241.eEnc, (int)RAW_ENC_LBA, "st2000 attr 241 enc LBA");
+    ExpectStr(dec241.szName, "Всего записано (LBA)", "st2000 attr 241 name Total LBAs Written");
+
+    ExpectInt((int)dec242.eState, (int)ATTR_DECODE_KNOWN, "st2000 attr 242 decode state KNOWN");
+    ExpectInt((int)dec242.eEnc, (int)RAW_ENC_LBA, "st2000 attr 242 enc LBA");
+    ExpectStr(dec242.szName, "Всего прочитано (LBA)", "st2000 attr 242 name Total LBAs Read");
+
+    szExpert[0] = '\0';
+    FormatHealthLectureExpert(&g, szExpert, (int)sizeof(szExpert));
+    Expect(strstr(szExpert, "Атрибуты 241, 242 не оцениваются") == NULL, "st2000 does not mark 241/242 unassessed");
+    Expect(strstr(szExpert, "⚠ Есть vendor-specific SMART-счётчики") == NULL, "st2000 has no vendor-specific warning in lecture");
+    ExpectHas(szExpert, "0 vendor-specific", "st2000 has 0 vendor-specific counters not decoded");
+
+    /* 2. Generic HDD (e.g. WDC) with 241/242 recognized as standard ATA LBAs */
+    Base(DRIVE_TYPE_HDD, "WDC WD20EZBX-00AYRA0", "01.01A01");
+    g.bSMART_Supported = TRUE;
+    Expect(AddAttr(241, 100, 1000000ULL), "wdc b65 attr 241");
+    Expect(AddAttr(242, 100, 2000000ULL), "wdc b65 attr 242");
+    Run();
+    memset(&dec241, 0, sizeof(dec241));
+    memset(&dec242, 0, sizeof(dec242));
+    GetAttrDecode(241, &g, &dec241);
+    GetAttrDecode(242, &g, &dec242);
+    ExpectInt((int)dec241.eState, (int)ATTR_DECODE_KNOWN, "wdc hdd attr 241 decode state KNOWN");
+    ExpectInt((int)dec241.eEnc, (int)RAW_ENC_LBA, "wdc hdd attr 241 enc LBA");
+    ExpectInt((int)dec242.eState, (int)ATTR_DECODE_KNOWN, "wdc hdd attr 242 decode state KNOWN");
+    ExpectInt((int)dec242.eEnc, (int)RAW_ENC_LBA, "wdc hdd attr 242 enc LBA");
+
+    /* 3. Unknown SATA SSD with 241 must NOT guess LBA (Unknown != Bad) */
+    Base(DRIVE_TYPE_SSD_SATA, "UnknownSSD 512GB", "1.00");
+    g.bSMART_Supported = TRUE;
+    Expect(AddAttr(241, 100, 1000000ULL), "unknown ssd attr 241");
+    Run();
+    memset(&dec241, 0, sizeof(dec241));
+    GetAttrDecode(241, &g, &dec241);
+    ExpectInt((int)dec241.eState, (int)ATTR_DECODE_UNKNOWN, "unknown ssd attr 241 decode state UNKNOWN");
+    ExpectInt((int)dec241.eEnc, (int)RAW_ENC_UNKNOWN, "unknown ssd attr 241 enc UNKNOWN");
+
+    /* 4. Build number is 65 */
+    Expect(DRIVEMONITOR_BUILD >= 65, "Build number is at least 65");
+
+    CaseEnd("build-65-regressions", before);
+}
+
+/* Regression tests for Build 66:
+ * 1. Attribute 188 (Command Timeout) formatting via FormatCommandTimeout:
+ *    - Word 0 = 0, Word 1 = 187, Word 2 = 77 (exact Toshiba DT01ACA 004D00BB0000 case):
+ *      effective total is 187, formatted as "187 таймаутов (за 5 с: 187, за 7.5 с: 77)",
+ *      NOT false "0  (ОК)".
+ *    - Word 0 = 121, Word 1 = 51, Word 2 = 46 (Seagate ST3000DM001 002E00330079 case):
+ *      formatted as "121 таймаутов (за 5 с: 51, за 7.5 с: 46)".
+ *    - Word 0 = 0, Word 1 = 0, Word 2 = 0: formatted as "0  (ОК)".
+ *    - Word 0 = 3, Word 1 = 0, Word 2 = 0: formatted as "3 таймаутов (за 5 с: 0, за 7.5 с: 0)".
+ * 2. Toshiba DT01ACA100 integration test:
+ *    - With attribute 188 = 004D00BB0000 and attribute 187 = 16:
+ *      AttrRawOrNeg1 returns 187 for 0xBC.
+ *      FormatCommandTimeout produces 187 timeouts and does NOT say "0  (ОК)".
+ *      Interface axis is scored properly.
+ * 3. Build number is 66. */
+static void TestBuild66Regressions(void)
+{
+    int before = g_fail;
+    char szBuf[128];
+    BYTE rawToshiba[6] = { 0x00, 0x00, 0xBB, 0x00, 0x4D, 0x00 };
+    BYTE rawSeagate[6] = { 0x79, 0x00, 0x33, 0x00, 0x2E, 0x00 };
+    BYTE rawZero[6]    = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    BYTE rawSimple[6]  = { 0x03, 0x00, 0x00, 0x00, 0x00, 0x00 };
+
+    /* 1. FormatCommandTimeout formatting checks */
+    szBuf[0] = '\0';
+    FormatCommandTimeout(rawToshiba, szBuf, (int)sizeof(szBuf));
+    ExpectHas(szBuf, "187", "toshiba 188 raw formats 187 timeouts");
+    Expect(strstr(szBuf, "0  (ОК)") == NULL, "toshiba 188 raw does NOT format as 0 OK");
+    ExpectHas(szBuf, "за 5 с: 187", "toshiba 188 raw shows over 5s count");
+    ExpectHas(szBuf, "за 7.5 с: 77", "toshiba 188 raw shows over 7.5s count");
+
+    szBuf[0] = '\0';
+    FormatCommandTimeout(rawSeagate, szBuf, (int)sizeof(szBuf));
+    ExpectHas(szBuf, "121", "seagate 188 raw formats 121 timeouts");
+    ExpectHas(szBuf, "за 5 с: 51", "seagate 188 raw shows over 5s count");
+    ExpectHas(szBuf, "за 7.5 с: 46", "seagate 188 raw shows over 7.5s count");
+
+    szBuf[0] = '\0';
+    FormatCommandTimeout(rawZero, szBuf, (int)sizeof(szBuf));
+    ExpectStr(szBuf, "0  (ОК)", "zero 188 raw formats as 0 OK");
+
+    szBuf[0] = '\0';
+    FormatCommandTimeout(rawSimple, szBuf, (int)sizeof(szBuf));
+    ExpectHas(szBuf, "3", "simple 188 raw formats 3 timeouts");
+
+    /* 2. Toshiba DT01ACA100 integration */
+    Base(DRIVE_TYPE_HDD, "TOSHIBA DT01ACA100", "MS2OA800");
+    g.bSMART_Supported = TRUE;
+    Expect(AddAttr(187, 84, 16), "toshiba b66 attr 187");
+    Expect(AddAttr(188, 100, 0x004D00BB0000ULL), "toshiba b66 attr 188");
+    Run();
+
+    {
+        char szLecture[16384];
+        szLecture[0] = '\0';
+        FormatHealthLectureExpert(&g, szLecture, (int)sizeof(szLecture));
+        ExpectHas(szLecture, "Таймауты команд (188): 187", "toshiba lecture shows 187 timeouts");
+    }
+    ExpectInt((int)g.eInterface, (int)HEALTH_STATUS_BAD, "toshiba 187 timeouts interface is BAD");
+    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_BAD, "toshiba headline is BAD");
+
+    /* 3. Build number is 66 or higher */
+    Expect(DRIVEMONITOR_BUILD >= 66, "Build number is at least 66");
+
+    CaseEnd("build-66-regressions", before);
+}
+
+/* Build 67 regression checks:
+ * 1. ValidateSmartData robustness:
+ *    - Valid sector passes.
+ *    - Unused slots (ID 0) with non-zero reserved bytes are accepted.
+ *    - Sector with non-zero byte 511 but checksum mismatch with >= 2 plausible attributes
+ *      (e.g. Crucial BX500 firmware bug) is accepted.
+ *    - Corrupted / noise sector with checksum mismatch is rejected.
+ *    - All-zero / all-FF sectors are rejected.
+ * 2. Crucial/Micron brand and controller identification:
+ *    - CT500BX500SSD1 -> VENDOR_MICRON, "Crucial", CONTROLLER_SMI, "Silicon Motion SM2258XT/SM2259XT".
+ *    - CT1000MX500SSD1 -> VENDOR_MICRON, "Crucial", CONTROLLER_SMI.
+ *    - MTFDDAK256TBN -> VENDOR_MICRON, "Micron".
+ * 3. Crucial BX500 profile & health integration:
+ *    - Attribute 202 (0xCA) provides remaining life %.
+ *    - Attribute 246 (0xF6) provides host LBAs written.
+ *    - Full health evaluation produces HEALTH_STATUS_GOOD with valid indicators.
+ * 4. Build number is 67. */
+static void TestBuild67Regressions(void)
+{
+    int before = g_fail;
+    BYTE sector[512];
+    unsigned sum;
+    int i;
+
+    /* 1. ValidateSmartData tests */
+    /* 1a. Clean sector with 2 valid attributes and matching checksum */
+    memset(sector, 0, sizeof(sector));
+    sector[0] = 0x10; sector[1] = 0x00; /* Revision 16 */
+    /* Attr 1: ID=0x05, Flags=0x0003, Value=100, Worst=100, Raw=0 */
+    sector[2] = 0x05; sector[3] = 0x03; sector[4] = 0x00; sector[5] = 100; sector[6] = 100;
+    /* Attr 2: ID=0x09, Flags=0x0002, Value=100, Worst=100, Raw=500 */
+    sector[14] = 0x09; sector[15] = 0x02; sector[16] = 0x00; sector[17] = 100; sector[18] = 100;
+    sector[19] = 0xF4; sector[20] = 0x01;
+    /* Calculate valid 2's complement checksum */
+    sum = 0;
+    for (i = 0; i < 511; i++) sum += sector[i];
+    sector[511] = (BYTE)((0x100 - (sum & 0xFF)) & 0xFF);
+    Expect(ValidateSmartData(sector, 512), "valid SMART sector with correct checksum");
+
+    /* 1b. Non-zero reserved bytes behind ID=0 (SMI controller unused slot behavior) */
+    sector[26] = 0x00; /* ID = 0 (unused) */
+    sector[27] = 0x00; sector[28] = 0x00;
+    sector[29] = 100;  /* non-zero value in unused slot */
+    sector[30] = 100;  /* non-zero worst in unused slot */
+    sector[31] = 0x55; /* non-zero raw in unused slot */
+    /* Recompute checksum */
+    sum = 0;
+    for (i = 0; i < 511; i++) sum += sector[i];
+    sector[511] = (BYTE)((0x100 - (sum & 0xFF)) & 0xFF);
+    Expect(ValidateSmartData(sector, 512), "sector with dirty reserved bytes in unused slot is accepted");
+
+    /* 1c. Crucial BX500 firmware bug: byte 511 non-zero, checksum does not match, but attributes are plausible */
+    sector[511] = (BYTE)(sector[511] + 42); /* corrupt checksum byte */
+    Expect(ValidateSmartData(sector, 512), "Crucial BX500 with checksum mismatch and plausible attributes is accepted");
+
+    /* 1d. Noise/garbage buffer with checksum mismatch: no plausible attributes -> rejected */
+    memset(sector, 0x12, sizeof(sector));
+    sector[511] = 0x34;
+    Expect(!ValidateSmartData(sector, 512), "noise sector with checksum mismatch is rejected");
+
+    /* 1e. All zero / all FF rejected */
+    memset(sector, 0, sizeof(sector));
+    Expect(!ValidateSmartData(sector, 512), "all-zero sector is rejected");
+    memset(sector, 0xFF, sizeof(sector));
+    Expect(!ValidateSmartData(sector, 512), "all-FF sector is rejected");
+
+    /* 2. Crucial/Micron brand & controller detection */
+    ExpectInt((int)DetectDriveVendor("CT500BX500SSD1"), (int)VENDOR_MICRON, "CT500BX500SSD1 vendor is Micron");
+    {
+        DRIVE_INFO di;
+        memset(&di, 0, sizeof(di));
+        strcpy(di.szModel, "CT500BX500SSD1");
+        IdentifyDriveParts(&di);
+        ExpectInt((int)di.eVendor, (int)VENDOR_MICRON, "CT500BX500SSD1 vendor is Micron");
+        ExpectStr(VendorLabel(&di), "Crucial", "CT500BX500SSD1 label is Crucial");
+        ExpectInt((int)di.eController, (int)CONTROLLER_SMI, "CT500BX500SSD1 controller is SMI");
+    }
+    {
+        DRIVE_INFO di;
+        memset(&di, 0, sizeof(di));
+        strcpy(di.szModel, "CT1000MX500SSD1");
+        IdentifyDriveParts(&di);
+        ExpectInt((int)di.eVendor, (int)VENDOR_MICRON, "CT1000MX500SSD1 vendor is Micron");
+        ExpectStr(VendorLabel(&di), "Crucial", "CT1000MX500SSD1 label is Crucial");
+        ExpectInt((int)di.eController, (int)CONTROLLER_SMI, "CT1000MX500SSD1 controller is SMI");
+    }
+    {
+        DRIVE_INFO di;
+        memset(&di, 0, sizeof(di));
+        strcpy(di.szModel, "MTFDDAK256TBN");
+        IdentifyDriveParts(&di);
+        ExpectInt((int)di.eVendor, (int)VENDOR_MICRON, "MTFDDAK256TBN vendor is Micron");
+        ExpectStr(VendorLabel(&di), "Micron", "MTFDDAK256TBN label is Micron");
+    }
+
+    /* 3. Crucial BX500 profile and health integration */
+    Base(DRIVE_TYPE_SSD_SATA, "CT500BX500SSD1", "M6CR072");
+    g.bSMART_Supported = TRUE;
+    Expect(AddAttr(0x05, 100, 0), "bx500 attr 05 reallocated");
+    Expect(AddAttr(0x09, 100, 500), "bx500 attr 09 poh");
+    Expect(AddAttr(0x0C, 100, 150), "bx500 attr 0C power cycles");
+    Expect(AddAttr(0xAD, 100, 25), "bx500 attr AD avg erase");
+    Expect(AddAttr(0xCA, 98, 2), "bx500 attr CA life 98%");
+    Expect(AddAttr(0xF6, 100, 2147483648ULL), "bx500 attr F6 ~1TB written");
+    Run();
+
+    ExpectStr(g.szProfileId, "bx500", "CT500BX500SSD1 profile is bx500");
+    ExpectInt((int)g.eController, (int)CONTROLLER_SMI, "bx500 controller is SMI");
+    ExpectStr(g.szControllerChip, "Silicon Motion SM2258XT/SM2259XT", "bx500 chip is SM2258XT/SM2259XT");
+    ExpectHas(g.szModelFamily, "Crucial/Micron Client SSDs", "bx500 drivedb matches Crucial/Micron Client SSDs");
+    ExpectInt(g.nSSDLifeLeft, 98, "bx500 life left is 98%");
+    Expect(g.nSSDTotalWritesGB >= 1000 && g.nSSDTotalWritesGB <= 1050, "bx500 total writes ~1024 GiB");
+    ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_GOOD, "bx500 health is GOOD");
+
+    /* 4. Build number is 67 */
+    Expect(DRIVEMONITOR_BUILD >= 67, "Build number >= 67");
+
+    CaseEnd("build-67-regressions", before);
+}
+static void TestBuild68Regressions(void)
+{
+    int before = g_fail;
+
+    /* 1. ValidateSmartData rejects buffer containing 0xFF attribute ID */
+    {
+        BYTE buf[512];
+        memset(buf, 0, sizeof(buf));
+        buf[0] = 0x01; buf[1] = 0x00; /* Version 1 */
+        /* Attr 1: ID 0x01 */
+        buf[2] = 0x01; buf[5] = 100; buf[6] = 100;
+        /* Attr 2: ID 0x05 */
+        buf[14] = 0x05; buf[17] = 100; buf[18] = 100;
+        /* Checksum byte */
+        BYTE sum = 0;
+        for (int i = 0; i < 511; i++) sum = (BYTE)(sum + buf[i]);
+        buf[511] = (BYTE)(0x100 - sum);
+
+        Expect(ValidateSmartData(buf, 512) == TRUE, "ValidateSmartData accepts valid buffer with 2 attrs");
+
+        /* Insert invalid attr ID 0xFF (dump from ASMedia/noise) */
+        buf[26] = 0xFF; buf[29] = 100; buf[30] = 100;
+        sum = 0;
+        for (int i = 0; i < 511; i++) sum = (BYTE)(sum + buf[i]);
+        buf[511] = (BYTE)(0x100 - sum);
+
+        Expect(ValidateSmartData(buf, 512) == FALSE, "ValidateSmartData rejects buffer with 0xFF attribute ID");
+    }
+
+    /* 2. BridgeAllowsVendorProbes rejects Cypress/Sunplus/Prolific on ASMedia, Realtek, JMicron */
+    {
+        DRIVE_INFO di;
+        memset(&di, 0, sizeof(di));
+        di.wUsbVid = 0x174C; /* ASMedia */
+        Expect(BridgeAllowsVendorProbes(&di, USB_BRIDGE_SUNPLUS) == FALSE, "Block Sunplus on ASMedia VID");
+        Expect(BridgeAllowsVendorProbes(&di, USB_BRIDGE_CYPRESS) == FALSE, "Block Cypress on ASMedia VID");
+        Expect(BridgeAllowsVendorProbes(&di, USB_BRIDGE_PROLIFIC) == FALSE, "Block Prolific on ASMedia VID");
+
+        memset(&di, 0, sizeof(di));
+        di.wUsbVid = 0x0BDA; /* Realtek */
+        Expect(BridgeAllowsVendorProbes(&di, USB_BRIDGE_SUNPLUS) == FALSE, "Block Sunplus on Realtek VID");
+
+        memset(&di, 0, sizeof(di));
+        strcpy(di.szBridgeVendor, "ASMedia");
+        Expect(BridgeAllowsVendorProbes(&di, USB_BRIDGE_SUNPLUS) == FALSE, "Block Sunplus on ASMedia string");
+    }
+
+    /* 3. Gen1 at full width is still below a known faster port */
+    {
+        DRIVE_INFO di;
+        memset(&di, 0, sizeof(di));
+        di.bIsNVMe = TRUE;
+        di.nPcieCurLinkWidth = 4;
+        di.nPcieMaxLinkWidth = 4;
+        di.nPcieCurLinkSpeed = 1;
+        di.nPcieMaxLinkSpeed = 4;
+        di.nPcieUpMaxLinkSpeed = 3;
+        di.nPcieUpMaxLinkWidth = 4;
+
+        ApplyPcieLinkLimit(&di);
+        Expect(di.bLinkDegraded == TRUE, "Gen1 on a Gen3 port is below the port");
+        Expect(di.bPcieHostCapped == FALSE, "Gen1 on a Gen3 port is not the board ceiling");
+
+        FillDriveProtocol(&di);
+        Expect(strstr(di.szProtocol, "ASPM") == NULL, "protocol does not call Gen1 an ASPM idle");
+        ExpectHas(di.szProtocol, "\xE2\x9A\xA0", "Gen1 below the port keeps the warning glyph");
+
+        /* Lane drop on the same port is degraded too */
+        memset(&di, 0, sizeof(di));
+        di.bIsNVMe = TRUE;
+        di.nPcieCurLinkWidth = 2;
+        di.nPcieMaxLinkWidth = 4;
+        di.nPcieCurLinkSpeed = 1;
+        di.nPcieMaxLinkSpeed = 4;
+        di.nPcieUpMaxLinkSpeed = 3;
+        di.nPcieUpMaxLinkWidth = 4;
+
+        ApplyPcieLinkLimit(&di);
+        Expect(di.bLinkDegraded == TRUE, "bLinkDegraded is TRUE when lane width reduced");
+        Expect(di.bPcieHostCapped == FALSE, "a narrow Gen1 link is not the board ceiling");
+    }
+
+    /* 4. TWSC brand detection */
+    {
+        DRIVE_INFO di;
+        memset(&di, 0, sizeof(di));
+        strcpy(di.szModel, "TWSC TSC3AN512-F6Q10SD");
+        IdentifyDriveParts(&di);
+        ExpectStr(VendorLabel(&di), "TWSC", "TWSC TSC3AN512-F6Q10SD vendor label is TWSC");
+    }
+
+    /* 5. Apacer AS340 SMI profile and attributes */
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "Apacer AS340 120GB", "VE1R9008");
+        g.bSMART_Supported = TRUE;
+        Expect(AddAttr(0x05, 100, 0), "as340 attr 05 realloc");
+        Expect(AddAttr(0x09, 100, 3484), "as340 attr 09 poh");
+        Expect(AddAttr(0x0C, 100, 2297), "as340 attr 0C power cycles");
+        Expect(AddAttr(0xA9, 100, 91), "as340 attr A9 life 91%");
+        Expect(AddAttr(0xAE, 100, 82), "as340 attr AE unexpected power loss 82");
+        Expect(AddAttr(0xE8, 100, 100), "as340 attr E8 spare 100%");
+        Expect(AddAttr(0xF1, 100, 7773), "as340 attr F1 host written 7773 blocks");
+        Run();
+
+        ExpectStr(g.szProfileId, "as340", "as340 profile matches");
+        ExpectInt((int)g.eController, (int)CONTROLLER_SMI, "as340 controller is SMI");
+        ExpectInt(g.nEndurancePercent, 91, "as340 endurance percent is 91%");
+        ExpectInt(g.nSSDLifeLeft, 91, "as340 life left is 91%");
+        Expect(g.nSSDTotalWritesGB >= 240 && g.nSSDTotalWritesGB <= 250, "as340 host writes ~243 GiB");
+        ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_GOOD, "as340 health is GOOD");
+    }
+
+    /* 6. Build number is 68 or later */
+    Expect(DRIVEMONITOR_BUILD >= 68, "Build number is 68 or later");
+
+    CaseEnd("build-68-regressions", before);
+}
+
+static void TestBuild69Regressions(void)
+{
+    int before = g_check;
+
+    /* 1. HDD SATA Gen 2 (3 Gb/s) on Gen 3 drive without CRC errors is host-capped, NOT degraded */
+    {
+        DRIVE_INFO info;
+        memset(&info, 0, sizeof(info));
+        info.bSMART_Supported = TRUE;
+        info.bSMART_Enabled = TRUE;
+        info.bGotReturnStatus = TRUE;
+        info.eType = DRIVE_TYPE_HDD;
+        WORD ident[256];
+        memset(ident, 0, sizeof(ident));
+        ident[76] = 0x000E; /* Gen 1, 2, 3 supported -> maxGen = 3 (6 Gb/s) */
+        ident[77] = (2 << 1); /* negotiated Gen 2 (3 Gb/s) */
+        FillAtaProtocolFromIdent(&info, ident);
+
+        Expect(info.bSataHostCapped, "SATA Gen2 on Gen3 HDD is host-capped");
+        Expect(!info.bLinkDegraded, "SATA Gen2 on Gen3 HDD is NOT degraded");
+        ExpectInt((int)info.nSataMaxGen, 3, "nSataMaxGen is 3");
+        ExpectInt((int)info.nSataCurGen, 2, "nSataCurGen is 2");
+        ExpectHas(info.szProtocol, "SATA 3 Гбит/с", "Protocol mentions negotiated 3 Gb/s");
+        ExpectHas(info.szProtocol, "макс. 6 Гбит/с", "Protocol mentions max 6 Gb/s");
+        Expect(strstr(info.szProtocol, "\xE2\x9A\xA0") == NULL, "Protocol has NO warning glyph");
+
+        AssessDriveHealth(&info);
+        ExpectInt((int)info.eInterface, (int)HEALTH_STATUS_GOOD, "HDD eInterface is GOOD on SATA II ceiling with 0 CRC");
+        ExpectInt((int)info.eHealthStatus, (int)HEALTH_STATUS_GOOD, "HDD eHealthStatus is GOOD on SATA II ceiling with 0 CRC");
+
+        char lecture[4096];
+        FormatHealthLecture(&info, lecture, sizeof(lecture));
+        ExpectHas(lecture, "Шина SATA: согласован режим 3 Гбит/с", "Lecture explains SATA II host ceiling");
+        Expect(strstr(lecture, "деградация скорости шины SATA") == NULL, "Lecture does NOT claim link degradation");
+    }
+
+    /* 2. CRC on a SATA II ceiling stays CRC. The speed line stays the port. */
+    {
+        DRIVE_INFO info;
+        char lecture[4096];
+        memset(&info, 0, sizeof(info));
+        info.bSMART_Supported = TRUE;
+        info.bSMART_Enabled = TRUE;
+        info.bGotReturnStatus = TRUE;
+        info.eType = DRIVE_TYPE_HDD;
+        info.attrData.stAttributes[0].bAttrID = 0xC7;
+        info.attrData.stAttributes[0].bAttrValue = 100;
+        info.attrData.stAttributes[0].bWorstValue = 100;
+        info.attrData.stAttributes[0].bRawValue[0] = 5;
+        WORD ident[256];
+        memset(ident, 0, sizeof(ident));
+        ident[76] = 0x000E;
+        ident[77] = (2 << 1);
+        FillAtaProtocolFromIdent(&info, ident);
+        AssessDriveHealth(&info);
+
+        Expect(info.bSataHostCapped, "SATA II ceiling stays when CRC is present");
+        Expect(!info.bLinkDegraded, "old CRC does not turn the port ceiling into a downtrain");
+        ExpectInt((int)info.eInterface, (int)HEALTH_STATUS_CAUTION, "eInterface is CAUTION on CRC");
+        Expect(strstr(info.szProtocol, "\xE2\x9A\xA0") == NULL, "protocol keeps no warning glyph");
+        FormatHealthLecture(&info, lecture, sizeof(lecture));
+        ExpectHas(lecture, "Шина SATA: согласован режим 3 Гбит/с", "lecture still names the SATA II ceiling");
+        ExpectHas(lecture, "Ошибки CRC", "lecture still names the CRC errors");
+        Expect(strstr(lecture, "Ошибок CRC нет") == NULL, "lecture does not claim CRC is zero");
+        Expect(strstr(lecture, "деградация скорости шины SATA") == NULL, "lecture does not call the port a speed fault");
+    }
+
+    /* 3. SATA SSD on Gen 2 port without CRC errors */
+    {
+        DRIVE_INFO info;
+        memset(&info, 0, sizeof(info));
+        info.bSMART_Supported = TRUE;
+        info.bSMART_Enabled = TRUE;
+        info.bGotReturnStatus = TRUE;
+        info.eType = DRIVE_TYPE_SSD_SATA;
+        info.nSSDLifeLeft = 100;
+        WORD ident[256];
+        memset(ident, 0, sizeof(ident));
+        ident[76] = 0x000E;
+        ident[77] = (2 << 1);
+        FillAtaProtocolFromIdent(&info, ident);
+        AssessDriveHealth(&info);
+
+        Expect(info.bSataHostCapped, "SSD on SATA II is host-capped");
+        Expect(!info.bLinkDegraded, "SSD on SATA II is NOT degraded when CRC=0");
+        ExpectInt((int)info.eInterface, (int)HEALTH_STATUS_GOOD, "SSD eInterface is GOOD on SATA II ceiling");
+        ExpectInt((int)info.eHealthStatus, (int)HEALTH_STATUS_GOOD, "SSD eHealthStatus is GOOD on SATA II ceiling");
+    }
+
+    /* 4. Attribute 181 (0xB5) naming and classification */
+    {
+        DRIVE_INFO di;
+        memset(&di, 0, sizeof(di));
+        strcpy(di.szModel, "Apacer AS340 120GB");
+        strcpy(di.szFirmware, "VE1R9008");
+        di.eType = DRIVE_TYPE_SSD_SATA;
+        di.bSMART_Supported = TRUE;
+        IdentifyDriveParts(&di);
+
+        const char* name = GetAttrNameEx(0xB5, &di);
+        ExpectHas(name, "Число программирований (всего)", "Attribute 0xB5 is Program count, not fail count");
+    }
+
+    /* 5. Build number is 69 or later */
+    Expect(DRIVEMONITOR_BUILD >= 69, "Build number is 69 or later");
+
+    CaseEnd("build-69-regressions", before);
+}
+
+static void TestBuild70Regressions(void)
+{
+    int before = g_fail;
+
+    /* 1. Apacer AS340 240GB with AP* firmware (e.g. AP202PS0):
+     * must NOT use SM2258 VE* table (241=BLOCK32), must decode
+     * 231 (E7h) as Lifetime_Left (%) and 241 (F1h) as 512B LBAs. */
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "Apacer AS340 240GB", "AP202PS0");
+        g.bSMART_Supported = TRUE;
+        Expect(AddAttr(0x09, 100, 47), "as340-ap attr 09 poh");
+        Expect(AddAttr(0x0C, 100, 351), "as340-ap attr 0C power cycles");
+        Expect(AddAttr(0xA3, 100, 3), "as340-ap attr A3 max erase");
+        Expect(AddAttr(0xA4, 100, 2), "as340-ap attr A4 avg erase");
+        Expect(AddAttr(0xA6, 100, 0), "as340-ap attr A6 bad blocks");
+        Expect(AddAttr(0xA7, 100, 0), "as340-ap attr A7 protect mode");
+        Expect(AddAttr(0xA8, 100, 0), "as340-ap attr A8 phy err");
+        Expect(AddAttr(0xAB, 100, 0), "as340-ap attr AB prog fail");
+        Expect(AddAttr(0xAC, 100, 0), "as340-ap attr AC erase fail");
+        Expect(AddAttr(0xAF, 100, 0), "as340-ap attr AF bad cluster");
+        Expect(AddAttr(0xC0, 100, 307), "as340-ap attr C0 power loss");
+        Expect(AddAttr(0xC2, 67, 0x002400210021ULL), "as340-ap attr C2 temp 33C");
+        Expect(AddAttr(0xE7, 100, 100), "as340-ap attr E7 life 100%");
+        Expect(AddAttr(0xF1, 100, 0x23B2EC6FULL), "as340-ap attr F1 total LBAs");
+        Run();
+
+        ExpectStr(g.szProfileId, "as340-ap", "as340-ap profile matches AP202PS0");
+        ExpectInt((int)g.eController, (int)CONTROLLER_UNKNOWN, "as340-ap does not assume SMI");
+        ExpectSem(0xE7, PROF_SEM_ENDURANCE, PROF_ENC_PERCENT, "as340-ap E7 is endurance percent");
+        ExpectSem(0xF1, PROF_SEM_HOST_WRITE, PROF_ENC_LBA, "as340-ap F1 is LBA host writes");
+        ExpectInt(g.nSSDLifeLeft, 100, "as340-ap life left 100%");
+        ExpectInt(g.nEndurancePercent, 100, "as340-ap endurance 100%");
+        ExpectInt(g.nSSDAvgEraseCount, 2, "as340-ap avg erase 2");
+        ExpectInt(g.nSSDMaxEraseCount, 3, "as340-ap max erase 3");
+        ExpectInt(g.nSSDTotalWritesGB, 285, "as340-ap host writes 285 GiB (not 4295 TB)");
+        ExpectName(0xE7, 1, "Остаток", "as340-ap E7 name is life left");
+        ExpectName(0xF1, 1, "LBA", "as340-ap F1 name mentions LBA");
+        ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_GOOD, "as340-ap health is GOOD");
+    }
+
+    /* 2. ExtractTemperatureFromATA must NOT treat non-thermal 0xE7 = 100 as 100 C */
+    {
+        DRIVE_INFO dt;
+        memset(&dt, 0, sizeof(dt));
+        dt.eType = DRIVE_TYPE_SSD_SATA;
+        dt.bSMART_Supported = TRUE;
+        strcpy(dt.szModel, "Apacer AS340 240GB");
+        strcpy(dt.szFirmware, "AP202PS0");
+        dt.attrData.stAttributes[0].bAttrID = 0xE7;
+        dt.attrData.stAttributes[0].bAttrValue = 100;
+        dt.attrData.stAttributes[0].bRawValue[0] = 100;
+        ExtractTemperatureFromATA(&dt);
+        ExpectInt(dt.nTemperatureC, 0, "E7 endurance must not be read as 100 C temperature");
+
+        /* Unknown drive with unconfirmed 0xE7 = 100 also must not become 100 C */
+        memset(&dt, 0, sizeof(dt));
+        dt.eType = DRIVE_TYPE_SSD_SATA;
+        dt.bSMART_Supported = TRUE;
+        strcpy(dt.szModel, "Unknown Test SSD");
+        strcpy(dt.szFirmware, "FW123");
+        dt.attrData.stAttributes[0].bAttrID = 0xE7;
+        dt.attrData.stAttributes[0].bAttrValue = 100;
+        dt.attrData.stAttributes[0].bRawValue[0] = 100;
+        ExtractTemperatureFromATA(&dt);
+        ExpectInt(dt.nTemperatureC, 0, "unconfirmed E7 must not be read as 100 C temperature");
+    }
+
+    /* 3. Apacer AS350 with AP* firmware also routes to as350-ap (231=life, 241=LBA) */
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "Apacer AS350 1TB", "AP613PE0");
+        g.bSMART_Supported = TRUE;
+        Expect(AddAttr(0xE7, 98, 98), "as350-ap E7 98%");
+        Expect(AddAttr(0xF1, 100, 20971520ULL), "as350-ap F1 10 GiB in LBAs");
+        Run();
+
+        ExpectStr(g.szProfileId, "as350-ap", "as350-ap profile matches AP613PE0");
+        ExpectSem(0xE7, PROF_SEM_ENDURANCE, PROF_ENC_PERCENT, "as350-ap E7 endurance");
+        ExpectSem(0xF1, PROF_SEM_HOST_WRITE, PROF_ENC_LBA, "as350-ap F1 LBA writes");
+        ExpectInt(g.nEndurancePercent, 98, "as350-ap endurance 98%");
+        ExpectInt(g.nSSDTotalWritesGB, 10, "as350-ap writes 10 GiB");
+    }
+
+    /* 4. Apacer AS340 120GB VE1R9008 still routes to SMI as340 profile */
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "Apacer AS340 120GB", "VE1R9008");
+        g.bSMART_Supported = TRUE;
+        Expect(AddAttr(0xA9, 100, 91), "as340 VE A9 life 91%");
+        Expect(AddAttr(0xF1, 100, 7773), "as340 VE F1 32MiB blocks");
+        Run();
+
+        ExpectStr(g.szProfileId, "as340", "as340 VE still matches SMI profile");
+        ExpectInt((int)g.eController, (int)CONTROLLER_SMI, "as340 VE controller is SMI");
+        ExpectSem(0xF1, PROF_SEM_HOST_WRITE, PROF_ENC_BLOCK32, "as340 VE F1 stays BLOCK32");
+    }
+
+    /* 5. Build number is 70 or later */
+    Expect(DRIVEMONITOR_BUILD >= 70, "Build number is 70 or later");
+
+    CaseEnd("build-70-regressions", before);
+}
+
+static void TestBuild71Regressions(void)
+{
+    int before = g_fail;
+
+    /* 1. Apacer AS340 third/unknown firmware must NOT fall into SM2258 kApacerSmi */
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "Apacer AS340 240GB", "U0101A0");
+        g.bSMART_Supported = TRUE;
+        Expect(AddAttr(0xE7, 100, 100), "as340 unknown fw E7");
+        Expect(AddAttr(0xF1, 100, 500000000ULL), "as340 unknown fw F1");
+        Run();
+
+        ExpectNotHas(g.szProfileId, "as340", "unknown AS340 fw must not force as340/as340-ap");
+        ExpectNoLookup(0xF1, "unknown AS340 fw must not force BLOCK32 on F1");
+    }
+
+    /* 2. AMD R5SL splits cleanly between Phison SBFM* and SMI 7-char firmware */
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "AMD R5SL512G", "V0929A0");
+        g.bSMART_Supported = TRUE;
+        Expect(AddAttr(0xA9, 100, 88), "r5sl smi A9 88%");
+        Expect(AddAttr(0xF1, 100, 1024), "r5sl smi F1 32 GiB");
+        Run();
+
+        ExpectStr(g.szProfileId, "r5sl-smi225", "AMD R5SL512G/V0929A0 uses r5sl-smi225");
+        ExpectInt((int)g.eController, (int)CONTROLLER_SMI, "R5SL V0929A0 is SMI");
+        ExpectInt(g.nEndurancePercent, 88, "R5SL SMI life 88%");
+        ExpectInt(g.nSSDTotalWritesGB, 32, "R5SL SMI writes 32 GiB");
+    }
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "R5SL480G", "SBFM61.3");
+        g.bSMART_Supported = TRUE;
+        Expect(AddAttr(0xE7, 95, 95), "r5sl sbfm E7 95%");
+        Run();
+
+        ExpectStr(g.szProfileId, "r5sl-sbfm", "R5SL SBFM matches r5sl-sbfm");
+        ExpectInt((int)g.eController, (int)CONTROLLER_PHISON, "R5SL SBFM is Phison");
+        ExpectInt(g.nEndurancePercent, 95, "R5SL Phison life 95%");
+    }
+
+    /* 3. SPCC M.2 SSD confirmed SMI firmware revisions override Phison fallback */
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "SPCC M.2 SSD", "Q0627A0");
+        g.bSMART_Supported = TRUE;
+        Expect(AddAttr(0xA9, 100, 93), "spcc smi A9 93%");
+        Expect(AddAttr(0xF1, 100, 2048), "spcc smi F1 64 GiB");
+        Run();
+
+        ExpectStr(g.szProfileId, "spcc-m2-q0627a0", "SPCC M.2 Q0627A0 uses SMI");
+        ExpectInt((int)g.eController, (int)CONTROLLER_SMI, "SPCC M.2 Q0627A0 controller is SMI");
+        ExpectInt(g.nEndurancePercent, 93, "SPCC M.2 SMI life 93%");
+        ExpectInt(g.nSSDTotalWritesGB, 64, "SPCC M.2 SMI writes 64 GiB");
+    }
+
+    /* 4. SandForce SF-2281: SV300 requires ABBF0 firmware (empty fw stays ata-generic) */
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "KINGSTON SV300S37A120G", "603ABBF0");
+        g.bSMART_Supported = TRUE;
+        Expect(AddAttr(0xE7, 94, 0x00000064ULL), "sv300 E7 Value=94 life");
+        Expect(AddAttr(0xF1, 100, 4200), "sv300 F1 4200 GiB");
+        Run();
+
+        ExpectStr(g.szProfileId, "sv300-sf", "SV300 ABBF0 matches sv300-sf");
+        ExpectInt((int)g.eController, (int)CONTROLLER_SANDFORCE, "SV300 ABBF0 controller SandForce");
+        ExpectSem(0xE7, PROF_SEM_ENDURANCE, PROF_ENC_VALUE, "SandForce E7 uses Value");
+        ExpectSem(0xF1, PROF_SEM_HOST_WRITE, PROF_ENC_GIB, "SandForce F1 uses GiB");
+        ExpectInt(g.nEndurancePercent, 94, "SV300 life 94% from Value");
+        ExpectInt(g.nSSDTotalWritesGB, 4200, "SV300 host writes 4200 GiB");
+    }
+
+    /* 5. WD Blue 3D / SanDisk Ultra 3D / SSD Plus SATA SSD profiles */
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "WDC WDS500G2B0A-00SM50", "X61130WD");
+        g.bSMART_Supported = TRUE;
+        Expect(AddAttr(0xA6, 100, 10), "wd blue min erase 10");
+        Expect(AddAttr(0xA8, 100, 45), "wd blue max erase 45");
+        Expect(AddAttr(0xAD, 100, 22), "wd blue avg erase 22");
+        Expect(AddAttr(0xF1, 100, 3150), "wd blue host writes 3150 GiB");
+        Run();
+
+        ExpectStr(g.szProfileId, "wd-blue-2b0a", "WDC WDS500G2B0A matches wd-blue-2b0a");
+        ExpectInt((int)g.eController, (int)CONTROLLER_MARVELL, "WD Blue 3D controller Marvell");
+        ExpectInt(g.nSSDMinEraseCount, 10, "wd blue min erase 10");
+        ExpectInt(g.nSSDMaxEraseCount, 45, "wd blue max erase 45");
+        ExpectInt(g.nSSDAvgEraseCount, 22, "wd blue avg erase 22");
+        ExpectInt(g.nSSDTotalWritesGB, 3150, "wd blue writes 3150 GiB");
+    }
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "SanDisk SSD PLUS 240GB", "UE4500RL");
+        g.bSMART_Supported = TRUE;
+        Expect(AddAttr(0xAD, 100, 15), "sandisk plus avg erase 15");
+        Expect(AddAttr(0xF1, 100, 890), "sandisk plus host writes 890 GiB");
+        Run();
+
+        ExpectStr(g.szProfileId, "sandisk-ssd-plus", "SanDisk SSD PLUS matches sandisk-ssd-plus");
+        ExpectInt(g.nSSDAvgEraseCount, 15, "sandisk plus avg erase 15");
+        ExpectInt(g.nSSDTotalWritesGB, 890, "sandisk plus writes 890 GiB");
+    }
+
+    /* 6. SMI mass models: SU650 (7-char SMI fw vs non-SMI fw) and SKC600 */
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "ADATA SU650", "S0212B0");
+        g.bSMART_Supported = TRUE;
+        Expect(AddAttr(0xA9, 100, 97), "su650 smi A9 97%");
+        Expect(AddAttr(0xF1, 100, 512), "su650 smi F1 16 GiB");
+        Run();
+
+        ExpectStr(g.szProfileId, "su650-smi225", "SU650 S0212B0 matches su650-smi225");
+        ExpectInt(g.nEndurancePercent, 97, "su650 life 97%");
+        ExpectInt(g.nSSDTotalWritesGB, 16, "su650 writes 16 GiB");
+    }
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "ADATA SU650", "V8X01c45");
+        g.bSMART_Supported = TRUE;
+        Run();
+        ExpectNotHas(g.szProfileId, "su650-smi225", "SU650 non-SMI225 fw does not match su650-smi225");
+    }
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "KINGSTON SKC600256G", "S4500105");
+        g.bSMART_Supported = TRUE;
+        Expect(AddAttr(0xA9, 100, 99), "skc600 A9 99%");
+        Expect(AddAttr(0xF1, 100, 1024), "skc600 F1 32 GiB");
+        Run();
+
+        ExpectStr(g.szProfileId, "kc600-smi", "SKC600 matches kc600-smi");
+        ExpectInt((int)g.eController, (int)CONTROLLER_SMI, "SKC600 controller SMI");
+        ExpectInt(g.nEndurancePercent, 99, "SKC600 life 99%");
+        ExpectInt(g.nSSDTotalWritesGB, 32, "SKC600 writes 32 GiB");
+    }
+
+    /* 7. Build number is 71 or later */
+    Expect(DRIVEMONITOR_BUILD >= 71, "Build number is 71 or later");
+
+    CaseEnd("build-71-regressions", before);
+}
+
+static void TestBuild72Regressions(void)
+{
+    int before = g_fail;
+
+    /* 1. Kingston UV400 / UV500 (Marvell 88SS1074): E7h % life, F1h/F2h GiB */
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "KINGSTON SUV400S37240G", "0C3J96R9");
+        g.bSMART_Supported = TRUE;
+        Expect(AddAttr(0xE7, 96, 96), "suv400 E7 96%");
+        Expect(AddAttr(0xF1, 100, 4100), "suv400 F1 4100 GiB");
+        Expect(AddAttr(0xF2, 100, 5200), "suv400 F2 5200 GiB");
+        Run();
+
+        ExpectStr(g.szProfileId, "suv400", "SUV400 matches suv400");
+        ExpectInt((int)g.eController, (int)CONTROLLER_MARVELL, "SUV400 controller Marvell");
+        ExpectInt(g.nEndurancePercent, 96, "SUV400 life 96%");
+        ExpectInt(g.nSSDTotalWritesGB, 4100, "SUV400 writes 4100 GiB");
+        ExpectSem(0xF2, PROF_SEM_HOST_READ, PROF_ENC_GIB, "SUV400 F2 reads use GiB");
+    }
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "KINGSTON SUV500480G", "003056RI");
+        g.bSMART_Supported = TRUE;
+        Expect(AddAttr(0xE7, 98, 98), "suv500 E7 98%");
+        Expect(AddAttr(0xF1, 100, 1200), "suv500 F1 1200 GiB");
+        Run();
+
+        ExpectStr(g.szProfileId, "suv500", "SUV500 matches suv500");
+        ExpectInt((int)g.eController, (int)CONTROLLER_MARVELL, "SUV500 controller Marvell");
+        ExpectInt(g.nEndurancePercent, 98, "SUV500 life 98%");
+        ExpectInt(g.nSSDTotalWritesGB, 1200, "SUV500 writes 1200 GiB");
+    }
+
+    /* 2. Patriot controller splits: Phison SBFM/SAFM vs Maxio SN vs SMI225 */
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "Patriot Burst", "SBFMLA.5");
+        g.bSMART_Supported = TRUE;
+        Expect(AddAttr(0xE7, 97, 97), "patriot burst E7 97%");
+        Run();
+
+        ExpectStr(g.szProfileId, "patriot-burst-sbfm", "Patriot Burst SBFM matches patriot-burst-sbfm");
+        ExpectInt((int)g.eController, (int)CONTROLLER_PHISON, "Patriot Burst SBFM is Phison");
+        ExpectInt(g.nEndurancePercent, 97, "Patriot Burst life 97%");
+    }
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "Patriot Burst Elite", "SN08979");
+        g.bSMART_Supported = TRUE;
+        Expect(AddAttr(0xE7, 95, 5), "burst elite SN E7 Value=95%");
+        Expect(AddAttr(0xF1, 100, 800), "burst elite SN F1 800 GiB");
+        Run();
+
+        ExpectStr(g.szProfileId, "burst-elite-sn", "Patriot Burst Elite SN matches burst-elite-sn");
+        ExpectInt((int)g.eController, (int)CONTROLLER_MAXIO, "Patriot Burst Elite SN is Maxio");
+        ExpectInt(g.nEndurancePercent, 95, "Patriot Burst Elite SN life 95%");
+        ExpectInt(g.nSSDTotalWritesGB, 800, "Patriot Burst Elite SN writes 800 GiB");
+    }
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "Patriot Burst Elite", "V1102A0");
+        g.bSMART_Supported = TRUE;
+        Expect(AddAttr(0xA9, 100, 92), "burst elite smi A9 92%");
+        Expect(AddAttr(0xF1, 100, 1024), "burst elite smi F1 32 GiB");
+        Run();
+
+        ExpectStr(g.szProfileId, "burst-elite-smi225", "Patriot Burst Elite V1102A0 matches burst-elite-smi225");
+        ExpectInt((int)g.eController, (int)CONTROLLER_SMI, "Patriot Burst Elite V1102A0 is SMI");
+        ExpectInt(g.nEndurancePercent, 92, "Patriot Burst Elite SMI life 92%");
+        ExpectInt(g.nSSDTotalWritesGB, 32, "Patriot Burst Elite SMI writes 32 GiB");
+    }
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "Patriot Blast", "SAFM02.2");
+        g.bSMART_Supported = TRUE;
+        Run();
+        ExpectStr(g.szProfileId, "patriot-blast-safm", "Patriot Blast SAFM matches patriot-blast-safm");
+        ExpectInt((int)g.eController, (int)CONTROLLER_PHISON, "Patriot Blast SAFM is Phison");
+    }
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "Patriot P200", "S0719B0");
+        g.bSMART_Supported = TRUE;
+        Run();
+        ExpectStr(g.szProfileId, "patriot-p200-smi225", "Patriot P200 SMI matches patriot-p200-smi225");
+        ExpectInt((int)g.eController, (int)CONTROLLER_SMI, "Patriot P200 S0719B0 is SMI");
+    }
+
+    /* 3. Goodram CX400 / Lexar NQ100 / MSI S270 / Smartbuy / TEAM splits */
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "SSDPR-CX400-512-G2", "SBFMLA.5");
+        g.bSMART_Supported = TRUE;
+        Run();
+        ExpectStr(g.szProfileId, "cx400-sbfm", "CX400 SBFM matches cx400-sbfm");
+        ExpectInt((int)g.eController, (int)CONTROLLER_PHISON, "CX400 SBFM is Phison");
+    }
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "SSDPR-CX400-128-G2", "SN07373");
+        g.bSMART_Supported = TRUE;
+        Run();
+        ExpectStr(g.szProfileId, "cx400-sn", "CX400 SN matches cx400-sn");
+        ExpectInt((int)g.eController, (int)CONTROLLER_MAXIO, "CX400 SN is Maxio");
+    }
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "Lexar SSD NQ100 240GB", "SN09238");
+        g.bSMART_Supported = TRUE;
+        Run();
+        ExpectStr(g.szProfileId, "lexar-nq100-sn", "Lexar NQ100 SN matches lexar-nq100-sn");
+        ExpectInt((int)g.eController, (int)CONTROLLER_MAXIO, "Lexar NQ100 SN is Maxio");
+    }
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "MSI S270 240GB", "SBFM61.3");
+        g.bSMART_Supported = TRUE;
+        Run();
+        ExpectStr(g.szProfileId, "msi-s270-sbfm", "MSI S270 SBFM matches msi-s270-sbfm");
+        ExpectInt((int)g.eController, (int)CONTROLLER_PHISON, "MSI S270 SBFM is Phison");
+    }
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "TEAM L3 EVO SSD 120GB", "SBFM01.0");
+        g.bSMART_Supported = TRUE;
+        Run();
+        ExpectStr(g.szProfileId, "team-l3evo-sbfm", "TEAM L3 EVO matches team-l3evo-sbfm");
+        ExpectInt((int)g.eController, (int)CONTROLLER_PHISON, "TEAM L3 EVO is Phison");
+    }
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "TEAML5Lite3D240G", "Q0824A0");
+        g.bSMART_Supported = TRUE;
+        Run();
+        ExpectStr(g.szProfileId, "team-l5lite3d-smi225", "TEAML5Lite3D matches team-l5lite3d-smi225");
+        ExpectInt((int)g.eController, (int)CONTROLLER_SMI, "TEAML5Lite3D is SMI");
+    }
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "T253X240G", "R0921B0");
+        g.bSMART_Supported = TRUE;
+        Run();
+        ExpectStr(g.szProfileId, "team-t253-smi225", "TEAM T253 matches team-t253-smi225");
+        ExpectInt((int)g.eController, (int)CONTROLLER_SMI, "TEAM T253 is SMI");
+    }
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "Smartbuy 240GB", "SBFM91.2");
+        g.bSMART_Supported = TRUE;
+        Run();
+        ExpectStr(g.szProfileId, "smartbuy-sbfm", "Smartbuy SBFM matches smartbuy-sbfm");
+        ExpectInt((int)g.eController, (int)CONTROLLER_PHISON, "Smartbuy SBFM is Phison");
+    }
+
+    /* 4. Transcend & Verbatim SMI models */
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "TS256GSSD230S", "22Z4W14J");
+        g.bSMART_Supported = TRUE;
+        Expect(AddAttr(0xA9, 100, 94), "ts230s A9 94%");
+        Run();
+
+        ExpectStr(g.szProfileId, "ts-ssd230s-22z", "TS256GSSD230S 22Z matches ts-ssd230s-22z");
+        ExpectInt((int)g.eController, (int)CONTROLLER_SMI, "TS256GSSD230S 22Z is SMI");
+        ExpectInt(g.nEndurancePercent, 94, "TS256GSSD230S life 94%");
+    }
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "TS120GSSD220S", "Q0116A0");
+        g.bSMART_Supported = TRUE;
+        Run();
+        ExpectStr(g.szProfileId, "ts-ssd220s-smi225", "TS120GSSD220S matches ts-ssd220s-smi225");
+        ExpectInt((int)g.eController, (int)CONTROLLER_SMI, "TS120GSSD220S is SMI");
+    }
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "TS256GMTS830S", "02J0T3HB");
+        g.bSMART_Supported = TRUE;
+        Expect(AddAttr(0xA9, 100, 91), "mts830s A9 91%");
+        Run();
+
+        ExpectStr(g.szProfileId, "ts-mts830s-02j0", "TS256GMTS830S 02J0 matches ts-mts830s-02j0");
+        ExpectInt((int)g.eController, (int)CONTROLLER_SMI, "TS256GMTS830S is SMI");
+        ExpectInt(g.nEndurancePercent, 91, "TS256GMTS830S life 91%");
+    }
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "TS128GMTS430S", "R0813A0");
+        g.bSMART_Supported = TRUE;
+        Run();
+        ExpectStr(g.szProfileId, "ts-mts430-smi225", "TS128GMTS430S matches ts-mts430-smi225");
+        ExpectInt((int)g.eController, (int)CONTROLLER_SMI, "TS128GMTS430S is SMI");
+    }
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "Vi550 S3", "S0613B0");
+        g.bSMART_Supported = TRUE;
+        Run();
+        ExpectStr(g.szProfileId, "vi550-smi225", "Vi550 S3 matches vi550-smi225");
+        ExpectInt((int)g.eController, (int)CONTROLLER_SMI, "Vi550 S3 is SMI");
+    }
+
+    /* 5. WD Blue 3D / SanDisk 230 (0xE6) stays PROF_ENC_PACKED / PROF_SEM_NONE */
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "WDC WDS500G2B0A-00SM50", "X61130WD");
+        g.bSMART_Supported = TRUE;
+        Expect(AddAttr(0xE6, 100, 0x00010055ULL), "wd blue E6 packed");
+        Run();
+
+        ExpectStr(g.szProfileId, "wd-blue-2b0a", "WD Blue 3D matches wd-blue-2b0a");
+        ExpectSem(0xE6, PROF_SEM_NONE, PROF_ENC_PACKED, "WD Blue 3D E6 stays packed non-endurance");
+        Expect(g.nEndurancePercent < 0, "WD Blue 3D E6 does not fabricate endurance");
+    }
+
+    /* 6. Build number is 72 or later */
+    Expect(DRIVEMONITOR_BUILD >= 72, "Build number is 72 or later");
+
+    CaseEnd("build-72-regressions", before);
+}
+
+static void TestBuild73Regressions(void)
+{
+    int before = g_fail;
+    char lecture[16384];
+
+    /* 1. Reflashed Apacer AS340 appearing as generic "SATA SSD" with Phison SBFA10.3 */
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "SATA SSD", "SBFA10.3");
+        g.bSMART_Supported = TRUE;
+        g.dwCapacityMB = 122104;
+        g.dwPowerCycleCount = 1;
+        Expect(AddAttr(0xA8, 100, 0), "sbfa A8 phy 0");
+        Expect(AddAttr(0xAA, 90, 94), "sbfa AA early/later bad 94");
+        Expect(AddAttr(0xAD, 100, 0), "sbfa AD erase 0");
+        Expect(AddAttr(0xDA, 100, 0), "sbfa DA crc 0");
+        Expect(AddAttr(0xE7, 100, 100), "sbfa E7 life 100%");
+        Expect(AddAttr(0xF1, 100, 0), "sbfa F1 writes 0");
+        Run();
+
+        ExpectStr(g.szProfileId, "sata-ssd-sbfa", "SATA SSD SBFA10.3 matches sata-ssd-sbfa");
+        ExpectInt((int)g.eController, (int)CONTROLLER_PHISON, "SATA SSD SBFA10.3 is Phison");
+        ExpectStr(g.szControllerChip, "Phison PS3111-S11", "SATA SSD SBFA10.3 chip PS3111-S11");
+        ExpectSem(0xA8, PROF_SEM_NONE, PROF_ENC_COUNTER, "sbfa A8 SATA PHY");
+        ExpectSem(0xAA, PROF_SEM_NONE, PROF_ENC_COUNTER, "sbfa AA bad blocks");
+        ExpectSem(0xAD, PROF_SEM_ERASE, PROF_ENC_MAXAVG, "sbfa AD max/avg erase");
+        ExpectSem(0xDA, PROF_SEM_INTERFACE, PROF_ENC_COUNTER, "sbfa DA CRC errors");
+        ExpectSem(0xE7, PROF_SEM_ENDURANCE, PROF_ENC_PERCENT, "sbfa E7 life percent");
+        ExpectInt(g.nEndurancePercent, 100, "SATA SSD SBFA10.3 life 100%");
+        ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_GOOD, "SATA SSD SBFA10.3 reliability GOOD");
+        Expect(g.bCounterfeitSuspected, "SATA SSD SBFA10.3 flagged as reflashed MPTool");
+        ExpectInt(g.nAnomalyType, (int)ANOMALY_REFLASHED_REPAIRED, "SATA SSD SBFA10.3 anomaly ANOMALY_REFLASHED_REPAIRED");
+        ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_CAUTION, "SATA SSD SBFA10.3 health CAUTION due to MPTool reflash");
+    }
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "SATA SSD", "SBFA18.1");
+        g.bSMART_Supported = TRUE;
+        Expect(AddAttr(0xAD, 100, 0x000C0008ULL), "sbfa AD max 12 / avg 8");
+        Expect(AddAttr(0xE7, 94, 94), "sbfa E7 life 94%");
+        Run();
+
+        ExpectInt(g.nSSDMaxEraseCount, 12, "sbfa AD max erase 12");
+        ExpectInt(g.nSSDAvgEraseCount, 8, "sbfa AD avg erase 8");
+        ExpectInt(g.nEndurancePercent, 94, "sbfa E7 life 94%");
+    }
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "SATA SSD", "CUSTOM1");
+        g.bSMART_Supported = TRUE;
+        Run();
+        ExpectStr(g.szProfileId, "ata-generic", "SATA SSD with non-Phison fw stays ata-generic");
+        ExpectInt((int)g.eController, (int)CONTROLLER_UNKNOWN, "SATA SSD unknown fw stays CONTROLLER_UNKNOWN");
+    }
+
+    /* 2. Neo Forza NFS121SA312-6007000 / HCS1A25P (Yeestor YS9082HP, 32-MiB blocks) */
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "Neo Forza NFS121SA312-6007000", "HCS1A25P");
+        g.bSMART_Supported = TRUE;
+        g.dwCapacityMB = 114473;
+        g.dwPowerOnHours = 859;
+        Expect(AddAttr(0xA4, 100, 83), "nfs12 A4 total erase 83");
+        Expect(AddAttr(0xA5, 100, 106), "nfs12 A5 max erase 106");
+        Expect(AddAttr(0xA6, 100, 41), "nfs12 A6 min erase 41");
+        Expect(AddAttr(0xA7, 100, 69), "nfs12 A7 avg erase 69");
+        Expect(AddAttr(0xA9, 100, 100), "nfs12 A9 life 100%");
+        Expect(AddAttr(0xAF, 100, 0x000001000000ULL), "nfs12 AF packed flags");
+        Expect(AddAttr(0xB0, 100, 373447), "nfs12 B0 block op counter");
+        Expect(AddAttr(0xE8, 100, 100), "nfs12 E8 reserve 100%");
+        Expect(AddAttr(0xF1, 100, 58703), "nfs12 F1 host writes 32MiB");
+        Expect(AddAttr(0xF2, 100, 135005), "nfs12 F2 host reads 32MiB");
+        Expect(AddAttr(0xF5, 100, 135222), "nfs12 F5 nand writes 32MiB");
+        Run();
+
+        ExpectStr(g.szProfileId, "neoforza-nfs12-hcs", "Neo Forza NFS12 HCS1A25P matches neoforza-nfs12-hcs");
+        ExpectInt((int)g.eController, (int)CONTROLLER_YEESTOR, "Neo Forza NFS12 is Yeestor");
+        ExpectStr(g.szControllerChip, "Yeestor YS9082HP", "Neo Forza NFS12 chip YS9082HP");
+        ExpectInt(g.nEndurancePercent, 100, "Neo Forza NFS12 life 100%");
+        ExpectInt(g.nSSDMinEraseCount, 41, "Neo Forza NFS12 min erase 41");
+        ExpectInt(g.nSSDAvgEraseCount, 69, "Neo Forza NFS12 avg erase 69");
+        ExpectInt(g.nSSDMaxEraseCount, 106, "Neo Forza NFS12 max erase 106");
+        ExpectSem(0xAF, PROF_SEM_NONE, PROF_ENC_PACKED, "Neo Forza AF is packed");
+        ExpectSem(0xF1, PROF_SEM_HOST_WRITE, PROF_ENC_BLOCK32, "Neo Forza F1 uses BLOCK32");
+        ExpectInt(g.nSSDTotalWritesGB, 1834, "Neo Forza writes 58703*32MiB = 1834 GiB");
+        ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_GOOD, "Neo Forza NFS12 health GOOD");
+    }
+
+    /* 3. Phison PS3111-S11 ROM/safe mode (PS3111 / SBRM02.0 / 20 MB and SATAFIRM S11) */
+    {
+        Base(DRIVE_TYPE_HDD, "PS3111", "SBRM02.0");
+        g.bSMART_Supported = FALSE;
+        g.dwCapacityMB = 20;
+        g.eType = DetectDriveType(INVALID_HANDLE_VALUE, &g);
+        Run();
+
+        ExpectInt((int)g.eType, (int)DRIVE_TYPE_SSD_SATA, "PS3111 SBRM detected as SSD SATA");
+        ExpectInt(IsPhisonRomMode(&g), TRUE, "PS3111 SBRM flagged as Phison ROM mode");
+        ExpectStr(g.szProfileId, "ps3111-rom", "PS3111 SBRM matches ps3111-rom");
+        ExpectInt((int)g.eController, (int)CONTROLLER_PHISON, "PS3111 SBRM is Phison");
+        ExpectStr(g.szControllerChip, "Phison PS3111-S11 (ROM)", "PS3111 ROM chip name");
+        ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_UNKNOWN, "PS3111 ROM health stays UNKNOWN");
+        FormatHealthLectureExpert(&g, lecture, (int)sizeof(lecture));
+        ExpectHas(lecture, "ROM", "PS3111 expert lecture explains ROM mode");
+        ExpectNotHas(lecture, "администратора", "PS3111 expert lecture does not blame admin rights");
+    }
+    {
+        Base(DRIVE_TYPE_HDD, "SATAFIRM   S11", "SBFM61.2");
+        g.bSMART_Supported = FALSE;
+        g.dwCapacityMB = 0;
+        g.eType = DetectDriveType(INVALID_HANDLE_VALUE, &g);
+        Run();
+
+        ExpectInt((int)g.eType, (int)DRIVE_TYPE_SSD_SATA, "SATAFIRM S11 detected as SSD SATA");
+        ExpectInt(IsPhisonRomMode(&g), TRUE, "SATAFIRM S11 flagged as Phison ROM mode");
+        ExpectStr(g.szProfileId, "satafirm-s11", "SATAFIRM S11 matches satafirm-s11");
+        ExpectInt((int)g.eController, (int)CONTROLLER_PHISON, "SATAFIRM S11 is Phison");
+    }
+
+    /* 4. Empty/unresponsive USB bridge reporting 0 MB (ASM225 / 1300BBBBAAAA) */
+    {
+        Base(DRIVE_TYPE_USB, "ASM225", "0");
+        g.bIsUSB = TRUE;
+        g.bSMART_Supported = FALSE;
+        g.dwCapacityMB = 0;
+        g.wUsbVid = 0x174C;
+        g.wUsbPid = 0x55AA;
+        Run();
+
+        ExpectInt(IsUsbBridgeNoMedia(&g), TRUE, "ASM225 0 MB flagged as USB bridge with no media");
+        ExpectInt((int)g.eController, (int)CONTROLLER_UNKNOWN, "ASM225 0 MB controller stays UNKNOWN");
+        ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_UNKNOWN, "ASM225 0 MB health stays UNKNOWN");
+        FormatHealthLectureExpert(&g, lecture, (int)sizeof(lecture));
+        ExpectHas(lecture, "0 МБ", "ASM225 0 MB lecture mentions 0 MB no media");
+        ExpectNotHas(lecture, "не пропускает", "ASM225 0 MB lecture does not blame bridge SMART passthrough");
+    }
+
+    /* 5. Build number is 73 or later */
+    Expect(DRIVEMONITOR_BUILD >= 73, "Build number is 73 or later");
+
+    CaseEnd("build-73-regressions", before);
+}
+
+static void FillTestAtaModel(WORD id[256], const char* pszModel)
+{
+    size_t nLen = strlen(pszModel);
+    for (size_t w = 0; w < 20; w++) {
+        char c0 = (w * 2 < nLen) ? pszModel[w * 2] : ' ';
+        char c1 = (w * 2 + 1 < nLen) ? pszModel[w * 2 + 1] : ' ';
+        id[27 + w] = (WORD)(((BYTE)c0 << 8) | (BYTE)c1);
+    }
+}
+
+static void TestBuild74Regressions(void)
+{
+    int before = g_fail;
+
+    /* 1. ParseAtaIdentifyData extracts GPL / SMART Error Log / Self-Test caps */
+    {
+        WORD id[256];
+        ZeroMemory(id, sizeof(id));
+        FillTestAtaModel(id, "ATA NonGpl Test SSD");
+        id[60] = 0x0000;
+        id[61] = 0x0100; /* 2^24 sectors ~ 8 GiB */
+        id[82] = 0x0001; /* SMART feature set supported */
+        id[85] = 0x0001; /* SMART enabled */
+        id[84] = 0x4003; /* SMART Error Log (bit 0) + Self-Test (bit 1), GPL bit 5 = 0 */
+        id[87] = 0x4003;
+
+        DRIVE_INFO d;
+        ZeroMemory(&d, sizeof(d));
+        d.eType = DRIVE_TYPE_SSD_SATA;
+        Expect(ParseAtaIdentifyData((const BYTE*)id, &d), "IDENTIFY parses valid non-GPL SSD");
+        ExpectInt(d.bCapAtaIdentify, TRUE, "IDENTIFY cap flag set");
+        ExpectInt(d.bCapSmartErrLog, TRUE, "IDENTIFY SMART error log bit set");
+        ExpectInt(d.bSelfTestSupported, TRUE, "IDENTIFY self-test bit set");
+        ExpectInt(d.bCapGpl, FALSE, "IDENTIFY GPL bit stays FALSE when word 84/87 bit 5 is 0");
+        ExpectInt(DriveShouldQueryAtaGplLogs(&d), FALSE, "Non-GPL SSD skips ATA GPL log queries");
+
+        /* Enable GPL bit 5 */
+        id[84] = 0x4023;
+        id[87] = 0x4023;
+        ZeroMemory(&d, sizeof(d));
+        d.eType = DRIVE_TYPE_SSD_SATA;
+        Expect(ParseAtaIdentifyData((const BYTE*)id, &d), "IDENTIFY parses valid GPL SSD");
+        ExpectInt(d.bCapGpl, TRUE, "IDENTIFY GPL bit TRUE when word 84/87 bit 5 is set");
+        ExpectInt(DriveShouldQueryAtaGplLogs(&d), TRUE, "GPL-capable SSD allows ATA GPL log queries");
+
+        /* Timeout bailout disables GPL queries */
+        d.bScanIoTimedOut = TRUE;
+        ExpectInt(DriveShouldQueryAtaGplLogs(&d), FALSE, "Timed-out drive skips ATA GPL log queries");
+    }
+
+    /* 2. Phison ROM mode and 0 MB USB bridge skip GPL log probing even without IDENTIFY */
+    {
+        DRIVE_INFO d;
+        ZeroMemory(&d, sizeof(d));
+        d.eType = DRIVE_TYPE_SSD_SATA;
+        snprintf(d.szModel, sizeof(d.szModel), "PS3111");
+        snprintf(d.szFirmware, sizeof(d.szFirmware), "SBRM02.0");
+        d.dwCapacityMB = 20;
+        ExpectInt(DriveShouldQueryAtaGplLogs(&d), FALSE, "Phison ROM mode skips ATA GPL log queries");
+
+        ZeroMemory(&d, sizeof(d));
+        d.eType = DRIVE_TYPE_USB;
+        d.bIsUSB = TRUE;
+        snprintf(d.szModel, sizeof(d.szModel), "ASM225");
+        d.dwCapacityMB = 0;
+        ExpectInt(DriveShouldQueryAtaGplLogs(&d), FALSE, "0 MB USB bridge skips ATA GPL log queries");
+    }
+
+    /* 3. AtaErrorLooksLikeTimeout classifies timeout errors vs fast unsupported rejections */
+    ExpectInt(AtaErrorLooksLikeTimeout(ERROR_SEM_TIMEOUT, 0), FALSE, "fast ERROR_SEM_TIMEOUT is not a hang");
+    ExpectInt(AtaErrorLooksLikeTimeout(ERROR_IO_DEVICE, 0), FALSE, "fast ERROR_IO_DEVICE is an abort, not a hang");
+    ExpectInt(AtaErrorLooksLikeTimeout(ERROR_NOT_READY, 0), FALSE, "fast ERROR_NOT_READY is not a hang");
+    ExpectInt(AtaErrorLooksLikeTimeout(ERROR_OPERATION_ABORTED, 0), FALSE, "fast ERROR_OPERATION_ABORTED is not a hang");
+    ExpectInt(AtaErrorLooksLikeTimeout(ERROR_IO_DEVICE, 1500), TRUE, "slow ERROR_IO_DEVICE is a hang");
+    ExpectInt(AtaErrorLooksLikeTimeout(ERROR_INVALID_FUNCTION, 1500), TRUE, "Slow error (>=1500ms) is timeout");
+    ExpectInt(AtaErrorLooksLikeTimeout(ERROR_INVALID_FUNCTION, 40), FALSE, "Fast ERROR_INVALID_FUNCTION is not timeout");
+
+    /* 4. Build number is 74 or later */
+    Expect(DRIVEMONITOR_BUILD >= 74, "Build number is 74 or later");
+
+    CaseEnd("build-74-regressions", before);
+}
+
+static void TestBuild75Regressions(void)
+{
+    int before = g_fail;
+    char lecture[16384];
+
+    /* 1. User's reflashed Apacer AS340 ("SATA SSD", SBFA10.3, SN 1117076B0C0D1602CF0C) */
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "SATA SSD", "SBFA10.3");
+        lstrcpynA(g.szSerial, "1117076B0C0D1602CF0C", (int)sizeof(g.szSerial));
+        g.bSMART_Supported = TRUE;
+        g.dwCapacityMB = 122104;
+        g.dwPowerOnHours = 1;
+        g.dwPowerCycleCount = 1;
+        Expect(AddAttr(0xA8, 100, 0), "reflash A8 phy 0");
+        Expect(AddAttr(0xAA, 90, 94), "reflash AA bad blocks 94");
+        Expect(AddAttr(0xAD, 100, 0), "reflash AD erase 0");
+        Expect(AddAttr(0xDA, 100, 0), "reflash DA crc 0");
+        Expect(AddAttr(0xE7, 100, 100), "reflash E7 life 100%");
+        Expect(AddAttr(0xF1, 100, 0), "reflash F1 writes 0");
+        Run();
+
+        ExpectInt((int)g.eController, (int)CONTROLLER_PHISON, "Reflashed SATA SSD controller is Phison");
+        Expect(g.bCounterfeitSuspected, "Reflashed SATA SSD + SBFA10.3 flagged");
+        ExpectInt(g.nAnomalyType, (int)ANOMALY_REFLASHED_REPAIRED, "Reflashed SATA SSD uses ANOMALY_REFLASHED_REPAIRED");
+        ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_GOOD, "Reflashed SATA SSD media reliability GOOD");
+        ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_CAUTION, "Reflashed SATA SSD headline CAUTION");
+
+        UiSetLang(UI_LANG_RU);
+        ExpectHas(GetCounterfeitBadge(&g), "ПЕРЕПРОШИТ / MPTOOL", "RU badge says reflashed MPTool");
+        ExpectHas(GetCounterfeitReason(&g), "SBFA10.3", "RU reason names firmware SBFA10.3");
+        FormatHealthLecturePlain(&g, lecture, (int)sizeof(lecture));
+        ExpectHas(lecture, "ПЕРЕПРОШИТОГО", "RU plain lecture warns about reflashed MPTool drive");
+        ExpectHas(lecture, "MPTool", "RU plain lecture mentions MPTool");
+
+        UiSetLang(UI_LANG_EN);
+        ExpectHas(GetCounterfeitBadge(&g), "REFLASHED / MPTOOL", "EN badge says reflashed MPTool");
+        ExpectHas(GetCounterfeitReason(&g), "SBFA10.3", "EN reason names firmware SBFA10.3");
+        UiSetLang(UI_LANG_RU);
+    }
+
+    /* 2. Generic "SATA SSD" with trailing ATA spaces + SBFM61.3 also triggers ANOMALY_REFLASHED_REPAIRED */
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "SATA SSD        ", "SBFM61.3");
+        lstrcpynA(g.szSerial, "AB1234567890CD", (int)sizeof(g.szSerial));
+        g.bSMART_Supported = TRUE;
+        Run();
+        Expect(g.bCounterfeitSuspected, "Padded SATA SSD + SBFM61.3 flagged as reflashed");
+        ExpectInt(g.nAnomalyType, (int)ANOMALY_REFLASHED_REPAIRED, "SBFM61.3 anomaly is ANOMALY_REFLASHED_REPAIRED");
+    }
+
+    /* 3. Negative checks: branded Phison, unknown generic FW, and Phison ROM mode must NOT false-trigger */
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "Patriot Burst", "SBFM61.3");
+        lstrcpynA(g.szSerial, "PB1234567890", (int)sizeof(g.szSerial));
+        g.bSMART_Supported = TRUE;
+        Run();
+        Expect(!g.bCounterfeitSuspected, "Branded Patriot Burst SBFM61.3 NOT flagged as reflashed");
+    }
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "SATA SSD", "CUSTOM1");
+        lstrcpynA(g.szSerial, "SN9876543210", (int)sizeof(g.szSerial));
+        g.bSMART_Supported = TRUE;
+        Run();
+        Expect(!g.bCounterfeitSuspected, "SATA SSD with non-Phison FW NOT flagged as reflashed");
+    }
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "PS3111", "SBRM02.0");
+        g.bSMART_Supported = FALSE;
+        g.dwCapacityMB = 20;
+        Run();
+        Expect(!g.bCounterfeitSuspected, "Phison ROM mode NOT flagged as reflashed");
+    }
+
+    /* 4. Build number is 75 or later */
+    Expect(DRIVEMONITOR_BUILD >= 75, "Build number is 75 or later");
+
+    CaseEnd("build-75-regressions", before);
+}
+
+static void TestBuild76Regressions(void)
+{
+    int before = g_fail;
+
+    /* 1. ADATA LEGEND 900 with Phison ERFM microcode */
+    {
+        Base(DRIVE_TYPE_NVME, "ADATA LEGEND 900", "ERFM11A0");
+        g.bIsNVMe = TRUE;
+        Run();
+        ExpectStr(g.szProfileId, "legend-900-erfm", "ADATA LEGEND 900 matches legend-900-erfm");
+        ExpectInt((int)g.eController, (int)CONTROLLER_PHISON, "ADATA LEGEND 900 is Phison");
+        ExpectStr(g.szControllerChip, "Phison PS5027-E27T", "ADATA LEGEND 900 chip is PS5027-E27T");
+        ExpectStr(g.szProtocol, "NVMe 1.4.0", "ADATA LEGEND 900 protocol is NVMe 1.4.0");
+    }
+
+    /* 2. ADATA LEGEND 900 with Maxio SN microcode */
+    {
+        Base(DRIVE_TYPE_NVME, "ADATA LEGEND 900", "SN11273");
+        g.bIsNVMe = TRUE;
+        Run();
+        ExpectStr(g.szProfileId, "legend-900-maxio", "ADATA LEGEND 900 matches legend-900-maxio");
+        ExpectInt((int)g.eController, (int)CONTROLLER_MAXIO, "ADATA LEGEND 900 with SN is Maxio");
+        ExpectStr(g.szControllerChip, "Maxio MAP1602", "ADATA LEGEND 900 chip is Maxio MAP1602");
+    }
+
+    /* 3. ADATA LEGEND 960 and LEGEND 840 */
+    {
+        Base(DRIVE_TYPE_NVME, "ADATA LEGEND 960", "3B4Q");
+        g.bIsNVMe = TRUE;
+        Run();
+        ExpectStr(g.szProfileId, "legend-960", "ADATA LEGEND 960 matches legend-960");
+        ExpectInt((int)g.eController, (int)CONTROLLER_SMI, "ADATA LEGEND 960 is SMI");
+        ExpectStr(g.szControllerChip, "Silicon Motion SM2264", "ADATA LEGEND 960 chip is SM2264");
+    }
+    {
+        Base(DRIVE_TYPE_NVME, "ADATA LEGEND 840", "1.0");
+        g.bIsNVMe = TRUE;
+        Run();
+        ExpectStr(g.szProfileId, "legend-840", "ADATA LEGEND 840 matches legend-840");
+        ExpectInt((int)g.eController, (int)CONTROLLER_INNOGRIT, "ADATA LEGEND 840 is Innogrit");
+        ExpectStr(g.szControllerChip, "Innogrit IG5220", "ADATA LEGEND 840 chip is IG5220");
+    }
+
+    /* 4. Cross-adapter Event 129 isolation (storahci vs UASPStor vs stornvme) */
+    {
+        DRIVE_INFO drives[3];
+        ZeroMemory(drives, sizeof(drives));
+
+        /* Drive 0: Internal SATA SSD on Port 0 */
+        drives[0].nDriveIndex = 0;
+        drives[0].nScsiPort = 0;
+        drives[0].eType = DRIVE_TYPE_SSD_SATA;
+        drives[0].bIsUSB = FALSE;
+        drives[0].bIsNVMe = FALSE;
+
+        /* Drive 1: USB NVMe SSD (e.g. ADATA Legend 900 in RTL9210B) also on local SCSI Port 0 */
+        drives[1].nDriveIndex = 1;
+        drives[1].nScsiPort = 0;
+        drives[1].eType = DRIVE_TYPE_NVME;
+        drives[1].bIsUSB = TRUE;
+        drives[1].bIsNVMe = TRUE;
+
+        /* Drive 2: Internal PCIe NVMe SSD on local Port 0 */
+        drives[2].nDriveIndex = 2;
+        drives[2].nScsiPort = 0;
+        drives[2].eType = DRIVE_TYPE_NVME;
+        drives[2].bIsUSB = FALSE;
+        drives[2].bIsNVMe = TRUE;
+
+        /* Event from storahci on \Device\RaidPort0 must ONLY affect internal SATA Drive 0 */
+        const wchar_t* xmlStorahci =
+            L"<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'>"
+            L"<System><Provider Name='storahci'/><EventID>129</EventID>"
+            L"<TimeCreated SystemTime='2026-11-12T15:05:20.0000000Z'/></System>"
+            L"<EventData><Data>\\Device\\RaidPort0</Data></EventData>"
+            L"</Event>";
+
+        BOOL okSata = ParseStorageEventXml(xmlStorahci, drives, 3);
+        Expect(okSata, "ParseStorageEventXml storahci 129 returned TRUE");
+        ExpectInt(drives[0].eventStats.nEvent129Count, 1, "Internal SATA Drive 0 received storahci 129");
+        ExpectInt(drives[1].eventStats.nEvent129Count, 0, "USB NVMe Drive 1 ignored storahci 129");
+        ExpectInt(drives[2].eventStats.nEvent129Count, 0, "Internal NVMe Drive 2 ignored storahci 129");
+
+        /* Event from UASPStor on \Device\RaidPort0 must ONLY affect USB Drive 1 */
+        const wchar_t* xmlUasp =
+            L"<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'>"
+            L"<System><Provider Name='UASPStor'/><EventID>129</EventID>"
+            L"<TimeCreated SystemTime='2026-11-13T12:00:00.0000000Z'/></System>"
+            L"<EventData><Data>\\Device\\RaidPort0</Data></EventData>"
+            L"</Event>";
+
+        BOOL okUasp = ParseStorageEventXml(xmlUasp, drives, 3);
+        Expect(okUasp, "ParseStorageEventXml UASPStor 129 returned TRUE");
+        ExpectInt(drives[0].eventStats.nEvent129Count, 1, "Internal SATA Drive 0 stayed at 1");
+        ExpectInt(drives[1].eventStats.nEvent129Count, 1, "USB Drive 1 received UASPStor 129");
+        ExpectInt(drives[2].eventStats.nEvent129Count, 0, "Internal NVMe Drive 2 ignored UASPStor 129");
+
+        /* Event from stornvme on \Device\RaidPort0 must ONLY affect internal NVMe Drive 2 */
+        const wchar_t* xmlNvme =
+            L"<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'>"
+            L"<System><Provider Name='stornvme'/><EventID>129</EventID>"
+            L"<TimeCreated SystemTime='2026-11-13T12:10:00.0000000Z'/></System>"
+            L"<EventData><Data>\\Device\\RaidPort0</Data></EventData>"
+            L"</Event>";
+
+        BOOL okNvme = ParseStorageEventXml(xmlNvme, drives, 3);
+        Expect(okNvme, "ParseStorageEventXml stornvme 129 returned TRUE");
+        ExpectInt(drives[0].eventStats.nEvent129Count, 1, "Internal SATA Drive 0 stayed at 1");
+        ExpectInt(drives[1].eventStats.nEvent129Count, 1, "USB Drive 1 stayed at 1");
+        ExpectInt(drives[2].eventStats.nEvent129Count, 1, "Internal NVMe Drive 2 received stornvme 129");
+    }
+
+    /* 5. Build number is at least 76 */
+    Expect(DRIVEMONITOR_BUILD >= 76, "Build number is at least 76");
+
+    CaseEnd("build-76-regressions", before);
+}
+
+static void TestBuild77Regressions(void)
+{
+    int before = g_fail;
+
+    /* 1. FormatSize on 1 TB NVMe SSD usable capacities */
+    {
+        char szBuf[32];
+        /* 1,024,209,543,168 bytes (2,000,409,264 sectors * 512) = 976,762 MB */
+        FormatSize(976762, szBuf, (int)sizeof(szBuf));
+        ExpectStr(szBuf, "953.9 GB", "1024 GB nominal SSD formats as 953.9 GB");
+
+        /* 1,000,204,886,016 bytes (1,953,525,168 sectors * 512) = 953,869 MB */
+        FormatSize(953869, szBuf, (int)sizeof(szBuf));
+        ExpectStr(szBuf, "931.5 GB", "1000 GB nominal HDD/SSD formats as 931.5 GB");
+
+        /* Raw NAND flash (1,280 GB / 1.28 TB) is 1,220,703 MB = 1.2 TB if unmasked */
+        FormatSize(1220703, szBuf, (int)sizeof(szBuf));
+        ExpectStr(szBuf, "1.2 TB", "1280 GB raw NAND formats as 1.2 TB");
+    }
+
+    /* 2. USB-bridge NVMe probe isolation:
+     * When an NVMe SSD is confirmed behind a dual-mode bridge, bCapAtaIdentify
+     * must be FALSE so UsbProbeFlags reports SAT as inactive and NVMe as active. */
+    {
+        DRIVE_INFO d;
+        ZeroMemory(&d, sizeof(d));
+        d.bIsUSB = TRUE;
+        d.bIsNVMe = TRUE;
+        d.bSMART_Supported = TRUE;
+        d.bCapAtaIdentify = FALSE;
+        d.dwCapacityMB = 976762;
+
+        int sat = 0, smart = 0, thresh = 0, nvme = 0;
+        UsbProbeFlags(&d, &sat, &smart, &thresh, &nvme);
+        ExpectInt(sat, 0, "NVMe SSD behind USB does not report SAT active");
+        ExpectInt(nvme, 1, "NVMe SSD behind USB reports NVMe active");
+
+        char szCap[64];
+        FormatUsbCapability(&d, szCap, (int)sizeof(szCap));
+        ExpectHas(szCap, "NVMe \xD0\xB4\xD0\xB0", "FormatUsbCapability reports NVMe yes");
+    }
+
+    /* 3. Build number is 77 or later */
+    Expect(DRIVEMONITOR_BUILD >= 77, "Build number is at least 77");
+
+    CaseEnd("build-77-regressions", before);
+}
+
+static void TestBuild78Regressions(void)
+{
+    int before = g_fail;
+
+    /* 1. FormatHddObservePrompt uses clear assessment prompt instead of ambiguous "состояние" */
+    {
+        DRIVE_INFO d;
+        ZeroMemory(&d, sizeof(d));
+        d.eType = DRIVE_TYPE_HDD;
+        d.eHealthStatus = HEALTH_STATUS_OBSERVE;
+        char buf[256];
+        FormatHddObservePrompt(&d, buf, (int)sizeof(buf));
+        ExpectHas(buf, "\xD0\xBE\xD1\x86\xD0\xB5\xD0\xBD\xD0\xBA\xD1\x83", "Prompt instructs to click assessment badge");
+    }
+
+    /* 2. FormatSsdCautionPrompt uses clear assessment prompt */
+    {
+        DRIVE_INFO d;
+        ZeroMemory(&d, sizeof(d));
+        d.eType = DRIVE_TYPE_SSD_SATA;
+        d.eHealthStatus = HEALTH_STATUS_CAUTION;
+        d.eReliability = HEALTH_STATUS_CAUTION;
+        char buf[256];
+        FormatSsdCautionPrompt(&d, buf, (int)sizeof(buf));
+        ExpectHas(buf, "\xD0\xBE\xD1\x86\xD0\xB5\xD0\xBD\xD0\xBA\xD1\x83", "Prompt instructs to click assessment badge");
+    }
+
+    /* 3. Build number is at least 78 */
+    Expect(DRIVEMONITOR_BUILD >= 78, "Build number is at least 78");
+
+    CaseEnd("build-78-regressions", before);
+}
+
+static void TestBuild79Regressions(void)
+{
+    int before = g_fail;
+
+    /* 1. Intel SSD 660p (INTEL SSDPEKNW512G8) matches intel-660p on Silicon Motion SM2263 */
+    {
+        Base(DRIVE_TYPE_NVME, "INTEL SSDPEKNW512G8", "002C");
+        g.bIsNVMe = TRUE;
+        Run();
+        ExpectStr(g.szProfileId, "intel-660p", "INTEL SSDPEKNW matches intel-660p");
+        ExpectInt((int)g.eController, (int)CONTROLLER_SMI, "INTEL 660p controller is SMI");
+        ExpectStr(g.szControllerChip, "Silicon Motion SM2263", "INTEL 660p chip is SM2263");
+        ExpectStr(g.szProtocol, "NVMe 1.3.0", "INTEL 660p protocol is NVMe 1.3.0");
+    }
+
+    /* 2. Intel SSD 670p (INTEL SSDPEKNU512GZ) matches intel-670p on Silicon Motion SM2265 */
+    {
+        Base(DRIVE_TYPE_NVME, "INTEL SSDPEKNU512GZ", "001C");
+        g.bIsNVMe = TRUE;
+        Run();
+        ExpectStr(g.szProfileId, "intel-670p", "INTEL SSDPEKNU matches intel-670p");
+        ExpectInt((int)g.eController, (int)CONTROLLER_SMI, "INTEL 670p controller is SMI");
+        ExpectStr(g.szControllerChip, "Silicon Motion SM2265", "INTEL 670p chip is SM2265");
+        ExpectStr(g.szProtocol, "NVMe 1.4.0", "INTEL 670p protocol is NVMe 1.4.0");
+    }
+
+    /* 3. Intel SSD 760p (INTEL SSDPEMKF512G8) matches intel-760p on Silicon Motion SM2262 */
+    {
+        Base(DRIVE_TYPE_NVME, "INTEL SSDPEMKF512G8", "004C");
+        g.bIsNVMe = TRUE;
+        Run();
+        ExpectStr(g.szProfileId, "intel-760p", "INTEL SSDPEMKF matches intel-760p");
+        ExpectInt((int)g.eController, (int)CONTROLLER_SMI, "INTEL 760p controller is SMI");
+        ExpectStr(g.szControllerChip, "Silicon Motion SM2262", "INTEL 760p chip is SM2262");
+        ExpectStr(g.szProtocol, "NVMe 1.3.0", "INTEL 760p protocol is NVMe 1.3.0");
+    }
+
+    /* 4. Intel SSD 600p (INTEL SSDPEKKW512G7) matches intel-600p on Silicon Motion SM2260 */
+    {
+        Base(DRIVE_TYPE_NVME, "INTEL SSDPEKKW512G7", "121N");
+        g.bIsNVMe = TRUE;
+        Run();
+        ExpectStr(g.szProfileId, "intel-600p", "INTEL SSDPEKKW matches intel-600p");
+        ExpectInt((int)g.eController, (int)CONTROLLER_SMI, "INTEL 600p controller is SMI");
+        ExpectStr(g.szControllerChip, "Silicon Motion SM2260", "INTEL 600p chip is SM2260");
+        ExpectStr(g.szProtocol, "NVMe 1.2.0", "INTEL 600p protocol is NVMe 1.2.0");
+    }
+
+    /* 5. SATA Intel SSD does not match NVMe intel-660p, keeps intel-ssd / CONTROLLER_INTEL */
+    {
+        Base(DRIVE_TYPE_SSD_SATA, "INTEL SSDSC2BW240A4", "DC32");
+        g.bIsNVMe = FALSE;
+        SetPciVid(0x8086);
+        Run();
+        ExpectStr(g.szProfileId, "intel-ssd", "SATA Intel SSD matches intel-ssd");
+        ExpectInt((int)g.eController, (int)CONTROLLER_INTEL, "SATA Intel SSD controller stays Intel");
+    }
+
+    /* 6. Build number is at least 79 */
+    Expect(DRIVEMONITOR_BUILD >= 79, "Build number is at least 79");
+
+    CaseEnd("build-79-regressions", before);
+}
+
+static void TestBuild80Regressions(void)
+{
+    int before = g_fail;
+
+    /* 1. CheckDriveWritability on invalid/null handle safely sets bWriteProtected to FALSE */
+    {
+        DRIVE_INFO d;
+        ZeroMemory(&d, sizeof(d));
+        d.bWriteProtected = TRUE;
+        CheckDriveWritability(INVALID_HANDLE_VALUE, &d);
+        ExpectInt((int)d.bWriteProtected, 0, "Invalid handle resets bWriteProtected to FALSE");
+
+        d.bWriteProtected = TRUE;
+        CheckDriveWritability(NULL, &d);
+        ExpectInt((int)d.bWriteProtected, 0, "NULL handle resets bWriteProtected to FALSE");
+    }
+
+    /* 2. Healthy drive without bWriteProtected has HEALTH_STATUS_GOOD */
+    {
+        Base(DRIVE_TYPE_NVME, "INTEL SSDPEKNW512G8", "002C");
+        g.bIsNVMe = TRUE;
+        g.bWriteProtected = FALSE;
+        g.nvmeHealth.CriticalWarning = 0;
+        g.qwNVMeMediaErrors = 0;
+        Run();
+        ExpectInt((int)g.eHealthStatus, (int)HEALTH_STATUS_GOOD, "Healthy Intel NVMe has GOOD health status");
+        ExpectInt((int)g.eReliability, (int)HEALTH_STATUS_GOOD, "Healthy Intel NVMe reliability is GOOD");
+    }
+
+    /* 3. Build number is at least 80 */
+    Expect(DRIVEMONITOR_BUILD >= 80, "Build number is at least 80");
+
+    CaseEnd("build-80-regressions", before);
+}
+
+static void TestBuild81Regressions(void)
+{
+    int before = g_fail;
+
+    /* 1. Multi-volume total capacity and free space percentage calculation (Intel 660p scenario) */
+    {
+        DRIVE_INFO ssd;
+        memset(&ssd, 0, sizeof(ssd));
+        ssd.eType = DRIVE_TYPE_NVME;
+        ssd.bIsNVMe = TRUE;
+        ssd.trimInfo.bQueried = TRUE;
+        ssd.trimInfo.bOsTrimEnabled = TRUE;
+        ssd.trimInfo.bDeviceTrimSupported = TRUE;
+        ssd.trimInfo.nVolumeCount = 2;
+
+        /* G: partition: 150.6 GB, 18.4 GB free -> 12.2% */
+        lstrcpynA(ssd.trimInfo.volumes[0].szLetter, "G:", (int)sizeof(ssd.trimInfo.volumes[0].szLetter));
+        lstrcpynA(ssd.trimInfo.volumes[0].szFileSystem, "NTFS", (int)sizeof(ssd.trimInfo.volumes[0].szFileSystem));
+        ssd.trimInfo.volumes[0].qwTotalBytes = 161715560448ULL; /* 150.6 GB */
+        ssd.trimInfo.volumes[0].qwFreeBytes = 19756843008ULL;   /* 18.4 GB */
+        ssd.trimInfo.volumes[0].fFreePercent = 12.2f;
+        ssd.trimInfo.volumes[0].bTrimSupportedFs = TRUE;
+
+        /* H: partition: 324.2 GB, 58.2 GB free -> 17.9% */
+        lstrcpynA(ssd.trimInfo.volumes[1].szLetter, "H:", (int)sizeof(ssd.trimInfo.volumes[1].szLetter));
+        lstrcpynA(ssd.trimInfo.volumes[1].szFileSystem, "NTFS", (int)sizeof(ssd.trimInfo.volumes[1].szFileSystem));
+        ssd.trimInfo.volumes[1].qwTotalBytes = 348107931648ULL; /* 324.2 GB */
+        ssd.trimInfo.volumes[1].qwFreeBytes = 62495391744ULL;   /* 58.2 GB */
+        ssd.trimInfo.volumes[1].fFreePercent = 17.9f;
+        ssd.trimInfo.volumes[1].bTrimSupportedFs = TRUE;
+
+        EvaluateDriveTrimAndCapacity(&ssd);
+
+        Expect(ssd.trimInfo.qwTotalBytesAll == (161715560448ULL + 348107931648ULL), "Total bytes summed across volumes");
+        Expect(ssd.trimInfo.qwFreeBytesAll == (19756843008ULL + 62495391744ULL), "Free bytes summed across volumes");
+        /* Total free %: 82252234752 / 509823492096 * 100 = 16.133% */
+        Expect(ssd.trimInfo.fTotalFreePercent > 16.0f && ssd.trimInfo.fTotalFreePercent < 16.3f, "Total free space is ~16.1%");
+        Expect(ssd.trimInfo.fMinFreePercent > 12.0f && ssd.trimInfo.fMinFreePercent < 12.4f, "Min free space is ~12.2%");
+        Expect(!ssd.trimInfo.bPanicLowSpace, "16.1% total free space is not panic");
+        Expect(!ssd.trimInfo.bCriticallyLowSpace, "16.1% total free space is not critical");
+    }
+
+    /* 2. Small recovery partition (< 1 GB) with < 5% free must NOT trigger false SSD panic */
+    {
+        DRIVE_INFO ssd;
+        memset(&ssd, 0, sizeof(ssd));
+        ssd.eType = DRIVE_TYPE_SSD_SATA;
+        ssd.trimInfo.bQueried = TRUE;
+        ssd.trimInfo.bOsTrimEnabled = TRUE;
+        ssd.trimInfo.bDeviceTrimSupported = TRUE;
+        ssd.trimInfo.nVolumeCount = 2;
+
+        /* Recovery partition: 500 MB total, 20 MB free (4.0%) */
+        lstrcpynA(ssd.trimInfo.volumes[0].szLetter, "", (int)sizeof(ssd.trimInfo.volumes[0].szLetter));
+        lstrcpynA(ssd.trimInfo.volumes[0].szFileSystem, "NTFS", (int)sizeof(ssd.trimInfo.volumes[0].szFileSystem));
+        ssd.trimInfo.volumes[0].qwTotalBytes = 500ULL * 1024ULL * 1024ULL;
+        ssd.trimInfo.volumes[0].qwFreeBytes = 20ULL * 1024ULL * 1024ULL;
+        ssd.trimInfo.volumes[0].fFreePercent = 4.0f;
+        ssd.trimInfo.volumes[0].bTrimSupportedFs = TRUE;
+
+        /* C: system partition: 400 GB total, 100 GB free (25.0%) */
+        lstrcpynA(ssd.trimInfo.volumes[1].szLetter, "C:", (int)sizeof(ssd.trimInfo.volumes[1].szLetter));
+        lstrcpynA(ssd.trimInfo.volumes[1].szFileSystem, "NTFS", (int)sizeof(ssd.trimInfo.volumes[1].szFileSystem));
+        ssd.trimInfo.volumes[1].qwTotalBytes = 400ULL * 1024ULL * 1024ULL * 1024ULL;
+        ssd.trimInfo.volumes[1].qwFreeBytes = 100ULL * 1024ULL * 1024ULL * 1024ULL;
+        ssd.trimInfo.volumes[1].fFreePercent = 25.0f;
+        ssd.trimInfo.volumes[1].bTrimSupportedFs = TRUE;
+
+        EvaluateDriveTrimAndCapacity(&ssd);
+
+        Expect(!ssd.trimInfo.bPanicLowSpace, "Tiny partition < 1 GB does not trigger false SSD panic");
+        Expect(!ssd.trimInfo.bCriticallyLowSpace, "Tiny partition < 1 GB does not trigger false SSD critical");
+        Expect(ssd.trimInfo.fTotalFreePercent > 24.5f, "Overall free percent is ~25%");
+    }
+
+    /* 3. Build number is at least 81 */
+    Expect(DRIVEMONITOR_BUILD >= 81, "Build number is at least 81");
+
+    CaseEnd("build-81-regressions", before);
+}
+
+static void TestBuild82Regressions(void)
+{
+    int before = g_fail;
+
+    /* 1. SMI firmware recognition for S-branch November builds (e.g. S1127B0) */
+    Expect(FirmwareIsSmi225x("S1127B0"), "FirmwareIsSmi225x accepts S1127B0");
+    Expect(FirmwareIsSmi225x("S0814A0"), "FirmwareIsSmi225x accepts S0814A0");
+    Expect(!FirmwareIsSmi225x("U1120A0"), "FirmwareIsSmi225x rejects U1120A0 (Phison S11)");
+
+    /* 2. Radeon R5SL with S1127B0 matches r5sl-smi225 and detects controller */
+    {
+        DRIVE_INFO d;
+        memset(&d, 0, sizeof(d));
+        strcpy(d.szModel, "R5SL240G");
+        strcpy(d.szFirmware, "S1127B0");
+        IdentifyDriveParts(&d);
+        ExpectStr(d.szProfileId, "r5sl-smi225", "R5SL S1127B0 matches r5sl-smi225");
+        ExpectInt((int)d.eController, (int)CONTROLLER_SMI, "R5SL S1127B0 detected as SMI");
+        Expect(strstr(d.szControllerChip, "SM2258") != NULL, "R5SL S1127B0 chip populated");
+
+        /* Drive type detection heuristic when no SMART or unprivileged */
+        DRIVE_TYPE dt = DetectDriveType(NULL, &d);
+        ExpectInt((int)dt, (int)DRIVE_TYPE_SSD_SATA, "R5SL detected as DRIVE_TYPE_SSD_SATA");
+    }
+
+    /* 3. Transcend 16GB USB flash drive with AA00... serial */
+    {
+        DRIVE_INFO d;
+        memset(&d, 0, sizeof(d));
+        d.eType = DRIVE_TYPE_USB;
+        d.bIsUSB = TRUE;
+        d.wUsbVid = 0x8564;
+        d.wUsbPid = 0x1000;
+        strcpy(d.szModel, "Transcend 16GB");
+        strcpy(d.szSerial, "AA00000000000489");
+        IdentifyDriveParts(&d);
+        ExpectInt((int)d.eVendor, (int)VENDOR_TRANSCEND, "Transcend brand detected");
+        ExpectStr(GetVendorName(d.eVendor), "Transcend", "GetVendorName returns Transcend");
+        ExpectInt(d.bCounterfeitSuspected, FALSE, "USB flash with AA00... serial is NOT counterfeit");
+    }
+
+    /* 4. SK Hynix NVMe SSD HFM256GDHTNI-87A0B */
+    {
+        DRIVE_INFO d;
+        memset(&d, 0, sizeof(d));
+        d.bIsNVMe = TRUE;
+        strcpy(d.szModel, "SKHynix_HFM256GDHTNI-87A0B");
+        strcpy(d.szFirmware, "11020C00");
+        IdentifyDriveParts(&d);
+        ExpectInt((int)d.eVendor, (int)VENDOR_SKHYNIX, "SK Hynix vendor detected");
+        ExpectInt((int)d.eController, (int)CONTROLLER_HYNIX, "SK Hynix controller detected");
+        ExpectStr(d.szProfileId, "hynix-bc", "HFM matches hynix-bc profile");
+        Expect(strstr(d.szControllerChip, "Cepheus") != NULL, "ACNS033 / Cepheus chip name");
+    }
+
+    /* 5. Pre-boot event log entries ignored for USB drives */
+    {
+        DRIVE_INFO drives[2];
+        memset(drives, 0, sizeof(drives));
+
+        /* Drive 0: Internal HDD / SSD */
+        drives[0].nDriveIndex = 3;
+        drives[0].bIsUSB = FALSE;
+
+        /* Drive 1: External USB Drive */
+        drives[1].nDriveIndex = 3;
+        drives[1].bIsUSB = TRUE;
+
+        /* Event 51 with an old timestamp from 2021 (before system boot) */
+        const wchar_t* xmlOldEvt51 =
+            L"<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'>"
+            L"<System>"
+            L"<Provider Name='disk'/>"
+            L"<EventID>51</EventID>"
+            L"<TimeCreated SystemTime='2021-05-10T12:00:00.000000000Z'/>"
+            L"</System>"
+            L"<EventData>"
+            L"<Data>\\Device\\Harddisk3\\DR3</Data>"
+            L"</EventData>"
+            L"</Event>";
+
+        /* Feed to internal drive: accepted */
+        EnableStorageEventPreBootFilter(TRUE);
+        BOOL okInt = ParseStorageEventXml(xmlOldEvt51, &drives[0], 1);
+        Expect(okInt, "Internal drive accepts harddisk event");
+        ExpectInt(drives[0].eventStats.nEvent51Count, 1, "Internal drive logs event 51");
+
+        /* Feed to USB drive: rejected because it's before boot */
+        BOOL okUsb = ParseStorageEventXml(xmlOldEvt51, &drives[1], 1);
+        Expect(!okUsb, "USB drive ignores pre-boot event");
+        ExpectInt(drives[1].eventStats.nEvent51Count, 0, "USB drive ignores pre-boot event 51 count is 0");
+        EnableStorageEventPreBootFilter(FALSE);
+    }
+
+    /* 6. Build number is at least 82 */
+    Expect(DRIVEMONITOR_BUILD >= 82, "Build number is at least 82");
+
+    CaseEnd("build-82-regressions", before);
+}
+
+static void TestBuild83Regressions(void)
+{
+    int before = g_fail;
+
+    /* 1. SanDisk PC SN5100S / WD SN5000 family profile and controller detection */
+    {
+        DRIVE_INFO d;
+        memset(&d, 0, sizeof(d));
+        d.bIsNVMe = TRUE;
+        d.eType = DRIVE_TYPE_NVME;
+        strcpy(d.szModel, "Sandisk PC SN5100S SDFQNSM-2T00-1002");
+        strcpy(d.szFirmware, "35170100");
+        IdentifyDriveParts(&d);
+        ExpectInt((int)d.eVendor, (int)VENDOR_SANDISK, "SanDisk vendor detected");
+        ExpectInt((int)d.eController, (int)CONTROLLER_SANDISK, "SanDisk controller detected");
+        ExpectStr(d.szProfileId, "sandisk-sn5100", "Matches sandisk-sn5100 profile");
+        Expect(strstr(d.szControllerChip, "Hermes") != NULL, "Hermes chip name populated");
+    }
+
+    /* 2. An empty event log does not clear a downtrain or invent a port max */
+    {
+        DRIVE_INFO info;
+        memset(&info, 0, sizeof(info));
+        info.bIsNVMe = TRUE;
+        info.bSMART_Supported = TRUE;
+        info.bSMART_Enabled = TRUE;
+        info.bGotNVMeIdent = TRUE;
+        info.nvmeHealth.AvailableSpare = 100;
+        info.nvmeHealth.AvailableSpareThreshold = 10;
+        info.nvmeHealth.PercentageUsed = 1;
+        info.eType = DRIVE_TYPE_NVME;
+        info.nPcieCurLinkSpeed = 4;
+        info.nPcieCurLinkWidth = 2;
+        info.nPcieMaxLinkSpeed = 4;
+        info.nPcieMaxLinkWidth = 4;
+        info.bLinkDegraded = TRUE;
+        info.eventStats.bQueried = TRUE;
+
+        AssessDriveHealth(&info);
+        Expect(info.bLinkDegraded, "empty event log keeps bLinkDegraded");
+        Expect(!info.bPcieHostCapped, "empty event log does not invent a host cap");
+        ExpectInt((int)info.eInterface, (int)HEALTH_STATUS_CAUTION, "downtrain eInterface stays CAUTION");
+        ExpectInt((int)info.eHealthStatus, (int)HEALTH_STATUS_CAUTION, "downtrain headline stays CAUTION");
+
+        FillDriveProtocol(&info);
+        ExpectHas(info.szProtocol, "\xE2\x9A\xA0", "downtrain protocol keeps the warning glyph");
+        ExpectHas(info.szProtocol, "PCIe 4.0 x2", "szProtocol has PCIe 4.0 x2");
+    }
+
+    /* 3. NVMe on PCIe x2 with bus errors (Event 129 reset) stays degraded */
+    {
+        DRIVE_INFO info;
+        memset(&info, 0, sizeof(info));
+        info.bIsNVMe = TRUE;
+        info.bSMART_Supported = TRUE;
+        info.bSMART_Enabled = TRUE;
+        info.bGotNVMeIdent = TRUE;
+        info.nvmeHealth.AvailableSpare = 100;
+        info.nvmeHealth.AvailableSpareThreshold = 10;
+        info.nvmeHealth.PercentageUsed = 1;
+        info.eType = DRIVE_TYPE_NVME;
+        info.nPcieCurLinkSpeed = 4;
+        info.nPcieCurLinkWidth = 2;
+        info.nPcieMaxLinkSpeed = 4;
+        info.nPcieMaxLinkWidth = 4;
+        info.bLinkDegraded = TRUE;
+        info.eventStats.bQueried = TRUE;
+        info.eventStats.nEvent129Count = 1; /* Hardware reset occurred */
+
+        AssessDriveHealth(&info);
+        Expect(info.bLinkDegraded, "NVMe with Event 129 retains bLinkDegraded");
+        ExpectInt((int)info.eInterface, (int)HEALTH_STATUS_CAUTION, "NVMe with Event 129 eInterface is CAUTION");
+        ExpectInt((int)info.eHealthStatus, (int)HEALTH_STATUS_CAUTION, "NVMe with Event 129 headline health is CAUTION");
+    }
+
+    /* 4. R5SL240G type detection heuristic without admin / SMART */
+    {
+        DRIVE_INFO d;
+        memset(&d, 0, sizeof(d));
+        strcpy(d.szModel, "R5SL240G");
+        strcpy(d.szFirmware, "S1127B0");
+        DRIVE_TYPE dt = DetectDriveType(NULL, &d);
+        ExpectInt((int)dt, (int)DRIVE_TYPE_SSD_SATA, "R5SL240G detected as SSD SATA");
+    }
+
+    /* 5. Build number is at least 83 */
+    Expect(DRIVEMONITOR_BUILD >= 83, "Build number is at least 83");
+
+    CaseEnd("build-83-regressions", before);
+}
+
+static void TestBuild84Regressions(void)
+{
+    int before = g_fail;
+
+    /* 1. A quiet log must not replace a measured port max with the current link. */
+    {
+        DRIVE_INFO info;
+        memset(&info, 0, sizeof(info));
+        info.bIsNVMe = TRUE;
+        info.bSMART_Supported = TRUE;
+        info.bSMART_Enabled = TRUE;
+        info.bGotNVMeIdent = TRUE;
+        info.nvmeHealth.AvailableSpare = 100;
+        info.nvmeHealth.AvailableSpareThreshold = 10;
+        info.nvmeHealth.PercentageUsed = 1;
+        info.eType = DRIVE_TYPE_NVME;
+        info.nPcieCurLinkSpeed = 3;
+        info.nPcieCurLinkWidth = 2;
+        info.nPcieMaxLinkSpeed = 4;
+        info.nPcieMaxLinkWidth = 4;
+        info.nPcieUpMaxLinkSpeed = 4;
+        info.nPcieUpMaxLinkWidth = 4;
+        info.bLinkDegraded = TRUE;
+        info.eventStats.bQueried = TRUE;
+
+        AssessDriveHealth(&info);
+        Expect(info.bLinkDegraded, "link below a known x4 port stays degraded");
+        Expect(!info.bPcieHostCapped, "link below a known x4 port is not a host cap");
+        ExpectInt((int)info.nPcieUpMaxLinkSpeed, 4, "upstream speed is not replaced");
+        ExpectInt((int)info.nPcieUpMaxLinkWidth, 4, "upstream width is not replaced");
+        ExpectInt((int)info.eInterface, (int)HEALTH_STATUS_CAUTION, "Interface health stays CAUTION");
+        ExpectInt((int)info.eHealthStatus, (int)HEALTH_STATUS_CAUTION, "Headline health stays CAUTION");
+
+        FillDriveProtocol(&info);
+        ExpectHas(info.szProtocol, "\xE2\x9A\xA0", "szProtocol keeps the warning glyph");
+        ExpectHas(info.szProtocol, "PCIe 3.0 x2", "szProtocol shows PCIe 3.0 x2");
+    }
+
+    /* 2. Toshiba C0 (Power-Off Retracts) low 16-bit decode via profile without vendor branch */
+    {
+        DRIVE_INFO d;
+        memset(&d, 0, sizeof(d));
+        d.eType = DRIVE_TYPE_HDD;
+        strcpy(d.szModel, "TOSHIBA DT01ACA100");
+        IdentifyDriveParts(&d);
+
+        int sem = PROF_SEM_NONE, enc = PROF_ENC_NONE;
+        BOOL bFound = ProfileLookup(&d, 0xC0, &sem, &enc);
+        Expect(bFound, "ProfileLookup found attribute C0 for Toshiba HDD");
+        ExpectInt(enc, PROF_ENC_LO16, "Attribute C0 encoding is PROF_ENC_LO16");
+    }
+
+    /* 3. Build number is at least 84 */
+    Expect(DRIVEMONITOR_BUILD >= 84, "Build number is at least 84");
+
+    CaseEnd("build-84-regressions", before);
+}
+
 int main(void){
     printf("drivedb_test\n");
     fflush(stdout);
@@ -4681,6 +6790,29 @@ int main(void){
     TestBuild54Regressions();
     TestBuild55Regressions();
     TestBuild56Regressions();
+    TestBuild62Regressions();
+    TestBuild63Regressions();
+    TestBuild64Regressions();
+    TestBuild65Regressions();
+    TestBuild66Regressions();
+    TestBuild67Regressions();
+    TestBuild68Regressions();
+    TestBuild69Regressions();
+    TestBuild70Regressions();
+    TestBuild71Regressions();
+    TestBuild72Regressions();
+    TestBuild73Regressions();
+    TestBuild74Regressions();
+    TestBuild75Regressions();
+    TestBuild76Regressions();
+    TestBuild77Regressions();
+    TestBuild78Regressions();
+    TestBuild79Regressions();
+    TestBuild80Regressions();
+    TestBuild81Regressions();
+    TestBuild82Regressions();
+    TestBuild83Regressions();
+    TestBuild84Regressions();
     if (g_fail) {
         fprintf(stderr, "FAILED %d of %d checks\n", g_fail, g_check);
         return 1;

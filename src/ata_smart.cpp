@@ -1,6 +1,15 @@
 /* DriveMonitor - ATA/SATA SMART (IOCTL_ATA_PASS_THROUGH). GPL-2.0-or-later. See LICENSE. */
 #include "smart_internal.h"
+#include "ata_log.h"
 #include "csmi.h"
+
+BOOL AtaErrorLooksLikeTimeout(DWORD dwErr, DWORD dwElapsedMs)
+{
+    /* A fast ATA abort (ERROR_IO_DEVICE and the rest) is an unsupported
+     * log, not a hung bus. Only a slow command skips the logs that follow. */
+    (void)dwErr;
+    return dwElapsedMs >= 1500;
+}
 
 void FillAtaProtocolFromIdent(DRIVE_INFO* pInfo, const WORD* pIdent)
 {
@@ -8,6 +17,9 @@ void FillAtaProtocolFromIdent(DRIVE_INFO* pInfo, const WORD* pIdent)
     unsigned neg;
     BYTE maxGen = 0;
     if (!pInfo || !pIdent) return;
+    pInfo->bLinkDegraded = FALSE;
+    pInfo->bSataHostCapped = FALSE;
+    pInfo->nSataCurGen = 0;
     w76 = pIdent[76];
     w77 = pIdent[77];
 
@@ -28,10 +40,21 @@ void FillAtaProtocolFromIdent(DRIVE_INFO* pInfo, const WORD* pIdent)
     if (!pInfo->bIsUSB && neg >= 1 && neg <= 3) {
         pInfo->nSataCurGen = (BYTE)neg;
         if (maxGen > (BYTE)neg) {
-            pInfo->bLinkDegraded = TRUE;
-            const char* szCurStr = (neg == 2) ? TN("3 Гбит/с", "3 Gb/s") : TN("1.5 Гбит/с", "1.5 Gb/s");
-            const char* szMaxStr = (maxGen == 3) ? TN("6 Гбит/с", "6 Gb/s") : TN("3 Гбит/с", "3 Gb/s");
-            safe_snprintf(pInfo->szProtocol, "SATA %s (%s %s \xE2\x9A\xA0)",
+            if (neg == 1) {
+                pInfo->bLinkDegraded = TRUE;
+                pInfo->bSataHostCapped = FALSE;
+                const char* szCurStr = TN("1.5 Гбит/с", "1.5 Gb/s");
+                const char* szMaxStr = (maxGen == 3) ? TN("6 Гбит/с", "6 Gb/s") : TN("3 Гбит/с", "3 Gb/s");
+                safe_snprintf(pInfo->szProtocol, "SATA %s (%s %s \xE2\x9A\xA0)",
+                              szCurStr, TN("макс.", "max"), szMaxStr);
+                return;
+            }
+            /* Gen 2 on Gen 3: the port ceiling. CRC stays on the interface axis. */
+            pInfo->bLinkDegraded = FALSE;
+            pInfo->bSataHostCapped = TRUE;
+            const char* szCurStr = TN("3 Гбит/с", "3 Gb/s");
+            const char* szMaxStr = TN("6 Гбит/с", "6 Gb/s");
+            safe_snprintf(pInfo->szProtocol, "SATA %s (%s %s)",
                           szCurStr, TN("макс.", "max"), szMaxStr);
             return;
         }
@@ -174,10 +197,12 @@ BOOL ParseAtaIdentifyData(const BYTE* pIdent512, DRIVE_INFO* pInfo)
     if (qwSectors == 0) qwSectors = (unsigned __int64)dwSectors28;
     pInfo->dwCapacityMB = (DWORD)(qwSectors * 512 / (1024 * 1024));
 
-    /* Word 82-84: Command set/feature support */
-    pInfo->bSMART_Supported = (pIdent[82] & 0x0001) ? TRUE : FALSE;
-    pInfo->bSMART_Enabled   = (pIdent[85] & 0x0001) ? TRUE : FALSE;
+    /* Word 82-84, 85-87: Command set/feature support */
+    pInfo->bSMART_Supported   = (pIdent[82] & 0x0001) ? TRUE : FALSE;
+    pInfo->bSMART_Enabled     = (pIdent[85] & 0x0001) ? TRUE : FALSE;
+    pInfo->bCapSmartErrLog    = ((pIdent[84] & 0x0001) || (pIdent[87] & 0x0001)) ? TRUE : FALSE;
     pInfo->bSelfTestSupported = ((pIdent[84] & 0x0002) || (pIdent[87] & 0x0002)) ? TRUE : FALSE;
+    pInfo->bCapGpl            = ((pIdent[84] & 0x0020) || (pIdent[87] & 0x0020)) ? TRUE : FALSE;
 
     /* Word 217: Nominal Media Rotation Rate
      * 0x0001 = non-rotating (SSD), >= 0x0401 = RPM */
@@ -368,7 +393,7 @@ static BOOL ReadSMARTLogATAPassthrough(HANDLE hDrive, BYTE bLogAddr,
     pApt->Length             = sizeof(MY_ATA_PASS_THROUGH_EX);
     pApt->AtaFlags           = ATA_FLAGS_DRDY_REQUIRED | ATA_FLAGS_DATA_IN;
     pApt->DataTransferLength = 512;
-    pApt->TimeOutValue       = 10;
+    pApt->TimeOutValue       = 5;
     pApt->DataBufferOffset   = sizeof(MY_ATA_PASS_THROUGH_EX) + 4;
 
     pApt->CurrentTaskFile[0] = SMART_READ_LOG;     /* Features */
@@ -403,27 +428,34 @@ BOOL ReadAtaLogExtNative(HANDLE hDrive, BYTE bLogAddr, WORD wPage,
     pApt->Length             = sizeof(MY_ATA_PASS_THROUGH_EX);
     pApt->AtaFlags           = ATA_FLAGS_DRDY_REQUIRED | ATA_FLAGS_DATA_IN | ATA_FLAGS_48BIT_COMMAND;
     pApt->DataTransferLength = 512;
-    pApt->TimeOutValue       = 10;
+    pApt->TimeOutValue       = 5;
     pApt->DataBufferOffset   = sizeof(MY_ATA_PASS_THROUGH_EX) + 4;
 
-    pApt->CurrentTaskFile[0]  = (BYTE)(wPage & 0xFF);        /* Features: page low */
-    pApt->PreviousTaskFile[0] = (BYTE)((wPage >> 8) & 0xFF); /* Features: page high */
+    /* READ LOG EXT: Features is reserved. The page is LBA mid/high. */
+    pApt->CurrentTaskFile[0]  = 0;
+    pApt->PreviousTaskFile[0] = 0;
     pApt->CurrentTaskFile[1]  = 1;                           /* Sector count: 1 */
     pApt->PreviousTaskFile[1] = 0;
     pApt->CurrentTaskFile[2]  = bLogAddr;                    /* LBA Low: Log Address */
     pApt->PreviousTaskFile[2] = 0;
-    pApt->CurrentTaskFile[3]  = 0;                           /* LBA Mid */
+    pApt->CurrentTaskFile[3]  = (BYTE)(wPage & 0xFF);        /* LBA Mid: page low */
     pApt->PreviousTaskFile[3] = 0;
-    pApt->CurrentTaskFile[4]  = 0;                           /* LBA High */
+    pApt->CurrentTaskFile[4]  = (BYTE)((wPage >> 8) & 0xFF); /* LBA High: page high */
     pApt->PreviousTaskFile[4] = 0;
     pApt->CurrentTaskFile[5]  = 0x40;                        /* Device (LBA mode) */
     pApt->CurrentTaskFile[6]  = 0x2F;                        /* Command: READ LOG EXT */
 
     DWORD dwBytes = 0;
+    DWORD t0 = GetTickCount();
     if (DeviceIoControl(hDrive, IOCTL_ATA_PASS_THROUGH,
             buf, sizeof(buf), buf, sizeof(buf), &dwBytes, NULL)) {
         memcpy(pBuf, buf + sizeof(MY_ATA_PASS_THROUGH_EX) + 4, 512);
         return TRUE;
+    }
+    DWORD dwErr = GetLastError();
+    if (AtaErrorLooksLikeTimeout(dwErr, GetTickCount() - t0)) {
+        SetLastError(dwErr);
+        return FALSE;
     }
 
     /* 2. Fallback to SMART READ LOG (0xB0 / 0xD5) for page 0 */
@@ -432,7 +464,7 @@ BOOL ReadAtaLogExtNative(HANDLE hDrive, BYTE bLogAddr, WORD wPage,
         pApt->Length             = sizeof(MY_ATA_PASS_THROUGH_EX);
         pApt->AtaFlags           = ATA_FLAGS_DRDY_REQUIRED | ATA_FLAGS_DATA_IN;
         pApt->DataTransferLength = 512;
-        pApt->TimeOutValue       = 10;
+        pApt->TimeOutValue       = 5;
         pApt->DataBufferOffset   = sizeof(MY_ATA_PASS_THROUGH_EX) + 4;
 
         pApt->CurrentTaskFile[0] = SMART_READ_LOG;
@@ -443,10 +475,16 @@ BOOL ReadAtaLogExtNative(HANDLE hDrive, BYTE bLogAddr, WORD wPage,
         pApt->CurrentTaskFile[5] = 0xA0;
         pApt->CurrentTaskFile[6] = SMART_CMD;
 
+        t0 = GetTickCount();
         if (DeviceIoControl(hDrive, IOCTL_ATA_PASS_THROUGH,
                 buf, sizeof(buf), buf, sizeof(buf), &dwBytes, NULL)) {
             memcpy(pBuf, buf + sizeof(MY_ATA_PASS_THROUGH_EX) + 4, 512);
             return TRUE;
+        }
+        dwErr = GetLastError();
+        if (AtaErrorLooksLikeTimeout(dwErr, GetTickCount() - t0)) {
+            SetLastError(dwErr);
+            return FALSE;
         }
 
         /* 3. Fallback to SMART_RCV_DRIVE_DATA */
@@ -466,6 +504,7 @@ BOOL ReadAtaLogExtNative(HANDLE hDrive, BYTE bLogAddr, WORD wPage,
         pCip->irDriveRegs.bCommandReg     = SMART_CMD;
         pCip->bDriveNumber                = 0;
 
+        t0 = GetTickCount();
         if (DeviceIoControl(hDrive, SMART_RCV_DRIVE_DATA,
                 pCip, sizeof(SENDCMDINPARAMS) - 1,
                 outBuf, sizeof(outBuf), &dwBytes, NULL)) {
@@ -473,6 +512,9 @@ BOOL ReadAtaLogExtNative(HANDLE hDrive, BYTE bLogAddr, WORD wPage,
             memcpy(pBuf, pCop->bBuffer, 512);
             return TRUE;
         }
+        dwErr = GetLastError();
+        SetLastError(dwErr);
+        (void)t0;
     }
     return FALSE;
 }
@@ -509,13 +551,38 @@ BOOL GetSMARTErrorLogATAPassthrough(HANDLE hDrive, DRIVE_INFO* pInfo)
 BOOL GetSMARTSelfTestLog(HANDLE hDrive, int nDrive, DRIVE_INFO* pInfo)
 {
     ZeroMemory(&pInfo->selfTestLog, sizeof(pInfo->selfTestLog));
+    if (pInfo->bScanIoTimedOut) return FALSE;
+    if (pInfo->bCapAtaIdentify && !pInfo->bSelfTestSupported) return FALSE;
 
-    if (ReadAtaLogExtNative(hDrive, SMART_LOG_COMP_SELF_TEST, 0,
-                            (BYTE*)&pInfo->selfTestLog, sizeof(pInfo->selfTestLog)) ||
-        ReadSMARTLog(hDrive, nDrive, SMART_LOG_COMP_SELF_TEST,
-                     (BYTE*)&pInfo->selfTestLog, sizeof(pInfo->selfTestLog)) ||
-        ReadSMARTLogATAPassthrough(hDrive, SMART_LOG_COMP_SELF_TEST,
-                     (BYTE*)&pInfo->selfTestLog, sizeof(pInfo->selfTestLog))) {
+    BOOL bOk = FALSE;
+    if (!pInfo->bCapAtaIdentify || pInfo->bCapGpl) {
+        DWORD t0 = GetTickCount();
+        bOk = ReadAtaLogExtNative(hDrive, SMART_LOG_COMP_SELF_TEST, 0,
+                                  (BYTE*)&pInfo->selfTestLog, sizeof(pInfo->selfTestLog));
+        if (!bOk && AtaErrorLooksLikeTimeout(GetLastError(), GetTickCount() - t0)) {
+            pInfo->bScanIoTimedOut = TRUE;
+            return FALSE;
+        }
+    }
+    if (!bOk) {
+        DWORD t0 = GetTickCount();
+        bOk = ReadSMARTLog(hDrive, nDrive, SMART_LOG_COMP_SELF_TEST,
+                           (BYTE*)&pInfo->selfTestLog, sizeof(pInfo->selfTestLog));
+        if (!bOk && AtaErrorLooksLikeTimeout(GetLastError(), GetTickCount() - t0)) {
+            pInfo->bScanIoTimedOut = TRUE;
+            return FALSE;
+        }
+    }
+    if (!bOk) {
+        DWORD t0 = GetTickCount();
+        bOk = ReadSMARTLogATAPassthrough(hDrive, SMART_LOG_COMP_SELF_TEST,
+                                         (BYTE*)&pInfo->selfTestLog, sizeof(pInfo->selfTestLog));
+        if (!bOk && AtaErrorLooksLikeTimeout(GetLastError(), GetTickCount() - t0)) {
+            pInfo->bScanIoTimedOut = TRUE;
+            return FALSE;
+        }
+    }
+    if (bOk) {
         pInfo->bGotSelfTestLog = TRUE;
         int idx = (pInfo->selfTestLog.bMostRecentTestIndex >= 1 && pInfo->selfTestLog.bMostRecentTestIndex <= 21)
                   ? (pInfo->selfTestLog.bMostRecentTestIndex - 1) : 0;
@@ -528,11 +595,29 @@ BOOL GetSMARTSelfTestLog(HANDLE hDrive, int nDrive, DRIVE_INFO* pInfo)
 BOOL GetSMARTSelfTestLogATAPassthrough(HANDLE hDrive, DRIVE_INFO* pInfo)
 {
     ZeroMemory(&pInfo->selfTestLog, sizeof(pInfo->selfTestLog));
+    if (pInfo->bScanIoTimedOut) return FALSE;
+    if (pInfo->bCapAtaIdentify && !pInfo->bSelfTestSupported) return FALSE;
 
-    if (ReadAtaLogExtNative(hDrive, SMART_LOG_COMP_SELF_TEST, 0,
-                            (BYTE*)&pInfo->selfTestLog, sizeof(pInfo->selfTestLog)) ||
-        ReadSMARTLogATAPassthrough(hDrive, SMART_LOG_COMP_SELF_TEST,
-                     (BYTE*)&pInfo->selfTestLog, sizeof(pInfo->selfTestLog))) {
+    BOOL bOk = FALSE;
+    if (!pInfo->bCapAtaIdentify || pInfo->bCapGpl) {
+        DWORD t0 = GetTickCount();
+        bOk = ReadAtaLogExtNative(hDrive, SMART_LOG_COMP_SELF_TEST, 0,
+                                  (BYTE*)&pInfo->selfTestLog, sizeof(pInfo->selfTestLog));
+        if (!bOk && AtaErrorLooksLikeTimeout(GetLastError(), GetTickCount() - t0)) {
+            pInfo->bScanIoTimedOut = TRUE;
+            return FALSE;
+        }
+    }
+    if (!bOk) {
+        DWORD t0 = GetTickCount();
+        bOk = ReadSMARTLogATAPassthrough(hDrive, SMART_LOG_COMP_SELF_TEST,
+                                         (BYTE*)&pInfo->selfTestLog, sizeof(pInfo->selfTestLog));
+        if (!bOk && AtaErrorLooksLikeTimeout(GetLastError(), GetTickCount() - t0)) {
+            pInfo->bScanIoTimedOut = TRUE;
+            return FALSE;
+        }
+    }
+    if (bOk) {
         pInfo->bGotSelfTestLog = TRUE;
         int idx = (pInfo->selfTestLog.bMostRecentTestIndex >= 1 && pInfo->selfTestLog.bMostRecentTestIndex <= 21)
                   ? (pInfo->selfTestLog.bMostRecentTestIndex - 1) : 0;
@@ -560,7 +645,7 @@ BOOL ATAPassThrough(HANDLE hDrive, BYTE bCommand, BYTE bFeatures,
     pApt->AtaFlags           = ATA_FLAGS_DRDY_REQUIRED |
                                (bDataIn ? ATA_FLAGS_DATA_IN : 0);
     pApt->DataTransferLength = dwDataLen;
-    pApt->TimeOutValue       = 10;
+    pApt->TimeOutValue       = 5;
     pApt->DataBufferOffset   = sizeof(MY_ATA_PASS_THROUGH_EX) + 4;
 
     pApt->CurrentTaskFile[0] = bFeatures;
@@ -826,9 +911,15 @@ void ExtractTemperatureFromATA(DRIVE_INFO* pInfo)
     }
     for (i = 0; i < 30; i++) {
         SMART_ATTRIBUTE* pA = &pInfo->attrData.stAttributes[i];
+        int sem = PROF_SEM_NONE;
+        BOOL isThermal = FALSE;
         if (pA->bAttrID != 0xE7)
             continue;
-        if (pInfo->eController == CONTROLLER_PHISON)
+        if (ProfileLookup(pInfo, 0xE7, &sem, NULL))
+            isThermal = (sem == PROF_SEM_THERMAL);
+        else if (DriveDbAttrEnc(pInfo, 0xE7, &sem, NULL))
+            isThermal = (sem == PROF_SEM_THERMAL);
+        if (!isThermal)
             continue;
         {
             int nT = (int)GetRawValue16Lo(pA->bRawValue);
@@ -859,38 +950,54 @@ void ExtractCommonATACounters(DRIVE_INFO* pInfo)
  * FillSmartData compacts it. The compacted attribute struct is
  * the wrong buffer: its last byte is zeroed padding.
  *
- * Reject a short, empty, 0xFF, or torn sector, and a checksum
- * byte that is present but does not match. Byte 511 == 0 means
+ * Reject a short, empty, 0xFF, or torn sector. Byte 511 == 0 means
  * the drive or bridge left the checksum unimplemented (typical
- * of USB SAT). That sector stays valid when the table is intact.
+ * of USB SAT). If byte 511 is non-zero but the checksum does not match,
+ * accept the sector only if it contains genuine plausible SMART attributes
+ * (recovering from firmware checksum bugs such as Crucial BX500 / SM2258/SM2259,
+ * matching smartmontools permissive tolerance). Unused slots (ID 0) are
+ * skipped as reserved per ATA spec and do not invalidate the payload.
  * ============================================================ */
 BOOL ValidateSmartData(const BYTE* pRawBuf, int nBufLen)
 {
     int nValidAttrs = 0;
-    int i, j;
+    int nPlausibleAttrs = 0;
+    int i;
     unsigned sum;
+    BYTE seenIds[256];
 
     if (!pRawBuf || nBufLen < 512) return FALSE;
     if (IsBufferAllZero(pRawBuf, 512)) return FALSE;
     if (IsBufferAllFF(pRawBuf + 2, 30 * 12)) return FALSE;
 
+    memset(seenIds, 0, sizeof(seenIds));
+
     for (i = 0; i < 30; i++) {
         const BYTE* pEntry = pRawBuf + 2 + i * 12;
-        if (pEntry[0] == 0) {
-            /* Unused slots are all zeros. A payload behind ID 0 is torn. */
-            for (j = 1; j < 12; j++) {
-                if (pEntry[j] != 0) return FALSE;
-            }
-            continue;
-        }
+        BYTE bID = pEntry[0];
+        if (bID == 0) continue;
+        if (bID == 0xFF) return FALSE; /* 0xFF is an invalid attribute ID in ATA SMART (indicates memory dump / uninitialized buffer) */
+        /* Duplicate attribute ID indicates noise or a repeating fill pattern */
+        if (seenIds[bID]) return FALSE;
+        seenIds[bID] = 1;
         nValidAttrs++;
+        /* Plausible ATA SMART attribute: normalized value and worst in 1..254 */
+        if (pEntry[3] >= 1 && pEntry[3] <= 254 &&
+            pEntry[4] >= 1 && pEntry[4] <= 254) {
+            nPlausibleAttrs++;
+        }
     }
     if (nValidAttrs == 0) return FALSE;
 
     if (pRawBuf[511] != 0) {
         sum = 0;
         for (i = 0; i < 512; i++) sum += pRawBuf[i];
-        if ((sum & 0xFF) != 0) return FALSE;
+        if ((sum & 0xFF) != 0) {
+            /* Checksum non-zero but mismatched. If the payload has genuine
+             * plausible attributes, keep them (firmware checksum bug).
+             * Reject only if the table lacks plausible attributes (noise/torn). */
+            if (nPlausibleAttrs < 2) return FALSE;
+        }
     }
     return TRUE;
 }
@@ -922,7 +1029,7 @@ int FillSmartData(DRIVE_INFO* pInfo, const BYTE* pRawBuf)
     for (i = 0; i < 30; i++) {
         const BYTE* pEntry = pRawBuf + 2 + i * 12;
         BYTE bID = pEntry[0];
-        if (bID == 0) continue;
+        if (bID == 0 || bID == 0xFF) continue;
 
         /* ATA 12-byte attr: ID, flags[1..2], value, worst, raw[5..10], reserved[11]. */
         SMART_ATTRIBUTE* pA = &pInfo->attrData.stAttributes[nCount];
@@ -1013,9 +1120,13 @@ BOOL AcquireATASMART(HANDLE hDrive, int nDrive, DRIVE_INFO* pInfo, BOOL bReadLog
 {
     BOOL bAttr = FALSE, bThresh = FALSE;
 
-    /* Enable SMART via both paths */
-    EnableSMART(hDrive, nDrive);
-    EnableSMARTSAT(hDrive);
+    /* Enable SMART only if IDENTIFY did not already report it enabled */
+    if (!pInfo->bCapAtaIdentify || !pInfo->bSMART_Enabled) {
+        if (pInfo->bIsUSB)
+            EnableSMARTSAT(hDrive);
+        else
+            EnableSMART(hDrive, nDrive);
+    }
 
     /* ---- For USB drives: prioritize SAT  ---- */
     if (pInfo->bIsUSB) {
@@ -1067,18 +1178,38 @@ BOOL AcquireATASMART(HANDLE hDrive, int nDrive, DRIVE_INFO* pInfo, BOOL bReadLog
         ExtractCommonATACounters(pInfo);
         ExtractSSDIndicators(pInfo);
 
-        /* SMART error / self-test logs: full scan only. Extra SMART READ LOG
-         * on USB/HDD every refresh can AV the usbstor/atapi stack. */
-        if (bReadLogs) {
-            if (!GetSMARTErrorLog(hDrive, nDrive, pInfo)) {
-                if (!GetSMARTErrorLogATAPassthrough(hDrive, pInfo))
-                    GetSMARTErrorLogSAT(hDrive, pInfo);
+        /* SMART error / self-test / GPL logs: full scan only. Extra SMART READ LOG
+         * on USB/HDD every refresh can AV the usbstor/atapi stack.
+         * Gate optional logs by IDENTIFY capabilities and bail out immediately
+         * if a port reset / I/O timeout occurs. */
+        if (bReadLogs && !pInfo->bScanIoTimedOut) {
+            if (!pInfo->bCapAtaIdentify || pInfo->bCapSmartErrLog) {
+                DWORD tErr = GetTickCount();
+                BOOL bErrOk = FALSE;
+                if (pInfo->bIsUSB) {
+                    bErrOk = GetSMARTErrorLogSAT(hDrive, pInfo);
+                } else {
+                    bErrOk = GetSMARTErrorLog(hDrive, nDrive, pInfo);
+                    if (!bErrOk && !AtaErrorLooksLikeTimeout(GetLastError(), GetTickCount() - tErr))
+                        bErrOk = GetSMARTErrorLogATAPassthrough(hDrive, pInfo);
+                }
+                if (!bErrOk && AtaErrorLooksLikeTimeout(GetLastError(), GetTickCount() - tErr))
+                    pInfo->bScanIoTimedOut = TRUE;
             }
-            if (!GetSMARTSelfTestLog(hDrive, nDrive, pInfo)) {
-                if (!GetSMARTSelfTestLogATAPassthrough(hDrive, pInfo))
-                    GetSMARTSelfTestLogSAT(hDrive, pInfo);
+            if (!pInfo->bScanIoTimedOut && (!pInfo->bCapAtaIdentify || pInfo->bSelfTestSupported)) {
+                if (pInfo->bIsUSB) {
+                    DWORD tSt = GetTickCount();
+                    if (!GetSMARTSelfTestLogSAT(hDrive, pInfo) &&
+                        AtaErrorLooksLikeTimeout(GetLastError(), GetTickCount() - tSt))
+                        pInfo->bScanIoTimedOut = TRUE;
+                } else {
+                    /* GetSMARTSelfTestLog already tries ReadAtaLogExtNative +
+                     * ReadSMARTLog + ReadSMARTLogATAPassthrough once. */
+                    GetSMARTSelfTestLog(hDrive, nDrive, pInfo);
+                }
             }
-            AcquireAtaLogs(hDrive, FALSE, pInfo);
+            if (DriveShouldQueryAtaGplLogs(pInfo))
+                AcquireAtaLogs(hDrive, pInfo->bIsUSB, pInfo);
         }
     } else {
         /* No accepted attribute sector. A rejected packet keeps
@@ -1105,9 +1236,23 @@ BOOL AcquireATASMART(HANDLE hDrive, int nDrive, DRIVE_INFO* pInfo, BOOL bReadLog
  * ============================================================ */
 BOOL AtaSendSmartOfflineImmediate(HANDLE hDrive, const DRIVE_INFO* pInfo, BYTE bSubcommand)
 {
+    /* Hidden CSMI member has no PhysicalDrive. Phy was stored at scan. */
+    if (pInfo && pInfo->eAccessMethod == SMART_ACCESS_CSMI &&
+        pInfo->nScsiPort >= 0 && pInfo->nCsmiPhy >= 0 && pInfo->nCsmiPhy <= 255) {
+        HANDLE hScsi = INVALID_HANDLE_VALUE;
+        BOOL ok = FALSE;
+        if (CsmiProbeController(pInfo->nScsiPort, &hScsi)) {
+            ok = CsmiSendStpCommand(hScsi, (BYTE)pInfo->nCsmiPhy,
+                SMART_EXECUTE_OFFLINE, 0, bSubcommand,
+                SMART_CYL_LOW, SMART_CYL_HI, SMART_CMD, NULL, 0, FALSE);
+            CloseHandle(hScsi);
+        }
+        return ok;
+    }
+
     if (hDrive == INVALID_HANDLE_VALUE || !hDrive) return FALSE;
 
-    /* 1. If CSMI RAID member */
+    /* CSMI on a real disk whose phy was not stored. */
     if (pInfo && pInfo->eAccessMethod == SMART_ACCESS_CSMI) {
         SCSI_ADDRESS addr;
         HANDLE hScsi = OpenScsiAdapterFromDrive(hDrive, &addr);

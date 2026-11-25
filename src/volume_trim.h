@@ -39,6 +39,9 @@ typedef struct _DRIVE_FS_TRIM_INFO {
     int  nVolumeCount;
     VOLUME_INFO_ENTRY volumes[MAX_DRIVE_VOLUMES];
     float fMinFreePercent;        /* Minimum free % across all volumes (-1.0 if no volumes) */
+    unsigned __int64 qwTotalBytesAll; /* Total capacity summed across all volumes on drive */
+    unsigned __int64 qwFreeBytesAll;  /* Total free bytes summed across all volumes on drive */
+    float fTotalFreePercent;      /* Overall free % across all volumes on drive (-1.0 if no volumes) */
     char szTrimSummary[96];       /* Human-readable status summary */
 } DRIVE_FS_TRIM_INFO;
 

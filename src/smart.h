@@ -180,6 +180,7 @@ typedef enum _DRIVE_VENDOR {
     VENDOR_MSI         = 23,
     VENDOR_RADEON      = 24,
     VENDOR_APACER      = 25,
+    VENDOR_TRANSCEND   = 26,
     VENDOR_OTHER       = 99
 } DRIVE_VENDOR;
 
@@ -205,7 +206,8 @@ typedef enum _DRIVE_CONTROLLER {
     CONTROLLER_AMAZON   = 15,
     CONTROLLER_MAXIO    = 16,  /* MAP1202/MAP1602 */
     CONTROLLER_INNOGRIT = 17,  /* IG5216/IG5236 */
-    CONTROLLER_YEESTOR  = 18   /* YS9082/YS9083/YS9203 */
+    CONTROLLER_YEESTOR  = 18,  /* YS9082/YS9083/YS9203 */
+    CONTROLLER_SANDFORCE = 19  /* SF-2281 etc. */
 } DRIVE_CONTROLLER;
 
 /* ============================================================
@@ -630,6 +632,9 @@ typedef struct _DRIVE_INFO {
     BOOL        bCapAtaIdentify;
     BOOL        bCapSmartData;
     BOOL        bCapSmartThresh;
+    BOOL        bCapGpl;             /* ATA IDENTIFY words 84/87 bit 5 (READ LOG EXT 2Fh) */
+    BOOL        bCapSmartErrLog;     /* ATA IDENTIFY words 84/87 bit 0 (SMART Error Log) */
+    BOOL        bScanIoTimedOut;     /* A slow/timed-out IOCTL occurred; skip optional logs */
     /* smartmontools drivedb.h (GPL-2.0-or-later). Family is a label.
      * It does not set the controller and it does not set a health score. */
     char        szModelFamily[96];
@@ -648,6 +653,7 @@ typedef struct _DRIVE_INFO {
     BOOL        bStandby;
     /* Bus / Link Speed Degradation */
     BOOL        bLinkDegraded;
+    BOOL        bSataHostCapped;      /* SATA Gen 2 on a Gen 3 drive: the port ceiling. CRC is scored on its own. */
     BYTE        nSataMaxGen;          /* 1 = Gen1 (1.5Gb/s), 2 = Gen2 (3Gb/s), 3 = Gen3 (6Gb/s) */
     BYTE        nSataCurGen;          /* Current negotiated Gen */
     BYTE        nPcieMaxLinkSpeed;    /* PCIe Gen 1..5, the drive */
@@ -673,7 +679,7 @@ typedef struct _DRIVE_INFO {
     uint64_t    qwDevStatSectorsWritten;   /* Page 01h, offset 0x18: logical sectors written */
     uint64_t    qwDevStatSectorsRead;      /* Page 01h, offset 0x28: logical sectors read */
     uint64_t    qwDevStatUncorrectable;    /* Page 04h, offset 0x08: reported uncorrectable errors */
-    int         nDevStatPercentUsed;       /* Page 07h, offset 0x08: SSD percentage used 0..100 (-1 if not reported) */
+    int         nDevStatPercentUsed;       /* Page 07h, offset 0x08: percent used 0..255 (-1 if not reported) */
     /* Seagate FARM (Field Accessible Reliability Metrics) telemetry (Log 0xA6) */
     BOOL        bFarmLogSupported;
     DWORD       dwFarmMajorVersion;
@@ -690,6 +696,8 @@ typedef struct _DRIVE_INFO {
     char        szFarmAssemblyDate[8];     /* Factory assembly date (YYWW), e.g. "1836" */
     /* SCSI / Miniport port number (corresponds to \Device\RaidPortN), -1 if unknown */
     int         nScsiPort;
+    /* Phy on that port. -1 if this drive is not reached through CSMI. */
+    int         nCsmiPhy;
     /* Windows Storage Event Log statistics (last 30 days) */
     STORAGE_EVENT_STATS eventStats;
     /* Filesystem volume partitions and TRIM status */
@@ -870,10 +878,18 @@ BOOL  IsShockSensorAttr(BYTE bID);
 /* SSD-specific analysis */
 void  ExtractSSDIndicators(DRIVE_INFO* pInfo);
 
+typedef void (*PFN_SCAN_PROGRESS)(const DRIVE_INFO* pDrives, int nFound,
+                                  int nCurrentPhysDrive, void* pUser);
+
 int   ScanDrives(DRIVE_INFO* pDrives, int nMaxDrives);
 int   ScanDrivesEx(DRIVE_INFO* pDrives, int nMaxDrives,
                    const DRIVE_INFO* pPrevDrives, int nPrevCount,
                    BOOL bBackground);
+int   ScanDrivesWithProgress(DRIVE_INFO* pDrives, int nMaxDrives,
+                             const DRIVE_INFO* pPrevDrives, int nPrevCount,
+                             BOOL bBackground,
+                             PFN_SCAN_PROGRESS pfnProgress, void* pUser);
+BOOL  AtaErrorLooksLikeTimeout(DWORD dwErr, DWORD dwElapsedMs);
 
 /* Power mode queries (ATA CHECK POWER MODE 0xE5) and Standby Awareness */
 int   AtaCheckPowerMode(HANDLE hDrive);
@@ -885,6 +901,8 @@ BOOL  DriveIsSleeping(int nPowerMode);
  * known NVMe/SATA enclosure bridge. Used to skip SAT/vendor SMART retries. */
 BOOL  UsbBridgeLooksLikeEnclosure(const DRIVE_INFO* p);
 BOOL  IsLikelyUsbFlashDrive(const DRIVE_INFO* pInfo);
+BOOL  IsUsbBridgeNoMedia(const DRIVE_INFO* pInfo);
+BOOL  IsPhisonRomMode(const DRIVE_INFO* pInfo);
 
 /* Utilities */
 void  FormatSize(DWORD dwMB, char* szBuf, int nBufLen);
@@ -905,6 +923,8 @@ BOOL RemapRawIsFlyingHours(const DRIVE_INFO* pInfo, const BYTE* pRaw);
 DWORD    SeagateRateOps(const BYTE* pRaw);
 unsigned SeagateRateErrs(const BYTE* pRaw);
 BOOL     UseSeagateRateRaw(const DRIVE_INFO* pInfo);
+/* 188 Command Timeout: 3 words (total, >5 s, >7.5 s). */
+void     FormatCommandTimeout(const BYTE* pRaw, char* szBuf, int nBufLen);
 /* MKP-521: bytes [1:0] max, [3:2] average. If the average half is larger,
  * this firmware stored them the other way (S9FM). */
 void     PhisonMaxAvgHalves(unsigned raw32, unsigned* mx, unsigned* avg);
@@ -1041,8 +1061,9 @@ BOOL IsSmi225xFamily(const DRIVE_INFO* p);
 
 #define PROF_FW_NONE    0
 #define PROF_FW_SUBSTR  1
-#define PROF_FW_SMI225  2  /* letter, four digits, letter, digit; not U11/U10/S11 */
+#define PROF_FW_SMI225  2  /* letter, four digits, letter, digit; not U11/U10/T07 */
 #define PROF_FW_VE      3  /* VE plus a digit */
+#define PROF_FW_AP      4  /* AP plus a digit (Apacer AP* firmware) */
 
 /* One declarative attribute row. id 0 ends the table.
  * A name is optional. altUnless: when that id is absent, the alt name is used. */

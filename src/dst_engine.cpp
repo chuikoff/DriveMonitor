@@ -60,7 +60,7 @@ BOOL DstAbortSelfTest(HANDLE hDrive, DRIVE_INFO* pInfo, char* szErr, int nErrLen
     if (!pInfo) return FALSE;
 
     if (pInfo->bIsNVMe) {
-        if (!NvmeSendDeviceSelfTest(hDrive, 0)) {
+        if (!NvmeSendDeviceSelfTest(hDrive, 0x0F)) {
             if (szErr) safe_snprintf_n(szErr, nErrLen, "%s", TN("Не удалось прервать тест NVMe", "Failed to abort NVMe self-test"));
             return FALSE;
         }
@@ -72,6 +72,30 @@ BOOL DstAbortSelfTest(HANDLE hDrive, DRIVE_INFO* pInfo, char* szErr, int nErrLen
     }
     pInfo->bSelfTestRunning = FALSE;
     return TRUE;
+}
+
+static BOOL DstReadCsmiSelfTest(DRIVE_INFO* pInfo)
+{
+    BYTE page[512];
+    int idx;
+    if (!pInfo || pInfo->eAccessMethod != SMART_ACCESS_CSMI) return FALSE;
+    if (!CsmiReadSmartLog(pInfo, SMART_LOG_COMP_SELF_TEST, page)) return FALSE;
+    memcpy(&pInfo->selfTestLog, page, sizeof(pInfo->selfTestLog));
+    pInfo->bGotSelfTestLog = TRUE;
+    idx = (pInfo->selfTestLog.bMostRecentTestIndex >= 1 &&
+           pInfo->selfTestLog.bMostRecentTestIndex <= 21)
+          ? (int)(pInfo->selfTestLog.bMostRecentTestIndex - 1) : 0;
+    pInfo->nSelfTestStatus = pInfo->selfTestLog.stEntries[idx].bStatusByte;
+    return TRUE;
+}
+
+static BOOL DstReadAtaSelfTest(HANDLE hDrive, DRIVE_INFO* pInfo)
+{
+    if (DstReadCsmiSelfTest(pInfo)) return TRUE;
+    if (!hDrive || hDrive == INVALID_HANDLE_VALUE) return FALSE;
+    return GetSMARTSelfTestLog(hDrive, pInfo->nDriveIndex, pInfo) ||
+           GetSMARTSelfTestLogATAPassthrough(hDrive, pInfo) ||
+           GetSMARTSelfTestLogSAT(hDrive, pInfo);
 }
 
 BOOL DstPollProgress(HANDLE hDrive, DRIVE_INFO* pInfo, DST_PROGRESS* pProgress)
@@ -118,10 +142,7 @@ BOOL DstPollProgress(HANDLE hDrive, DRIVE_INFO* pInfo, DST_PROGRESS* pProgress)
         }
         return FALSE;
     } else {
-        /* ATA: read attribute sector or self-test log */
-        if (GetSMARTSelfTestLog(hDrive, pInfo->nDriveIndex, pInfo) ||
-            GetSMARTSelfTestLogATAPassthrough(hDrive, pInfo) ||
-            GetSMARTSelfTestLogSAT(hDrive, pInfo)) {
+        if (DstReadAtaSelfTest(hDrive, pInfo)) {
             int idx = (pInfo->selfTestLog.bMostRecentTestIndex >= 1 && pInfo->selfTestLog.bMostRecentTestIndex <= 21)
                       ? (int)(pInfo->selfTestLog.bMostRecentTestIndex - 1) : 0;
             BYTE bSt = pInfo->selfTestLog.stEntries[idx].bStatusByte;
@@ -146,14 +167,15 @@ BOOL DstPollProgress(HANDLE hDrive, DRIVE_INFO* pInfo, DST_PROGRESS* pProgress)
 
 BOOL DstQueryAtaLogs(HANDLE hDrive, DRIVE_INFO* pInfo)
 {
+    BOOL bLog1 = FALSE;
     if (!pInfo) return FALSE;
-    BOOL bLog1 = GetSMARTErrorLog(hDrive, pInfo->nDriveIndex, pInfo) ||
-                 GetSMARTErrorLogATAPassthrough(hDrive, pInfo) ||
-                 GetSMARTErrorLogSAT(hDrive, pInfo);
-    BOOL bLog6 = GetSMARTSelfTestLog(hDrive, pInfo->nDriveIndex, pInfo) ||
-                 GetSMARTSelfTestLogATAPassthrough(hDrive, pInfo) ||
-                 GetSMARTSelfTestLogSAT(hDrive, pInfo);
-    return bLog1 || bLog6;
+    /* Error log struct is not 512 bytes. Do not copy a CSMI sector into it. */
+    if (hDrive && hDrive != INVALID_HANDLE_VALUE) {
+        bLog1 = GetSMARTErrorLog(hDrive, pInfo->nDriveIndex, pInfo) ||
+                GetSMARTErrorLogATAPassthrough(hDrive, pInfo) ||
+                GetSMARTErrorLogSAT(hDrive, pInfo);
+    }
+    return bLog1 || DstReadAtaSelfTest(hDrive, pInfo);
 }
 
 BOOL DstQueryNvmeLogs(HANDLE hDrive, DRIVE_INFO* pInfo)
@@ -199,9 +221,18 @@ int DstFormatSelfTestHistory(const DRIVE_INFO* pInfo, char* szOut, int nOutLen)
 
     if (pInfo->bIsNVMe) {
         if (!pInfo->bGotNvmeSelfTestLog) {
-            APPEND_FORMAT(szOut, nOutLen, pos,
-                "%s\r\n", TN("Журнал самотестирования NVMe не поддерживается данным накопителем.",
-                             "NVMe self-test log is not supported by this drive."));
+            if (pInfo->bSelfTestSupported) {
+                APPEND_FORMAT(szOut, nOutLen, pos,
+                    "%s\r\n%s\r\n",
+                    TN("Журнал самопроверок NVMe пуст или не был возвращён драйвером (тесты ещё не запускались).",
+                       "NVMe self-test log is empty or was not returned by driver (no tests have been run yet)."),
+                    TN("Для запуска диагностики выберите 'Короткий тест (~2 мин)' или 'Расширенный тест' и нажмите кнопку запуска.",
+                       "To run diagnostics, select 'Short Test (~2 min)' or 'Extended Test' and click start."));
+            } else {
+                APPEND_FORMAT(szOut, nOutLen, pos,
+                    "%s\r\n", TN("Журнал самотестирования NVMe не поддерживается данным накопителем (OACS bit 4 = 0).",
+                                 "NVMe self-test log is not supported by this drive (OACS bit 4 = 0)."));
+            }
             return pos;
         }
 
@@ -216,7 +247,7 @@ int DstFormatSelfTestHistory(const DRIVE_INFO* pInfo, char* szOut, int nOutLen)
                 "%s\r\n%s\r\n",
                 TN("Журнал самопроверок NVMe пуст (тесты ещё не запускались на этом накопителе).",
                    "NVMe self-test log is empty (no tests have been run on this drive)."),
-                TN("Для запуска диагностики выберите 'Короткий тест DST' или 'Расширенный тест' и нажмите 'Запустить'.",
+                    TN("Для запуска диагностики выберите 'Короткий тест' или 'Расширенный тест' и нажмите кнопку запуска.",
                    "To run diagnostics, select 'Short DST' or 'Extended Test' and click 'Start'."));
             return pos;
         }
@@ -253,9 +284,18 @@ int DstFormatSelfTestHistory(const DRIVE_INFO* pInfo, char* szOut, int nOutLen)
         }
     } else {
         if (!pInfo->bGotSelfTestLog) {
-            APPEND_FORMAT(szOut, nOutLen, pos,
-                "%s\r\n", TN("Журнал самотестирования SMART не поддерживается накопителем или контроллером.",
-                             "SMART self-test log is not supported by drive or controller."));
+            if (pInfo->bSelfTestSupported) {
+                APPEND_FORMAT(szOut, nOutLen, pos,
+                    "%s\r\n%s\r\n",
+                    TN("Журнал самопроверок SMART пуст или не был возвращён контроллером (тесты ещё не запускались).",
+                       "SMART self-test log is empty or was not returned by controller (no tests have been run yet)."),
+                    TN("Для запуска диагностики выберите 'Короткий тест' или 'Расширенный тест' и нажмите кнопку запуска.",
+                       "To run diagnostics, select 'Short Test' or 'Extended Test' and click start."));
+            } else {
+                APPEND_FORMAT(szOut, nOutLen, pos,
+                    "%s\r\n", TN("Журнал самотестирования SMART не поддерживается накопителем (Identify word 84/87).",
+                                 "SMART self-test log is not supported by drive (Identify word 84/87)."));
+            }
             return pos;
         }
 
@@ -271,7 +311,7 @@ int DstFormatSelfTestHistory(const DRIVE_INFO* pInfo, char* szOut, int nOutLen)
                 "%s\r\n%s\r\n",
                 TN("Журнал самопроверок SMART пуст (тесты ещё не запускались на этом накопителе).",
                    "SMART self-test log is empty (no tests have been run on this drive)."),
-                TN("Для запуска диагностики выберите 'Короткий тест DST' или 'Расширенный тест' и нажмите 'Запустить'.",
+                    TN("Для запуска диагностики выберите 'Короткий тест' или 'Расширенный тест' и нажмите кнопку запуска.",
                    "To run diagnostics, select 'Short DST' or 'Extended Test' and click 'Start'."));
             return pos;
         }
@@ -335,8 +375,8 @@ int DstFormatErrorLogHistory(const DRIVE_INFO* pInfo, char* szOut, int nOutLen)
     if (pInfo->bIsNVMe) {
         if (!pInfo->bGotNvmeErrorLog) {
             APPEND_FORMAT(szOut, nOutLen, pos,
-                "%s\r\n", TN("Журнал аппаратных ошибок NVMe не поддерживается контроллером.",
-                             "NVMe error log is not supported by controller."));
+                "%s\r\n", TN("Журнал аппаратных ошибок NVMe не был возвращён контроллером или драйвером.",
+                             "NVMe hardware error log was not returned by controller or driver."));
             return pos;
         }
 
@@ -373,8 +413,8 @@ int DstFormatErrorLogHistory(const DRIVE_INFO* pInfo, char* szOut, int nOutLen)
     } else {
         if (!pInfo->bGotErrorLog) {
             APPEND_FORMAT(szOut, nOutLen, pos,
-                "%s\r\n", TN("Журнал аппаратных ошибок интерфейса ATA не поддерживается.",
-                             "ATA hardware error log is not supported."));
+                "%s\r\n", TN("Журнал аппаратных ошибок интерфейса ATA не был возвращён накопителем.",
+                             "ATA hardware error log was not returned by drive."));
             return pos;
         }
         if (pInfo->nErrorLogCount == 0) {

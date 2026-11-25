@@ -76,8 +76,9 @@
 #define IDM_SELF_TEST        2043
 #define IDT_HOTPLUG          3002
 #define IDT_MONITOR          3003
-#define WM_APP_REFRESH_DONE  (WM_APP + 1)
-#define WM_TRAYICON          (WM_APP + 2)
+#define WM_APP_REFRESH_DONE     (WM_APP + 1)
+#define WM_TRAYICON             (WM_APP + 2)
+#define WM_APP_REFRESH_PROGRESS (WM_APP + 3)
 #define DRIVE_BTN_H    56
 #define DRIVE_BTN_GAP   6
 #define DRIVE_BTN_PANEL_W 200

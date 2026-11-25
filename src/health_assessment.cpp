@@ -1,4 +1,4 @@
-﻿/* DriveMonitor - health assessment and SSD indicators. GPL-2.0-or-later. See LICENSE. */
+/* DriveMonitor - health assessment and SSD indicators. GPL-2.0-or-later. See LICENSE. */
 #include "smart_internal.h"
 
 /* ============================================================
@@ -66,11 +66,12 @@ static int AttrRawOrNeg1(const DRIVE_INFO* pInfo, BYTE id)
                 else
                     v = 0;
             } else if (id == 0xC0) {
+                int sem = PROF_SEM_NONE, enc = PROF_ENC_NONE;
                 unsigned long dw = (unsigned long)raw[0] | ((unsigned long)raw[1] << 8) |
                                   ((unsigned long)raw[2] << 16) | ((unsigned long)raw[3] << 24);
                 if (((dw >> 16) & 0xFFFFu) == (dw & 0xFFFFu) && (dw & 0xFFFFu) > 0)
                     v = (unsigned __int64)(dw & 0xFFFFu);
-                else if (pInfo && (pInfo->eVendor == VENDOR_TOSHIBA || pInfo->eVendor == VENDOR_KIOXIA) && dw > 0xFFFFu)
+                else if (ProfileLookup(pInfo, id, &sem, &enc) && enc == PROF_ENC_LO16)
                     v = (unsigned __int64)(dw & 0xFFFFu);
                 else {
                     GetAttrDecode(id, pInfo, &dec);
@@ -439,7 +440,9 @@ void FormatDriveSummary(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen)
         pInfo->szEvidence[0] ? pInfo->szEvidence : "OK");
     if (pInfo->bCounterfeitSuspected) {
         char szAlert[256];
-        safe_snprintf(szAlert, "Authenticity: ⚠️ SUSPECTED COUNTERFEIT (%s)\r\n", GetCounterfeitReason(pInfo));
+        const char* pszKind = (pInfo->nAnomalyType == ANOMALY_REFLASHED_REPAIRED)
+                              ? "REFLASHED / MPTOOL" : "SUSPECTED COUNTERFEIT";
+        safe_snprintf(szAlert, "Authenticity: ⚠️ %s (%s)\r\n", pszKind, GetCounterfeitReason(pInfo));
         size_t curLen = strlen(szBuf);
         if (curLen < (size_t)nBufLen - strlen(szAlert) - 1) {
             safe_snprintf_n(szBuf + curLen, nBufLen - (int)curLen, "%s", szAlert);
@@ -724,8 +727,18 @@ static void HddWearFlags(const DRIVE_INFO* p, HDD_WEAR* w)
     w7   = AttrWorstOrNeg1(p, 0x07);
     v193 = AttrValueOrNeg1(p, 0xC1);
     w->bId7      = HddRateNearThresh(v7, w7, FindThreshold(p, 0x07));
-    w->bId193Val = (v193 >= 0 && v193 <= 15);
-    w->bId193Raw = (p->nLoadUnload >= 300000);
+    if (UseSeagateRateRaw(p)) {
+        /* Seagate C1h normalized value scales as 100 - (RAW / 2000), hitting 1 at 200,000 cycles
+         * with threshold 0, while Seagate rates modern drives for 600,000 load/unload cycles.
+         * The normalized value does not represent wear exhaustion and is advisory only. */
+        w->bId193Val = FALSE;
+        w->bId193Raw = (p->nLoadUnload >= 600000);
+    } else {
+        w->bId193Val = (v193 >= 0 && v193 <= 15);
+        w->bId193Raw = (p->nLoadUnload >= 300000);
+    
+    }
+
 }
 
 void FormatHddObservePrompt(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen)
@@ -747,8 +760,8 @@ void FormatHddObservePrompt(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen)
         return;
     }
     safe_snprintf_n(szBuf, nBufLen, "%s", TN(
-        "Есть факторы риска. Нажмите на состояние.",
-        "There are risk factors. Click the status for details."));
+        "Есть факторы риска. Нажмите на оценку для подробностей.",
+        "There are risk factors. Click assessment badge for details."));
 }
 
 void FormatHddCautionPrompt(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen)
@@ -760,8 +773,8 @@ void FormatHddCautionPrompt(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen)
     cau = HealthRank(HEALTH_STATUS_CAUTION);
     if (HealthRank(pInfo->eReliability) >= cau) {
         safe_snprintf_n(szBuf, nBufLen, "%s", TN(
-            "Есть признаки деградации носителя. Нажмите на состояние.",
-            "There are signs of media degradation. Click the status for details."));
+            "Есть признаки деградации носителя. Нажмите на оценку для подробностей.",
+            "There are signs of media degradation. Click assessment badge for details."));
         return;
     }
     if (pInfo->bWriteProtected && !DriveOwnReadOnly(pInfo)) {
@@ -777,15 +790,15 @@ void FormatHddCautionPrompt(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen)
     }
     if (pInfo->bLinkDegraded) {
         safe_snprintf_n(szBuf, nBufLen, "%s", TN(
-            "Интерфейс: деградация линка шины (снижена скорость подключения). Нажмите на состояние.",
-            "Interface: link degradation (negotiated speed reduced). Click status for details."));
+            "Интерфейс: деградация линка шины (снижена скорость подключения). Нажмите на оценку для подробностей.",
+            "Interface: link degradation (negotiated speed reduced). Click assessment badge for details."));
         return;
     }
     if (HealthRank(pInfo->eInterface) >= cau) {
         if (pInfo->bCounterfeitSuspected) {
             safe_snprintf_n(szBuf, nBufLen, "%s", TN(
-                "⚠️ Подозрение на подделку; проблемы интерфейса (кабель/питание). Нажмите на состояние.",
-                "⚠️ Suspected counterfeit; interface issues (cable/power). Click status for details."));
+                "⚠️ Подозрение на подделку; проблемы интерфейса (кабель/питание). Нажмите на оценку для подробностей.",
+                "⚠️ Suspected counterfeit; interface issues (cable/power). Click assessment badge for details."));
         } else {
             safe_snprintf_n(szBuf, nBufLen, "%s", TN(
                 "Проблема интерфейса: CRC, таймауты или повторы раскрутки. Носитель в норме — кабель, контакт или питание.",
@@ -807,13 +820,13 @@ void FormatHddCautionPrompt(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen)
     }
     if (pInfo->bCounterfeitSuspected) {
         safe_snprintf_n(szBuf, nBufLen, "%s", TN(
-            "⚠️ Подозрение на поддельный/перемаркированный накопитель! Нажмите на состояние.",
-            "⚠️ Suspected counterfeit or relabeled drive! Click status for details."));
+            "⚠️ Подозрение на поддельный/перемаркированный накопитель! Нажмите на оценку для подробностей.",
+            "⚠️ Suspected counterfeit or relabeled drive! Click assessment badge for details."));
         return;
     }
     safe_snprintf_n(szBuf, nBufLen, "%s", TN(
-        "Есть признаки, требующие наблюдения. Нажмите на состояние.",
-        "There are signs that need watching. Click the status for details."));
+        "Есть признаки, требующие наблюдения. Нажмите на оценку для подробностей.",
+        "There are signs that need watching. Click assessment badge for details."));
 }
 
 void FormatSsdCautionPrompt(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen)
@@ -825,8 +838,8 @@ void FormatSsdCautionPrompt(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen)
     cau = HealthRank(HEALTH_STATUS_CAUTION);
     if (HealthRank(pInfo->eReliability) >= cau) {
         safe_snprintf_n(szBuf, nBufLen, "%s", TN(
-            "Есть признаки деградации носителя. Нажмите на состояние.",
-            "There are signs of media degradation. Click the status for details."));
+            "Есть признаки деградации носителя. Нажмите на оценку для подробностей.",
+            "There are signs of media degradation. Click assessment badge for details."));
         return;
     }
     if (pInfo->bWriteProtected && !DriveOwnReadOnly(pInfo)) {
@@ -842,15 +855,15 @@ void FormatSsdCautionPrompt(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen)
     }
     if (pInfo->bLinkDegraded) {
         safe_snprintf_n(szBuf, nBufLen, "%s", TN(
-            "Интерфейс: деградация линка шины (снижена скорость подключения). Нажмите на состояние.",
-            "Interface: link degradation (negotiated speed reduced). Click status for details."));
+            "Интерфейс: деградация линка шины (снижена скорость подключения). Нажмите на оценку для подробностей.",
+            "Interface: link degradation (negotiated speed reduced). Click assessment badge for details."));
         return;
     }
     if (!pInfo->bIsNVMe && HealthRank(pInfo->eInterface) >= cau) {
         if (pInfo->bCounterfeitSuspected) {
             safe_snprintf_n(szBuf, nBufLen, "%s", TN(
-                "⚠️ Подозрение на подделку; проблемы интерфейса (кабель/питание). Нажмите на состояние.",
-                "⚠️ Suspected counterfeit; interface issues (cable/power). Click status for details."));
+                "⚠️ Подозрение на подделку; проблемы интерфейса (кабель/питание). Нажмите на оценку для подробностей.",
+                "⚠️ Suspected counterfeit; interface issues (cable/power). Click assessment badge for details."));
         } else {
             safe_snprintf_n(szBuf, nBufLen, "%s", TN(
                 "Проблема интерфейса: CRC или таймауты. NAND в норме — кабель, контакт или питание.",
@@ -872,19 +885,19 @@ void FormatSsdCautionPrompt(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen)
     }
     if (pInfo->trimInfo.bQueried && pInfo->trimInfo.bPanicLowSpace) {
         safe_snprintf_n(szBuf, nBufLen, "%s", TN(
-            "Критический дефицит свободного места на SSD! Нажмите на состояние.",
-            "Critical free space deficit on SSD! Click status for details."));
+            "Критический дефицит свободного места на SSD! Нажмите на оценку для подробностей.",
+            "Critical free space deficit on SSD! Click assessment badge for details."));
         return;
     }
     if (pInfo->bCounterfeitSuspected) {
         safe_snprintf_n(szBuf, nBufLen, "%s", TN(
-            "⚠️ Подозрение на поддельный/перемаркированный накопитель! Нажмите на состояние.",
-            "⚠️ Suspected counterfeit or relabeled drive! Click status for details."));
+            "⚠️ Подозрение на поддельный/перемаркированный накопитель! Нажмите на оценку для подробностей.",
+            "⚠️ Suspected counterfeit or relabeled drive! Click assessment badge for details."));
         return;
     }
     safe_snprintf_n(szBuf, nBufLen, "%s", TN(
-        "Есть признаки, требующие наблюдения. Нажмите на состояние.",
-        "There are signs that need watching. Click the status for details."));
+        "Есть признаки, требующие наблюдения. Нажмите на оценку для подробностей.",
+        "There are signs that need watching. Click assessment badge for details."));
 }
 
 /* Confirmed side axis into the headline. CAUTION or worse becomes
@@ -953,11 +966,12 @@ static void AssessHddHealth(DRIVE_INFO* pInfo)
     {
         HDD_WEAR wear;
         int v193 = AttrValueOrNeg1(pInfo, 0xC1);
+        BYTE thresh193 = FindThreshold(pInfo, 0xC1);
         BOOL bSeekWorn, bParkLow, bParkBad;
         HddWearFlags(pInfo, &wear);
         bSeekWorn = wear.bId7;
         bParkLow  = wear.bId193Val || wear.bId193Raw;
-        bParkBad  = (v193 >= 0 && v193 <= 5);
+        bParkBad  = (thresh193 > 0 && v193 <= (int)thresh193);
 
     /* Media and interface ranks come from profile rules. Prefail and a
      * failed self-test still sit on top of that rank. */
@@ -1795,8 +1809,11 @@ void AssessDriveHealth(DRIVE_INFO* pInfo)
         pInfo->eHealthStatus = WorstHealth(pInfo->eHealthStatus, HEALTH_STATUS_CAUTION);
         size_t len = strlen(pInfo->szEvidence);
         if (len < sizeof(pInfo->szEvidence) - 50) {
+            const char* pszTag = (pInfo->nAnomalyType == ANOMALY_REFLASHED_REPAIRED)
+                ? TN("  [ПЕРЕПРОШИТ / MPTOOL]", "  [REFLASHED / MPTOOL]")
+                : TN("  [ПРИЗНАКИ РЕМАРКИРОВАНИЯ/ПОДДЕЛКИ]", "  [SUSPECTED RELABELED/COUNTERFEIT]");
             safe_snprintf_n(pInfo->szEvidence + len, (int)(sizeof(pInfo->szEvidence) - len),
-                "%s", TN("  [ПРИЗНАКИ РЕМАРКИРОВАНИЯ/ПОДДЕЛКИ]", "  [SUSPECTED RELABELED/COUNTERFEIT]"));
+                "%s", pszTag);
         }
     }
 }
@@ -1950,12 +1967,22 @@ static void LectureAddTrimAndVolumes(char* szBuf, int nBufLen, const DRIVE_INFO*
                 LectureAdd(szBuf, nBufLen, szVolLine);
                 continue;
             }
-            safe_snprintf(szVolLine, "    [%s] %s (%s) — %.1f GB свободно из %.1f GB (%.1f%%)\r\n",
+            safe_snprintf(szVolLine, "    [%s] %s (%s) — %.1f GB %s %.1f GB (%.1f%%)\r\n",
                 v->szLetter[0] ? v->szLetter : "?",
                 v->szFileSystem[0] ? v->szFileSystem : "RAW",
                 v->bTrimSupportedFs ? TN("TRIM активен", "TRIM active") : TN("НЕТ TRIM ⚠️", "NO TRIM ⚠️"),
-                flFreeGb, flTotalGb, (double)v->fFreePercent);
+                flFreeGb, TN("свободно из", "free of"), flTotalGb, (double)v->fFreePercent);
             LectureAdd(szBuf, nBufLen, szVolLine);
+        }
+        if (pInfo->trimInfo.nVolumeCount > 1 && pInfo->trimInfo.qwTotalBytesAll > 0) {
+            double flFreeTotGb = (double)pInfo->trimInfo.qwFreeBytesAll / (1024.0 * 1024.0 * 1024.0);
+            double flTotAllGb  = (double)pInfo->trimInfo.qwTotalBytesAll / (1024.0 * 1024.0 * 1024.0);
+            char szTotLine[256];
+            safe_snprintf(szTotLine, "    %s: %.1f GB %s %.1f GB (%.1f%%)\r\n",
+                TN("Всего по разделам", "Total across volumes"),
+                flFreeTotGb, TN("свободно из", "free of"), flTotAllGb,
+                (double)pInfo->trimInfo.fTotalFreePercent);
+            LectureAdd(szBuf, nBufLen, szTotLine);
         }
     }
 }
@@ -1970,18 +1997,18 @@ static void LectureAddCounterfeit(char* szBuf, int nBufLen, const DRIVE_INFO* pI
             "\r\n⚠️ WARNING: REFLASHED / REPAIRED DRIVE DETECTED (MPTool)!\r\n"));
         LectureAddF(szBuf, nBufLen, TN(
             "  Причина: %s\r\n"
-            "  Пояснение: Накопитель имеет стандартный шаблон серийного номера сервисных прошивальщиков.\r\n"
-            "             Это типично для дисков, восстановленных после программного сбоя (re-MP),\r\n"
-            "             либо собранных на стороннем производстве. Сам накопитель может быть оригинальным,\r\n"
-            "             но заводские счётчики SMART сброшены.\r\n"
+            "  Пояснение: Накопитель содержит характерный шаблон сервисного прошивальщика (обезличенное имя\r\n"
+            "             модели/прошивки или шаблонный серийный номер). Это типично для дисков,\r\n"
+            "             восстановленных после программного сбоя (re-MP), либо собранных на стороннем\r\n"
+            "             производстве. Сам накопитель может быть оригинальным, но счётчики SMART сброшены.\r\n"
             "  Рекомендация: Диск может функционировать нормально, однако рекомендуется регулярно\r\n"
-            "                создавать резервные копии и выполнить проверку буфера DRAM (кнопка «Тест DRAM»).\r\n",
+            "                создавать резервные копии и контролировать стабильность работы накопителя.\r\n",
             "  Reason: %s\r\n"
-            "  Explanation: Drive carries a standard factory flasher (MPTool) serial number template.\r\n"
-            "               This is common for drives recovered after firmware crash (re-MP) or third-party\r\n"
-            "               assembly. The hardware may be authentic, but SMART counters were cleared.\r\n"
-            "  Recommendation: The drive may function normally, but regular backups are advised.\r\n"
-            "                  Run DRAM buffer verification (button 'DRAM Test').\r\n"),
+            "  Explanation: Drive carries a service flasher (MPTool) signature (generic model/reference\r\n"
+            "               firmware or placeholder serial template). This is common for drives recovered\r\n"
+            "               after firmware crash (re-MP) or third-party assembly. Hardware may be authentic,\r\n"
+            "               but SMART counters were cleared.\r\n"
+            "  Recommendation: The drive may function normally, but regular backups are advised.\r\n"),
             GetCounterfeitReason(pInfo));
         return;
     }
@@ -1994,12 +2021,12 @@ static void LectureAddCounterfeit(char* szBuf, int nBufLen, const DRIVE_INFO* pI
             "  Причина: %s\r\n"
             "  Риск: Накопитель эксплуатировался длительное время, но счётчики наработки SMART были\r\n"
             "        принудительно сброшены перед перепродажей. Аппаратный лог зафиксировал реальную наработку.\r\n"
-            "  Рекомендация: Провести полный тест чтения поверхности (кнопка «Тест чтения»),\r\n"
-            "                запустить расширенный самотест DST («Тест DST») и не доверять диску ценные данные.\r\n",
+            "  Рекомендация: Провести полный тест чтения поверхности (кнопка «Тест чтения»)\r\n"
+            "                и не доверять диску ценные данные без внешних резервных копий.\r\n",
             "  Reason: %s\r\n"
             "  Risk: The drive has significant operational history, but SMART runtime counters\r\n"
             "        were cleared before resale. Internal telemetry recorded real operating hours.\r\n"
-            "  Recommendation: Perform full surface read test ('Read Test'), run Extended DST ('Self-Test')\r\n"
+            "  Recommendation: Perform full surface read test (\x27Read Test\x27)\r\n"
             "                  and avoid storing critical data without external backups.\r\n"),
             GetCounterfeitReason(pInfo));
         return;
@@ -2013,11 +2040,11 @@ static void LectureAddCounterfeit(char* szBuf, int nBufLen, const DRIVE_INFO* pI
             "  Причина: %s\r\n"
             "  Риск: На диск нанесена маркировка одной модели/производителя, но микрокод и мотор\r\n"
             "        принадлежат другой платформе. Часто так маскируют списанные серверные диски.\r\n"
-            "  Рекомендация: Проверить подлинность по серийному номеру и запустить аппаратный самотест DST.\r\n",
+            "  Рекомендация: Проверить подлинность по серийному номеру на сайте производителя.\r\n",
             "  Reason: %s\r\n"
             "  Risk: The drive label claims one brand/model, but internal microcode and motor\r\n"
             "        belong to a different platform. Used to mask decommissioned server drives.\r\n"
-            "  Recommendation: Check serial on manufacturer site and run hardware DST.\r\n"),
+            "  Recommendation: Check serial number on manufacturer website.\r\n"),
             GetCounterfeitReason(pInfo));
         return;
     }
@@ -2030,12 +2057,12 @@ static void LectureAddCounterfeit(char* szBuf, int nBufLen, const DRIVE_INFO* pI
         "  Риск: На накопителе со сброшенным SMART или поддельным ярлыком могут скрываться\r\n"
         "        списанный серверный диск с огромной наработкой или дешёвый ненадёжный контроллер.\r\n"
         "  Рекомендация: Проверить подлинность по серийному номеру на сайте производителя,\r\n"
-        "                провести полный тест поверхности и верификацию буфера DRAM (Ctrl+D).\r\n",
+            "                провести полный тест поверхности (кнопка «Тест чтения»).\r\n",
         "  Reason: %s\r\n"
         "  Risk: A drive with reset SMART or forged label may conceal a decommissioned\r\n"
         "        server disk with massive operating hours or a cheap unreliable controller.\r\n"
         "  Recommendation: Verify serial number on manufacturer official website,\r\n"
-        "                  run full surface test and DRAM verification (Ctrl+D).\r\n"),
+            "                  run full surface read test (\x27Read Test\x27).\r\n"),
         GetCounterfeitReason(pInfo));
 }
 
@@ -2246,7 +2273,8 @@ static void LectureAddParkCause(char* szBuf, int nBufLen, const DRIVE_INFO* pInf
     int v193;
     if (!pInfo) return;
     v193 = AttrValueOrNeg1(pInfo, 0xC1);
-    if (v193 < 0 || v193 > 5) return;
+    BYTE thresh193 = FindThreshold(pInfo, 0xC1);
+    if (v193 < 0 || thresh193 == 0 || v193 > (int)thresh193) return;
     if (pInfo->nLoadUnload >= 0)
         LectureAddF(szBuf, nBufLen, TN(
             "Парковка головок: значение %d, циклов %d. Это механика, не поверхность.\r\n",
@@ -2259,6 +2287,136 @@ static void LectureAddParkCause(char* szBuf, int nBufLen, const DRIVE_INFO* pInf
             v193);
 }
 
+static void LectureAddSataHostCap(char* szBuf, int nBufLen, const DRIVE_INFO* p)
+{
+    BOOL clean;
+    if (!p || !p->bSataHostCapped || p->bLinkDegraded) return;
+    clean = (p->nCrcErrors <= 0) &&
+            !(p->bSataPhyLogSupported &&
+              (p->nPhyCrcErrorsH2D > 0 || p->nPhyCommandIcrcErrors > 0));
+    if (DriveIsHdd(p)) {
+        if (clean) {
+            LectureAdd(szBuf, nBufLen, TN(
+                "Шина SATA: согласован режим 3 Гбит/с (накопитель поддерживает 6 Гбит/с). "
+                "Ошибок CRC нет (0) — режим обусловлен возможностями порта материнской платы (SATA II) либо чипсета. "
+                "Для механического HDD скорость шины 3 Гбит/с полностью перекрывает предельную скорость пластин (до ~200 МБ/с).\r\n",
+                "SATA bus: 3 Gb/s mode negotiated (drive supports 6 Gb/s). "
+                "No CRC errors (0) — negotiated mode is the motherboard SATA II port ceiling. "
+                "For a mechanical HDD, 3 Gb/s bandwidth easily exceeds the platter speed limit (up to ~200 MB/s).\r\n"));
+        } else {
+            LectureAdd(szBuf, nBufLen, TN(
+                "Шина SATA: согласован режим 3 Гбит/с (накопитель поддерживает 6 Гбит/с). "
+                "Режим обусловлен возможностями порта материнской платы (SATA II) либо чипсета. "
+                "Для механического HDD скорость шины 3 Гбит/с полностью перекрывает предельную скорость пластин (до ~200 МБ/с).\r\n",
+                "SATA bus: 3 Gb/s mode negotiated (drive supports 6 Gb/s). "
+                "The mode is the motherboard SATA II port ceiling. "
+                "For a mechanical HDD, 3 Gb/s bandwidth easily exceeds the platter speed limit (up to ~200 MB/s).\r\n"));
+        }
+    } else if (clean) {
+        LectureAdd(szBuf, nBufLen, TN(
+            "Шина SATA: согласован режим 3 Гбит/с (накопитель поддерживает 6 Гбит/с). "
+            "Ошибок CRC нет (0) — накопитель подключён к порту SATA II материнской платы. "
+            "Скорость ограничена пропускной способностью порта (~270 МБ/с), ошибок кабеля и интерфейса нет.\r\n",
+            "SATA bus: 3 Gb/s mode negotiated (drive supports 6 Gb/s). "
+            "No CRC errors (0) — drive is connected to a motherboard SATA II port. "
+            "Speed is capped by the port bandwidth (~270 MB/s); no cable or interface errors.\r\n"));
+    } else {
+        LectureAdd(szBuf, nBufLen, TN(
+            "Шина SATA: согласован режим 3 Гбит/с (накопитель поддерживает 6 Гбит/с). "
+            "Накопитель подключён к порту SATA II материнской платы. "
+            "Скорость ограничена пропускной способностью порта (~270 МБ/с).\r\n",
+            "SATA bus: 3 Gb/s mode negotiated (drive supports 6 Gb/s). "
+            "The drive is connected to a motherboard SATA II port. "
+            "Speed is capped by the port bandwidth (~270 MB/s).\r\n"));
+    }
+}
+
+static void LectureAddSmartUnavailableReason(const DRIVE_INFO* pInfo,
+                                           char* szBuf, int nBufLen,
+                                           BOOL bExpert)
+{
+    if (!pInfo || !szBuf || nBufLen <= 0) return;
+    if (LectureAddSmartDataError(pInfo, szBuf, nBufLen))
+        return;
+
+    if (IsUsbBridgeNoMedia(pInfo)) {
+        LectureAdd(szBuf, nBufLen, bExpert
+            ? TN("Накопитель за USB-мостом не обнаружен или не инициализирован (объём 0 МБ). "
+                 "Контроллер моста отвечает системе, но подключённый диск отсутствует или не отвечает. "
+                 "Без исходных данных оценка не ставится.\r\n",
+                 "The drive behind the USB bridge is not detected or not initialized (0 MB capacity). "
+                 "The bridge chip responds, but the attached disk is absent or unresponsive. "
+                 "No assessment without source data.\r\n")
+            : TN("Диск за USB-мостом не обнаружен или не отвечает (0 МБ). "
+                 "Без исходных данных оценка не ставится.\r\n",
+                 "The drive behind the USB bridge is absent or unresponsive (0 MB). "
+                 "No assessment without source data.\r\n"));
+        return;
+    }
+
+    if (IsPhisonRomMode(pInfo)) {
+        LectureAdd(szBuf, nBufLen, bExpert
+            ? TN("Накопитель работает в сервисном ROM-режиме контроллера Phison PS3111-S11 "
+                 "(основная прошивка не загружена / сбой транслятора, флеш-память не инициализирована, "
+                 "отображается фиктивный объём). SMART в ROM-режиме недоступен; оценка не ставится.\r\n",
+                 "The SSD is in Phison PS3111-S11 service ROM mode "
+                 "(main firmware not loaded / FTL fault, NAND not initialized, dummy capacity reported). "
+                 "SMART is unavailable in ROM mode; no assessment is made.\r\n")
+            : TN("Контроллер Phison в сервисном ROM-режиме (прошивка не загружена, SMART недоступен). "
+                 "Без исходных данных оценка не ставится.\r\n",
+                 "Phison controller in service ROM mode (firmware not loaded, SMART unavailable). "
+                 "No assessment without source data.\r\n"));
+        return;
+    }
+
+    if (pInfo->bIsUSB && IsLikelyUsbFlashDrive(pInfo)) {
+        LectureAdd(szBuf, nBufLen, bExpert
+            ? TN("SMART недоступен. Это USB-флешка: контроллер флешки обычно не отдаёт "
+                 "атрибуты SMART, поэтому состояние не оценивается. Числа здоровья не выдумываются.\r\n",
+                 "SMART is unavailable. This is a USB flash drive: the flash controller usually does not "
+                 "provide SMART attributes, so the condition is not assessed. Health figures are not invented.\r\n")
+            : TN("SMART недоступен. Это USB-флешка: контроллер обычно не отдаёт атрибуты SMART, "
+                 "поэтому состояние не оценивается. Процент здоровья не выдумывается.\r\n",
+                 "SMART is unavailable. This is a USB flash drive: the controller usually does not "
+                 "provide SMART attributes, so the condition is not assessed. A health percent is not invented.\r\n"));
+    } else if (pInfo->bIsUSB) {
+        LectureAdd(szBuf, nBufLen, bExpert
+            ? TN("SMART недоступен. USB-мост или корпус не пропускает команды SMART. "
+                 "Без исходных данных оценка не ставится — программа не подставляет фиктивные проценты.\r\n",
+                 "SMART is unavailable. The USB bridge or enclosure does not pass SMART commands. "
+                 "No assessment without source data — the program does not invent percentages.\r\n")
+            : TN("SMART недоступен. USB-мост или корпус не пропускает команды SMART. "
+                 "Без исходных данных оценка не ставится.\r\n",
+                 "SMART is unavailable. The USB bridge or enclosure does not pass SMART commands. "
+                 "No assessment without source data.\r\n"));
+    } else if (pInfo->bIsNVMe) {
+        LectureAddF(szBuf, nBufLen, bExpert
+            ? TN("Не удалось прочитать журнал здоровья NVMe (код ошибки Windows %lu). "
+                 "Возможные причины: нет прав администратора, драйвер не поддерживает запрос, "
+                 "или устройство занято. Без журнала здоровья проценты не выдумываются.\r\n",
+                 "Could not read the NVMe health log (Windows error %lu). "
+                 "Possible causes: not running as administrator, the driver does not support the request, "
+                 "or the device is busy. Percentages are not invented without the health log.\r\n")
+            : TN("Не удалось прочитать журнал здоровья NVMe (код ошибки Windows %lu). "
+                 "Без журнала оценка не ставится.\r\n",
+                 "Could not read the NVMe health log (Windows error %lu). "
+                 "No assessment without the log.\r\n"),
+            (unsigned long)pInfo->dwErrNvmeProtocol);
+    } else {
+        LectureAdd(szBuf, nBufLen, bExpert
+            ? TN("SMART недоступен. Без исходных данных оценка не ставится — "
+                 "программа не подставляет фиктивные проценты. Запустите программу "
+                 "от имени администратора и нажмите «Перечитать».\r\n",
+                 "SMART is unavailable. No assessment without source data — "
+                 "the program does not invent percentages. Run the program "
+                 "as administrator and press Reread.\r\n")
+            : TN("SMART недоступен. Без исходных данных оценка не ставится. "
+                 "Запустите программу от имени администратора и нажмите «Перечитать».\r\n",
+                 "SMART is unavailable. No assessment without source data. "
+                 "Run the program as administrator and press Reread.\r\n"));
+    }
+}
+
 static void FormatHddLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen)
 {
     int r, pend, u;
@@ -2269,11 +2427,7 @@ static void FormatHddLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
 
     if (!pInfo->bSMART_Supported) {
         LectureAddReadOnlyCause(szBuf, nBufLen, pInfo);
-        if (LectureAddSmartDataError(pInfo, szBuf, nBufLen))
-            return;
-        LectureAdd(szBuf, nBufLen, TN(
-            "SMART недоступен. Без исходных данных оценка не ставится.\r\n",
-            "SMART is unavailable. No assessment without source data.\r\n"));
+        LectureAddSmartUnavailableReason(pInfo, szBuf, nBufLen, FALSE);
         return;
     }
 
@@ -2589,6 +2743,7 @@ static void FormatHddLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
         LectureAddF(szBuf, nBufLen, TN("\r\nНаработка: %s\r\n", "\r\nPower-on: %s\r\n"), szPoh);
     }
     LectureAddCounterfeit(szBuf, nBufLen, pInfo);
+    LectureAddSataHostCap(szBuf, nBufLen, pInfo);
 }
 
 static void LectureAddPcieHostCap(char* szBuf, int nBufLen, const DRIVE_INFO* p)
@@ -2625,11 +2780,8 @@ static void FormatSsdLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
     if (!pInfo->bSMART_Supported) {
         LectureAddReadOnlyCause(szBuf, nBufLen, pInfo);
         LectureAddPcieHostCap(szBuf, nBufLen, pInfo);
-        if (LectureAddSmartDataError(pInfo, szBuf, nBufLen))
-            return;
-        LectureAdd(szBuf, nBufLen, TN(
-            "SMART недоступен. Без исходных данных оценка не ставится.\r\n",
-            "SMART is unavailable. No assessment without source data.\r\n"));
+        LectureAddSataHostCap(szBuf, nBufLen, pInfo);
+        LectureAddSmartUnavailableReason(pInfo, szBuf, nBufLen, FALSE);
         return;
     }
 
@@ -3036,6 +3188,7 @@ static void FormatSsdLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBuf
     }
 
     LectureAddPcieHostCap(szBuf, nBufLen, pInfo);
+    LectureAddSataHostCap(szBuf, nBufLen, pInfo);
 
     if (pInfo->nEndurancePercent >= 0)
         LectureAddF(szBuf, nBufLen, TN("\r\nРесурс: %d%%\r\n",
@@ -3083,34 +3236,7 @@ void FormatHealthLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen)
     LectureAddReadOnlyCause(szBuf, nBufLen, pInfo);
 
     if (!pInfo->bSMART_Supported) {
-        if (LectureAddSmartDataError(pInfo, szBuf, nBufLen))
-            return;
-        if (pInfo->bIsUSB && IsLikelyUsbFlashDrive(pInfo)) {
-            LectureAdd(szBuf, nBufLen, TN(
-                "SMART недоступен. Это USB-флешка: контроллер обычно не отдаёт атрибуты SMART, "
-                "поэтому состояние не оценивается. Процент здоровья не выдумывается.\r\n",
-                "SMART is unavailable. This is a USB flash drive: the controller usually does not "
-                "provide SMART attributes, so the condition is not assessed. A health percent is not invented.\r\n"));
-        } else if (pInfo->bIsUSB) {
-            LectureAdd(szBuf, nBufLen, TN(
-                "SMART недоступен. USB-мост или корпус не пропускает команды SMART. "
-                "Без исходных данных оценка не ставится.\r\n",
-                "SMART is unavailable. The USB bridge or enclosure does not pass SMART commands. "
-                "No assessment without source data.\r\n"));
-        } else if (pInfo->bIsNVMe) {
-            LectureAddF(szBuf, nBufLen, TN(
-                "Не удалось прочитать журнал здоровья NVMe (код ошибки Windows %lu). "
-                "Без журнала оценка не ставится.\r\n",
-                "Could not read the NVMe health log (Windows error %lu). "
-                "No assessment without the log.\r\n"),
-                (unsigned long)pInfo->dwErrNvmeProtocol);
-        } else {
-            LectureAdd(szBuf, nBufLen, TN(
-                "SMART недоступен. Без исходных данных оценка не ставится. "
-                "Запустите программу от имени администратора и нажмите «Перечитать».\r\n",
-                "SMART is unavailable. No assessment without source data. "
-                "Run the program as administrator and press Reread.\r\n"));
-        }
+        LectureAddSmartUnavailableReason(pInfo, szBuf, nBufLen, FALSE);
         return;
     }
 
@@ -3238,19 +3364,28 @@ void FormatHealthLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen)
         if (pInfo->eMechanics == HEALTH_STATUS_OBSERVE) {
             int n187o = AttrRawOrNeg1(pInfo, 0xBB);
             LectureAdd(szBuf, nBufLen, "\r\n");
-            if (n187o > 0)
+            if (pInfo->nGSenseEvents > 0) {
+                if (n187o > 0)
+                    LectureAddF(szBuf, nBufLen, TN(
+                        "G-Sense фиксирует удары и вибрацию. Счётчики 5/196/197/198 равны 0, "
+                        "но атрибут 187 = %d. Это отдельный счётчик, не доказательство, что удары повредили поверхность.\r\n",
+                        "G-Sense records shock and vibration. Counters 5/196/197/198 are 0, "
+                        "but attribute 187 is %d. That is a separate count, not proof the shocks damaged the surface.\r\n"),
+                        n187o);
+                else
+                    LectureAdd(szBuf, nBufLen, TN(
+                        "G-Sense фиксирует события, связанные с ударом/вибрацией. "
+                        "Признаков повреждения поверхности на текущем SMART-снимке нет: 5/196/197/198 = 0.\r\n",
+                        "G-Sense records shock or vibration. "
+                        "This SMART snapshot shows no surface damage: 5/196/197/198 = 0.\r\n"));
+            } else if (pInfo->nLoadUnload >= 0) {
                 LectureAddF(szBuf, nBufLen, TN(
-                    "G-Sense фиксирует удары и вибрацию. Счётчики 5/196/197/198 равны 0, "
-                    "но атрибут 187 = %d. Это отдельный счётчик, не доказательство, что удары повредили поверхность.\r\n",
-                    "G-Sense records shock and vibration. Counters 5/196/197/198 are 0, "
-                    "but attribute 187 is %d. That is a separate count, not proof the shocks damaged the surface.\r\n"),
-                    n187o);
-            else
-                LectureAdd(szBuf, nBufLen, TN(
-                    "G-Sense фиксирует события, связанные с ударом/вибрацией. "
-                    "Признаков повреждения поверхности на текущем SMART-снимке нет: 5/196/197/198 = 0.\r\n",
-                    "G-Sense records shock or vibration. "
-                    "This SMART snapshot shows no surface damage: 5/196/197/198 = 0.\r\n"));
+                    "Большое число циклов парковки головок: %d. "
+                    "Это естественный износ механики позиционирования, не повреждение поверхности.\r\n",
+                    "High load/unload cycle count: %d. "
+                    "This is mechanical positioning wear, not platter damage.\r\n"),
+                    pInfo->nLoadUnload);
+            }
         }
     }
 
@@ -3282,13 +3417,21 @@ void FormatHealthLecturePlain(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen)
 
     if (pInfo->eHealthStatus == HEALTH_STATUS_GOOD) {
         if (pInfo->eMechanics == HEALTH_STATUS_OBSERVE) {
-            LectureAdd(szBuf, nBufLen, TN(
-                "Носитель и интерфейс в норме. Механика — риск: G-Sense фиксирует события, "
-                "связанные с ударом/вибрацией, но переназначенных, ожидающих и неисправимых секторов нет. "
-                "Абсолютное число событий само по себе не снижает оценку.\r\n\r\n",
-                "Media and interface are fine. Mechanics are a risk: G-Sense records shock or vibration, "
-                "but there are no reallocated, pending, or uncorrectable sectors. "
-                "The event count alone does not lower the assessment.\r\n\r\n"));
+            if (pInfo->nGSenseEvents > 0) {
+                LectureAdd(szBuf, nBufLen, TN(
+                    "Носитель и интерфейс в норме. Механика — риск: G-Sense фиксирует события, "
+                    "связанные с ударом/вибрацией, но переназначенных, ожидающих и неисправимых секторов нет. "
+                    "Абсолютное число событий само по себе не снижает оценку.\r\n\r\n",
+                    "Media and interface are fine. Mechanics are a risk: G-Sense records shock or vibration, "
+                    "but there are no reallocated, pending, or uncorrectable sectors. "
+                    "The event count alone does not lower the assessment.\r\n\r\n"));
+            } else {
+                LectureAdd(szBuf, nBufLen, TN(
+                    "Носитель и интерфейс в норме. Механика — наблюдение: зафиксирован повышенный износ парковки, "
+                    "но переназначенных, ожидающих и неисправимых секторов нет. Накопитель исправен.\r\n\r\n",
+                    "Media and interface are fine. Mechanics are observe: high parking wear recorded, "
+                    "but there are no reallocated, pending, or uncorrectable sectors. The drive is healthy.\r\n\r\n"));
+            }
         } else if (pInfo->bIsNVMe) {
             LectureAdd(szBuf, nBufLen, TN(
                 "Диск находится в хорошем состоянии. Журнал здоровья NVMe не сообщает об ошибках носителя "
@@ -3418,41 +3561,11 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
     LectureAddDualStatus(szBuf, nBufLen, pInfo);
     LectureAddReadOnlyCause(szBuf, nBufLen, pInfo);
     LectureAddPcieHostCap(szBuf, nBufLen, pInfo);
+    LectureAddSataHostCap(szBuf, nBufLen, pInfo);
     LectureAddF(szBuf, nBufLen, TN("Сводка: %s\r\n", "Summary: %s\r\n"), szState);
 
     if (!pInfo->bSMART_Supported) {
-        if (LectureAddSmartDataError(pInfo, szBuf, nBufLen))
-            return;
-        if (pInfo->bIsUSB && IsLikelyUsbFlashDrive(pInfo)) {
-            LectureAdd(szBuf, nBufLen, TN(
-                "SMART недоступен. Это USB-флешка: контроллер флешки обычно не отдаёт "
-                "атрибуты SMART, поэтому состояние не оценивается. Числа здоровья не выдумываются.\r\n",
-                "SMART is unavailable. This is a USB flash drive: the flash controller usually does not "
-                "provide SMART attributes, so the condition is not assessed. Health figures are not invented.\r\n"));
-        } else if (pInfo->bIsUSB) {
-            LectureAdd(szBuf, nBufLen, TN(
-                "SMART недоступен. USB-мост или корпус не пропускает команды SMART. "
-                "Без исходных данных оценка не ставится — программа не подставляет фиктивные проценты.\r\n",
-                "SMART is unavailable. The USB bridge or enclosure does not pass SMART commands. "
-                "No assessment without source data — the program does not invent percentages.\r\n"));
-        } else if (pInfo->bIsNVMe) {
-            LectureAddF(szBuf, nBufLen, TN(
-                "Не удалось прочитать журнал здоровья NVMe (код ошибки Windows %lu). "
-                "Возможные причины: нет прав администратора, драйвер не поддерживает запрос, "
-                "или устройство занято. Без журнала здоровья проценты не выдумываются.\r\n",
-                "Could not read the NVMe health log (Windows error %lu). "
-                "Possible causes: not running as administrator, the driver does not support the request, "
-                "or the device is busy. Percentages are not invented without the health log.\r\n"),
-                (unsigned long)pInfo->dwErrNvmeProtocol);
-        } else {
-            LectureAdd(szBuf, nBufLen, TN(
-                "SMART недоступен. Без исходных данных оценка не ставится — "
-                "программа не подставляет фиктивные проценты. Запустите программу "
-                "от имени администратора и нажмите «Перечитать».\r\n",
-                "SMART is unavailable. No assessment without source data — "
-                "the program does not invent percentages. Run the program "
-                "as administrator and press Reread.\r\n"));
-        }
+        LectureAddSmartUnavailableReason(pInfo, szBuf, nBufLen, TRUE);
         return;
     }
 
@@ -3968,6 +4081,10 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
                 LectureAdd(szBuf, nBufLen, TN(
                     "  G-Sense совпадает с проблемными секторами — это связанная улика, не отдельный штраф.\r\n",
                     "  G-Sense lines up with bad sectors — related evidence, not a separate penalty.\r\n"));
+            else if (pInfo->eMechanics == HEALTH_STATUS_OBSERVE && pInfo->nLoadUnload >= 0)
+                LectureAdd(szBuf, nBufLen, TN(
+                    "  Зафиксирован повышенный износ парковки головок. Повреждений поверхности нет: 5/197/198 = 0. Это естественный износ механики, не отказ диска.\r\n",
+                    "  High head parking wear recorded. No surface damage: 5/197/198 = 0. This is mechanical wear, not a drive failure.\r\n"));
         }
         if (nC3 >= 0) {
             if (DriveIsHdd(pInfo) && UseSeagateRateRaw(pInfo)) {
@@ -4055,7 +4172,12 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
         }
         if (DriveIsHdd(pInfo)) {
             int v193 = AttrValueOrNeg1(pInfo, 0xC1);
-            BOOL notable = (v193 >= 0 && v193 <= 15) || pInfo->nLoadUnload >= 300000;
+            BYTE thresh193 = FindThreshold(pInfo, 0xC1);
+            BOOL notable;
+            if (UseSeagateRateRaw(pInfo))
+                notable = (pInfo->nLoadUnload >= 600000) || (thresh193 > 0 && v193 <= (int)thresh193);
+            else
+                notable = (v193 >= 0 && v193 <= 15) || pInfo->nLoadUnload >= 300000 || (thresh193 > 0 && v193 <= (int)thresh193);
             if (notable) {
                 char sz193[48];
                 if (v193 >= 0 && pInfo->nLoadUnload >= 0)
@@ -4072,7 +4194,7 @@ void FormatHealthLectureExpert(const DRIVE_INFO* pInfo, char* szBuf, int nBufLen
                                      ? TN("Парковка (225)", "Park (225)")
                                      : TN("Парковка (193)", "Park (193)"),
                                  sz193,
-                                 (v193 >= 0 && v193 <= 5) ? TN("механика", "mechanics") : "0");
+                                 (thresh193 > 0 && v193 <= (int)thresh193) ? TN("механика", "mechanics") : "0");
             }
         }
         if (Attr187Scored(pInfo)) {

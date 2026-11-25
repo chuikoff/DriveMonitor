@@ -251,6 +251,15 @@ static void FamilyControllerBits(DRIVE_CONTROLLER ctl, const char* family,
     if (ctl == CONTROLLER_UNKNOWN) return;
     LowerCopy(low, (int)sizeof(low), family);
     if (!low[0]) return;
+    /* Crucial / Micron client SSDs use third-party controllers: Silicon Motion (SM2258/SM2259),
+     * Marvell (88SS9189/88SS1074), and Phison. */
+    if (strstr(low, "crucial/micron") != NULL || strstr(low, "crucial") != NULL) {
+        if (ctl == CONTROLLER_SMI || ctl == CONTROLLER_MARVELL ||
+            ctl == CONTROLLER_PHISON || ctl == CONTROLLER_MICRON) {
+            *ours = true;
+            return;
+        }
+    }
     for (i = 0; i < sizeof(kFamilyCtl) / sizeof(kFamilyCtl[0]); i++) {
         if (!strstr(low, kFamilyCtl[i].needle)) continue;
         if (kFamilyCtl[i].ctl == (int)ctl) *ours = true;

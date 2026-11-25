@@ -83,7 +83,8 @@ void FillNvmeProtocolFromIdent(DRIVE_INFO* pInfo)
     if (oacs & 0x0010) {
         pInfo->bSelfTestSupported = TRUE;
         pInfo->nShortSelfTestMinutes = 2;
-        pInfo->nExtSelfTestMinutes = (int)id[258];
+        pInfo->nExtSelfTestMinutes =
+            (int)((unsigned)id[258] | ((unsigned)id[259] << 8));
     }
 }
 
@@ -194,7 +195,7 @@ static BOOL QueryNVMeProtocolOnHandle(HANDLE h, ULONG dataType, ULONG requestVal
      * 72-byte SN/MN/FR stub (VER at 80 = 0). Health log: Device first. */
     ULONG propertyIds[2];
     ULONG subValues[3];
-    ULONG lengths[2];
+    ULONG lengths[3];
     int nSub, nLen, ip, isv, il;
     BYTE bestIdent[4096];
     CDI_NVME_QUERY_BUF q;
@@ -219,13 +220,14 @@ static BOOL QueryNVMeProtocolOnHandle(HANDLE h, ULONG dataType, ULONG requestVal
         subValues[1] = 0xFFFFFFFFu;
         subValues[2] = 1;
         nSub = 3;
-        /* Log page 02h is 512 bytes. A 4096-byte length is only tried
-         * for inbox NVMe (identLen 4096). iaStorVD bugchecks on it. */
-        lengths[0] = 512;
+        /* Default length: caller's requested buffer size if within 512..4096 (e.g. 564 for self-test log), else 512. */
+        lengths[0] = (dwOutLen >= 512 && dwOutLen <= 4096) ? dwOutLen : 512;
         nLen = 1;
-        if (identLen >= 4096) {
-            lengths[1] = 4096;
-            nLen = 2;
+        if (lengths[0] != 512) {
+            lengths[nLen++] = 512;
+        }
+        if (identLen >= 4096 && lengths[0] != 4096) {
+            lengths[nLen++] = 4096;
         }
     }
 
@@ -737,7 +739,7 @@ void TryNvmeLifetimeTemp(HANDLE hDrive, DRIVE_INFO* pInfo)
 
 BOOL NvmeSendDeviceSelfTest(HANDLE hDrive, DWORD dwTestType)
 {
-    /* dwTestType: 1 = Short, 2 = Extended, 0 = Abort */
+    /* dwTestType: 1 = short, 2 = extended, 0xF = abort. 0 is reserved. */
     if (!hDrive || hDrive == INVALID_HANDLE_VALUE)
         return FALSE;
 

@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #include "volume_trim.h"
 #include "smart.h"
@@ -79,6 +80,9 @@ void EvaluateDriveTrimAndCapacity(DRIVE_INFO* pInfo)
     pInfo->trimInfo.bCriticallyLowSpace = FALSE;
     pInfo->trimInfo.bPanicLowSpace = FALSE;
     pInfo->trimInfo.fMinFreePercent = -1.0f;
+    pInfo->trimInfo.qwTotalBytesAll = 0;
+    pInfo->trimInfo.qwFreeBytesAll = 0;
+    pInfo->trimInfo.fTotalFreePercent = -1.0f;
 
     unsigned __int64 qwTotalAll = 0;
     unsigned __int64 qwFreeAll = 0;
@@ -101,8 +105,18 @@ void EvaluateDriveTrimAndCapacity(DRIVE_INFO* pInfo)
         if (v->qwTotalBytes > 0) {
             qwTotalAll += v->qwTotalBytes;
             if (v->fFreePercent >= 0.0f) {
-                qwFreeAll += (unsigned __int64)((double)v->qwTotalBytes * (double)v->fFreePercent / 100.0);
-            } else {
+                /* If free percent is specified, use exact qwFreeBytes only if consistent with percent */
+                if (v->qwFreeBytes > 0) {
+                    double pctFromBytes = (double)v->qwFreeBytes / (double)v->qwTotalBytes * 100.0;
+                    if (fabs(pctFromBytes - (double)v->fFreePercent) <= 0.5) {
+                        qwFreeAll += v->qwFreeBytes;
+                    } else {
+                        qwFreeAll += (unsigned __int64)((double)v->qwTotalBytes * (double)v->fFreePercent / 100.0);
+                    }
+                } else {
+                    qwFreeAll += (unsigned __int64)((double)v->qwTotalBytes * (double)v->fFreePercent / 100.0);
+                }
+            } else if (v->qwFreeBytes > 0) {
                 qwFreeAll += v->qwFreeBytes;
             }
         }
@@ -113,6 +127,9 @@ void EvaluateDriveTrimAndCapacity(DRIVE_INFO* pInfo)
     if (qwTotalAll > 0) {
         fTotalFreePct = (float)((double)qwFreeAll / (double)qwTotalAll * 100.0);
     }
+    pInfo->trimInfo.qwTotalBytesAll = qwTotalAll;
+    pInfo->trimInfo.qwFreeBytesAll = qwFreeAll;
+    pInfo->trimInfo.fTotalFreePercent = fTotalFreePct;
     if (pInfo->trimInfo.fMinFreePercent < 0.0f) {
         if (fTotalFreePct >= 0.0f) {
             pInfo->trimInfo.fMinFreePercent = fTotalFreePct;
@@ -270,7 +287,9 @@ void QueryDriveVolumesAndTrim(DRIVE_INFO* pDrives, int nNumDrives)
             BOOL bMatched = FALSE;
             if (bGotExtents) {
                 VOLUME_DISK_EXTENTS* pExt = (VOLUME_DISK_EXTENTS*)extBuf;
-                for (DWORD e = 0; e < pExt->NumberOfDiskExtents; e++) {
+                DWORD maxExt = (ret >= sizeof(DWORD)) ? (ret - (DWORD)sizeof(DWORD)) / (DWORD)sizeof(DISK_EXTENT) : 0;
+                DWORD nExt = (pExt->NumberOfDiskExtents < maxExt) ? pExt->NumberOfDiskExtents : maxExt;
+                for (DWORD e = 0; e < nExt; e++) {
                     if ((int)pExt->Extents[e].DiskNumber == pDrives[d].nDriveIndex) {
                         bMatched = TRUE;
                         break;

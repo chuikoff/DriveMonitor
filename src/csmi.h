@@ -87,6 +87,8 @@ BOOL CsmiGetIdentifyData(HANDLE hScsi, BYTE bPhy, DRIVE_INFO* pInfo);
 BOOL CsmiGetSMARTAttributes(HANDLE hScsi, BYTE bPhy, DRIVE_INFO* pInfo);
 BOOL CsmiGetSMARTThresholds(HANDLE hScsi, BYTE bPhy, DRIVE_INFO* pInfo);
 BOOL CsmiGetSMARTReturnStatus(HANDLE hScsi, BYTE bPhy, BOOL* pbFail);
+/* SMART READ LOG (0xD5) for a member found by CsmiScanRaidDrives. */
+BOOL CsmiReadSmartLog(const DRIVE_INFO* pInfo, BYTE bLogAddr, BYTE* pBuf);
 
 /* Scan and discover hidden physical SATA member drives behind Intel RST / CSMI RAID */
 int  CsmiScanRaidDrives(DRIVE_INFO* pDrives, int nMaxDrives, int nCurrentCount);

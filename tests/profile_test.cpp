@@ -705,6 +705,14 @@ static void TestHealthRule(void)
     Go();
     Expect(ProfileHealthRule(&g, 0xBB, &h) && h.enc == PROF_ENC_REPORTED &&
            h.slot == PROF_SLOT_REPORTED && h.bad == 1, "seagate 187 rule");
+    {
+        int sem241 = PROF_SEM_NONE, enc241 = PROF_ENC_NONE;
+        int sem242 = PROF_SEM_NONE, enc242 = PROF_ENC_NONE;
+        Expect(ProfileLookup(&g, 0xF1, &sem241, &enc241) &&
+               sem241 == PROF_SEM_HOST_WRITE && enc241 == PROF_ENC_LBA, "seagate 241 write lba");
+        Expect(ProfileLookup(&g, 0xF2, &sem242, &enc242) &&
+               sem242 == PROF_SEM_HOST_READ && enc242 == PROF_ENC_LBA, "seagate 242 read lba");
+    }
 
     Blank(DRIVE_TYPE_SSD_SATA, FALSE);
     g.eVendor = VENDOR_MICRON;

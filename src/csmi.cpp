@@ -22,7 +22,7 @@ BOOL CsmiProbeController(int nScsiPort, HANDLE* phScsi)
     ZeroMemory(&buf, sizeof(buf));
     buf.IoctlHeader.HeaderLength = (ULONG)sizeof(SRB_IO_CONTROL);
     memcpy(buf.IoctlHeader.Signature, CSMI_SAS_SIGNATURE, 8);
-    buf.IoctlHeader.Timeout = 5;
+    buf.IoctlHeader.Timeout = 2;
     buf.IoctlHeader.ControlCode = CC_CSMI_SAS_GET_DRIVER_INFO;
     buf.IoctlHeader.Length = (ULONG)sizeof(CSMI_SAS_DRIVER_INFO);
 
@@ -33,12 +33,20 @@ BOOL CsmiProbeController(int nScsiPort, HANDLE* phScsi)
         else CloseHandle(h);
         return TRUE;
     }
+    {
+        DWORD err = GetLastError();
+        if (err == ERROR_INVALID_FUNCTION || err == ERROR_NOT_SUPPORTED ||
+            err == ERROR_INVALID_PARAMETER) {
+            CloseHandle(h);
+            return FALSE;
+        }
+    }
 
     /* 2. Try with "CSMIALL " signature */
     ZeroMemory(&buf, sizeof(buf));
     buf.IoctlHeader.HeaderLength = (ULONG)sizeof(SRB_IO_CONTROL);
     memcpy(buf.IoctlHeader.Signature, CSMI_ALL_SIGNATURE, 8);
-    buf.IoctlHeader.Timeout = 5;
+    buf.IoctlHeader.Timeout = 2;
     buf.IoctlHeader.ControlCode = CC_CSMI_SAS_GET_DRIVER_INFO;
     buf.IoctlHeader.Length = (ULONG)sizeof(CSMI_SAS_DRIVER_INFO);
 
@@ -54,7 +62,7 @@ BOOL CsmiProbeController(int nScsiPort, HANDLE* phScsi)
     ZeroMemory(&buf, sizeof(buf));
     buf.IoctlHeader.HeaderLength = (ULONG)sizeof(SRB_IO_CONTROL);
     memcpy(buf.IoctlHeader.Signature, CSMI_SAS_SIGNATURE, 8);
-    buf.IoctlHeader.Timeout = 5;
+    buf.IoctlHeader.Timeout = 2;
     buf.IoctlHeader.ControlCode = CC_CSMI_SAS_GET_DRIVER_INFO_32;
     buf.IoctlHeader.Length = (ULONG)sizeof(CSMI_SAS_DRIVER_INFO);
 
@@ -79,7 +87,7 @@ static void InitCsmiStpBuffer(CSMI_SAS_STP_PASSTHRU_BUFFER* pBuf, DWORD bufSize,
     ZeroMemory(pBuf, sizeof(CSMI_SAS_STP_PASSTHRU_BUFFER));
     pBuf->IoctlHeader.HeaderLength = (ULONG)sizeof(SRB_IO_CONTROL);
     memcpy(pBuf->IoctlHeader.Signature, sig, 8);
-    pBuf->IoctlHeader.Timeout = 10;
+    pBuf->IoctlHeader.Timeout = 5;
     pBuf->IoctlHeader.ControlCode = ccode;
     pBuf->IoctlHeader.Length = bufSize - (DWORD)sizeof(SRB_IO_CONTROL);
 
@@ -155,7 +163,8 @@ BOOL CsmiGetIdentifyData(HANDLE hScsi, BYTE bPhy, DRIVE_INFO* pInfo)
         return FALSE;
 
     if (ParseAtaIdentifyData(data, pInfo)) {
-        pInfo->bSMART_Supported = TRUE;
+        /* Identify bit stays as the disk reported it. SMART is real
+         * only after CsmiGetSMARTAttributes succeeds. */
         pInfo->eAccessMethod = SMART_ACCESS_CSMI;
         return TRUE;
     }
@@ -232,6 +241,21 @@ BOOL CsmiGetSMARTReturnStatus(HANDLE hScsi, BYTE bPhy, BOOL* pbFail)
     return FALSE;
 }
 
+BOOL CsmiReadSmartLog(const DRIVE_INFO* pInfo, BYTE bLogAddr, BYTE* pBuf)
+{
+    HANDLE hScsi = INVALID_HANDLE_VALUE;
+    BOOL ok;
+    if (!pInfo || !pBuf) return FALSE;
+    if (pInfo->nScsiPort < 0 || pInfo->nCsmiPhy < 0 || pInfo->nCsmiPhy > 255)
+        return FALSE;
+    if (!CsmiProbeController(pInfo->nScsiPort, &hScsi)) return FALSE;
+    ok = CsmiSendStpCommand(hScsi, (BYTE)pInfo->nCsmiPhy,
+        SMART_READ_LOG, 1, bLogAddr, SMART_CYL_LOW, SMART_CYL_HI, SMART_CMD,
+        pBuf, 512, TRUE);
+    CloseHandle(hScsi);
+    return ok;
+}
+
 int CsmiScanRaidDrives(DRIVE_INFO* pDrives, int nMaxDrives, int nCurrentCount)
 {
     if (!pDrives || nCurrentCount >= nMaxDrives) return nCurrentCount;
@@ -240,12 +264,19 @@ int CsmiScanRaidDrives(DRIVE_INFO* pDrives, int nMaxDrives, int nCurrentCount)
         HANDLE hScsi = INVALID_HANDLE_VALUE;
         if (!CsmiProbeController(port, &hScsi)) continue;
 
-        /* Probe Phys 0 to 7 on this controller */
+        /* Probe Phys 0 to 7 on this controller.
+         * One slow empty phy is skipped. A second slow failure stops this port. */
+        int nSlow = 0;
         for (BYTE phy = 0; phy < 8 && nCurrentCount < nMaxDrives; phy++) {
             DRIVE_INFO tempInfo;
             ZeroMemory(&tempInfo, sizeof(tempInfo));
 
-            if (!CsmiGetIdentifyData(hScsi, phy, &tempInfo)) continue;
+            DWORD t0 = GetTickCount();
+            if (!CsmiGetIdentifyData(hScsi, phy, &tempInfo)) {
+                if (GetTickCount() - t0 >= 1500 && ++nSlow >= 2)
+                    break;
+                continue;
+            }
             if (tempInfo.szModel[0] == '\0') continue;
 
             /* Check if this drive serial is already in pDrives */
@@ -262,14 +293,16 @@ int CsmiScanRaidDrives(DRIVE_INFO* pDrives, int nMaxDrives, int nCurrentCount)
             /* Found a distinct physical SATA drive behind RAID! */
             DRIVE_INFO* pNew = &pDrives[nCurrentCount];
             *pNew = tempInfo;
-            pNew->nDriveIndex = nCurrentCount;
+            /* Not a Windows disk number. Callers open PhysicalDriveN. */
+            pNew->nDriveIndex = -1;
             pNew->nScsiPort = port;
+            pNew->nCsmiPhy = (int)phy;
             pNew->eType = DetectDriveType(INVALID_HANDLE_VALUE, pNew);
-            pNew->bSMART_Supported = TRUE;
             pNew->eAccessMethod = SMART_ACCESS_CSMI;
-
-            /* Retrieve SMART telemetry */
-            CsmiGetSMARTAttributes(hScsi, phy, pNew);
+            if (CsmiGetSMARTAttributes(hScsi, phy, pNew))
+                pNew->bSMART_Supported = TRUE;
+            else
+                pNew->bSMART_Supported = FALSE;
             CsmiGetSMARTThresholds(hScsi, phy, pNew);
 
             ExtractTemperatureFromATA(pNew);

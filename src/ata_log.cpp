@@ -151,14 +151,15 @@ BOOL ParseDeviceStatisticsPage(BYTE bPage, const BYTE* pPage512, DRIVE_INFO* pIn
         /* Percentage Used Endurance Indicator: offset 0x08 */
         uint64_t wEndur = ReadLE64(pPage512 + 0x08);
         if ((wEndur & ATA_DEV_STAT_BIT_SUPPORTED) && (wEndur & ATA_DEV_STAT_BIT_VALID)) {
-            int pct = (int)(wEndur & 0x7F);
-            if (pct >= 0 && pct <= 100) {
-                pInfo->nDevStatPercentUsed = pct;
-                if (pInfo->nEndurancePercent < 0) {
-                    pInfo->nEndurancePercent = 100 - pct;
-                }
-                bFound = TRUE;
-            }
+            /* ACS: one byte, 0..255. 100 means the rated life is used up.
+             * Bit 7 is part of the value, not a flag. */
+            int pct = (int)(wEndur & 0xFF);
+            int nLeft = 100 - pct;
+            if (nLeft < 0) nLeft = 0;
+            pInfo->nDevStatPercentUsed = pct;
+            if (pInfo->nEndurancePercent < 0)
+                pInfo->nEndurancePercent = nLeft;
+            bFound = TRUE;
         }
         break;
     }
@@ -313,6 +314,18 @@ void AcquireSeagateFarmLog(HANDLE hDrive, BOOL bIsSAT, DRIVE_INFO* pInfo)
     if (ok4) ParseSeagateFarmEnvironment(secBuf, pInfo);
 }
 
+BOOL DriveShouldQueryAtaGplLogs(const DRIVE_INFO* pInfo)
+{
+    if (!pInfo) return FALSE;
+    if (pInfo->bScanIoTimedOut) return FALSE;
+    if (IsUsbBridgeNoMedia(pInfo)) return FALSE;
+    if (IsPhisonRomMode(pInfo)) return FALSE;
+    /* IDENTIFY DEVICE words 84/87 bit 5: General Purpose Logging (READ LOG EXT 0x2F).
+     * Drives without GPL support often abort or reset the controller port on 0x2F. */
+    if (pInfo->bCapAtaIdentify && !pInfo->bCapGpl) return FALSE;
+    return TRUE;
+}
+
 void AcquireAtaLogs(HANDLE hDrive, BOOL bIsUSB, DRIVE_INFO* pInfo)
 {
     if (!hDrive || !pInfo) return;
@@ -350,21 +363,32 @@ void AcquireAtaLogs(HANDLE hDrive, BOOL bIsUSB, DRIVE_INFO* pInfo)
     pInfo->nFarmLifetimeMinTempC     = -1;
     pInfo->szFarmAssemblyDate[0]     = '\0';
 
+    if (!DriveShouldQueryAtaGplLogs(pInfo)) return;
+
     BYTE logBuf[512];
 
     /* 1. Read SATA PHY Event Counters (Log 11h, page 0) */
     ZeroMemory(logBuf, sizeof(logBuf));
+    DWORD t0 = GetTickCount();
     BOOL okPhy = bIsUSB ? ReadAtaLogExtSAT(hDrive, 0x11, 0, logBuf, sizeof(logBuf))
                         : ReadAtaLogExtNative(hDrive, 0x11, 0, logBuf, sizeof(logBuf));
     if (okPhy) {
         ParseSataPhyLog(logBuf, pInfo);
+    } else if (AtaErrorLooksLikeTimeout(GetLastError(), GetTickCount() - t0)) {
+        pInfo->bScanIoTimedOut = TRUE;
+        return;
     }
 
     /* 2. Read ATA Device Statistics Log (Log 04h) */
     /* Check Directory / Supported Pages list at Page 00h */
     ZeroMemory(logBuf, sizeof(logBuf));
+    t0 = GetTickCount();
     BOOL okDir = bIsUSB ? ReadAtaLogExtSAT(hDrive, 0x04, 0x00, logBuf, sizeof(logBuf))
                         : ReadAtaLogExtNative(hDrive, 0x04, 0x00, logBuf, sizeof(logBuf));
+    if (!okDir && AtaErrorLooksLikeTimeout(GetLastError(), GetTickCount() - t0)) {
+        pInfo->bScanIoTimedOut = TRUE;
+        return;
+    }
     if (okDir && logBuf[2] == 0x00) {
         BYTE nEntries = logBuf[3];
         if (nEntries > 64) nEntries = 64;

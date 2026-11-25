@@ -104,6 +104,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         CloseHandle(hMutex);
         return 0;
     }
+    if (!hMutex && GetLastError() == ERROR_ACCESS_DENIED) {
+        HANDLE hExisting = OpenMutexA(SYNCHRONIZE, FALSE, MUTEX_NAME);
+        if (hExisting) {
+            BringExistingWindowToFront();
+            CloseHandle(hExisting);
+            return 0;
+        }
+    }
 
     g_hInst = hInstance;
     UiInitScale();

@@ -6,6 +6,19 @@
 #include <ctype.h>
 #include <string.h>
 
+/* Hours are known only from a real counter. ZeroMemory leaves both at 0. */
+static BOOL SmartHoursKnown(const DRIVE_INFO* pInfo)
+{
+    int i;
+    if (!pInfo) return FALSE;
+    if (pInfo->dwPowerOnHours > 0) return TRUE;
+    for (i = 0; i < 30; i++) {
+        if (pInfo->attrData.stAttributes[i].bAttrID == 0x09)
+            return TRUE;
+    }
+    return FALSE;
+}
+
 static BOOL IsWdModel(const char* szModelU)
 {
     if (!szModelU || !szModelU[0]) return FALSE;
@@ -81,6 +94,17 @@ static BOOL IsWdFirmwarePattern(const char* fwU)
     return FALSE;
 }
 
+static BOOL IsPhisonMpReferenceFw(const char* fwU)
+{
+    if (!fwU || !fwU[0]) return FALSE;
+    return (strncmp(fwU, "SBFA", 4) == 0 ||
+            strncmp(fwU, "SBFM", 4) == 0 ||
+            strncmp(fwU, "SBFK", 4) == 0 ||
+            strncmp(fwU, "SAFM", 4) == 0 ||
+            strncmp(fwU, "S9FM", 4) == 0 ||
+            strncmp(fwU, "S8FM", 4) == 0);
+}
+
 static BOOL ModelLooksSamsung(const char* szModelU)
 {
     if (!szModelU || !szModelU[0]) return FALSE;
@@ -103,6 +127,11 @@ void DetectCounterfeitMismatch(DRIVE_INFO* pInfo)
     pInfo->nAnomalyType = ANOMALY_NONE;
     pInfo->szCounterfeitReason[0] = '\0';
     pInfo->szCounterfeitReasonEn[0] = '\0';
+
+    /* Flash drives and external USB storage without SMART are not SSDs subject to MPTool detection */
+    if (pInfo->eType == DRIVE_TYPE_USB || (pInfo->bIsUSB && !pInfo->bSMART_Supported && !pInfo->bIsNVMe)) {
+        return;
+    }
 
     /* Generic MPTool / All-zeros placeholder serial check */
     if (pInfo->szSerial[0]) {
@@ -211,9 +240,28 @@ void DetectCounterfeitMismatch(DRIVE_INFO* pInfo)
         }
     }
 
-    /* 2. SATA SSD Controller / Firmware Contradictions */
+    /* 2. SATA SSD Controller / Firmware Contradictions & MPTool Generic Templates */
     if (!pInfo->bIsNVMe && (pInfo->eType == DRIVE_TYPE_SSD_SATA || pInfo->eType == DRIVE_TYPE_M2_SATA ||
         (pInfo->wRotationRate == 0x0001 && !DriveIsHdd(pInfo)))) {
+        char szModelTrim[64];
+        safe_snprintf(szModelTrim, "%s", szModelU);
+        size_t mLen = strlen(szModelTrim);
+        while (mLen > 0 && szModelTrim[mLen - 1] == ' ')
+            szModelTrim[--mLen] = '\0';
+
+        if (strcmp(szModelTrim, "SATA SSD") == 0 &&
+            pInfo->eController == CONTROLLER_PHISON &&
+            IsPhisonMpReferenceFw(szFwU)) {
+            pInfo->bCounterfeitSuspected = TRUE;
+            pInfo->nAnomalyType = ANOMALY_REFLASHED_REPAIRED;
+            safe_snprintf(pInfo->szCounterfeitReason,
+                "Признак перепрошивки (MPTool): шаблонная модель «SATA SSD» с прошивкой %s (%s)",
+                pInfo->szFirmware, DriveControllerLabel(pInfo));
+            safe_snprintf(pInfo->szCounterfeitReasonEn,
+                "Reflashed/MPTool signature: generic model 'SATA SSD' with reference firmware %s (%s)",
+                pInfo->szFirmware, DriveControllerLabel(pInfo));
+            return;
+        }
         if (ModelLooksSamsung(szModelU) || pInfo->eVendor == VENDOR_SAMSUNG) {
             if (pInfo->eController == CONTROLLER_REALTEK || pInfo->eController == CONTROLLER_MAXIO ||
                 pInfo->eController == CONTROLLER_YEESTOR || pInfo->eController == CONTROLLER_SMI) {
@@ -247,7 +295,7 @@ void DetectCounterfeitMismatch(DRIVE_INFO* pInfo)
 
     /* 3. Seagate FARM Telemetry Discrepancy (wiped / refurbished drive detection) */
     if (pInfo->bFarmLogSupported && pInfo->qwFarmPowerOnHours > 0) {
-        if (pInfo->dwPowerOnHours >= 0 &&
+        if (SmartHoursKnown(pInfo) &&
             pInfo->qwFarmPowerOnHours > (unsigned __int64)pInfo->dwPowerOnHours + 100) {
             pInfo->bCounterfeitSuspected = TRUE;
             pInfo->nAnomalyType = ANOMALY_SMART_WIPED;

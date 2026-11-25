@@ -963,6 +963,25 @@ BOOL ScsiSendGenericCdb(HANDLE hDrive, const UCHAR* pCdb, UCHAR cdbLen,
  * Cypress ATACB (CY7C68300A, CY7C68300C, CY7C68310, I-O Data)
  * Vendor-specific 16-byte SCSI command with opcode 0x24 / sub 0x24
  * ============================================================ */
+BOOL BridgeAllowsVendorProbes(const DRIVE_INFO* pInfo, USB_BRIDGE_TYPE expectedType)
+{
+    if (!pInfo) return TRUE;
+    if (pInfo->eUsbBridgeType == expectedType) return TRUE;
+    if (pInfo->eUsbBridgeType != USB_BRIDGE_UNKNOWN) return FALSE;
+    /* Do not send proprietary legacy vendor passthrough opcodes (0xF8, 0x24, 0xD8)
+     * to standard SAT bridges or modern bridges (ASMedia, Realtek, JMicron, VLI) */
+    if (pInfo->wUsbVid == 0x174C || /* ASMedia */
+        pInfo->wUsbVid == 0x0BDA || /* Realtek */
+        pInfo->wUsbVid == 0x152D || /* JMicron */
+        pInfo->wUsbVid == 0x2109)   /* VIA Labs */
+        return FALSE;
+    if (strstr(pInfo->szBridgeVendor, "ASMedia") || strstr(pInfo->szBridgeProduct, "ASM") ||
+        strstr(pInfo->szBridgeVendor, "Realtek") || strstr(pInfo->szBridgeProduct, "RTL") ||
+        strstr(pInfo->szBridgeVendor, "JMicron") || strstr(pInfo->szBridgeProduct, "JMS"))
+        return FALSE;
+    return TRUE;
+}
+
 static BOOL CypressSendCommand(HANDLE hDrive, BYTE bFeatures, BYTE bSectorCnt,
                                BYTE bLBALow, BYTE bCylLow, BYTE bCylHigh,
                                BYTE bCommand, BYTE* pDataBuf, DWORD dwDataLen)
@@ -1039,6 +1058,7 @@ BOOL GetIdentifyDataCypress(HANDLE hDrive, DRIVE_INFO* pInfo)
 }
 
 BOOL GetSMARTAttributesCypress(HANDLE hDrive, DRIVE_INFO* pInfo)
+
 {
     BYTE data[READ_ATTRIBUTE_BUFFER_SIZE];
     ZeroMemory(data, sizeof(data));
@@ -1297,21 +1317,21 @@ BOOL GetIdentifyDataLegacyBridges(HANDLE hDrive, DRIVE_INFO* pInfo)
     /* 1. Try known bridge from VID/PID */
     if (pInfo->eUsbBridgeType == USB_BRIDGE_CYPRESS ||
         pInfo->eUsbBridgeType == USB_BRIDGE_IO_DATA) {
-        if (GetIdentifyDataCypress(hDrive, pInfo)) return TRUE;
+        if (BridgeAllowsVendorProbes(pInfo, USB_BRIDGE_CYPRESS) && GetIdentifyDataCypress(hDrive, pInfo)) return TRUE;
     }
     else if (pInfo->eUsbBridgeType == USB_BRIDGE_SUNPLUS) {
-        if (GetIdentifyDataSunplus(hDrive, pInfo)) return TRUE;
+        if (BridgeAllowsVendorProbes(pInfo, USB_BRIDGE_SUNPLUS) && GetIdentifyDataSunplus(hDrive, pInfo)) return TRUE;
     }
     else if (pInfo->eUsbBridgeType == USB_BRIDGE_PROLIFIC ||
              pInfo->eUsbBridgeType == USB_BRIDGE_JMICRON) {
-        if (GetIdentifyDataProlific(hDrive, pInfo)) return TRUE;
+        if (BridgeAllowsVendorProbes(pInfo, USB_BRIDGE_PROLIFIC) && GetIdentifyDataProlific(hDrive, pInfo)) return TRUE;
     }
 
     /* 2. If bridge is unknown or auto-detect failed, try each safely */
     if (UsbBridgeLooksLikeEnclosure(pInfo)) {
-        if (GetIdentifyDataCypress(hDrive, pInfo)) return TRUE;
-        if (GetIdentifyDataSunplus(hDrive, pInfo)) return TRUE;
-        if (GetIdentifyDataProlific(hDrive, pInfo)) return TRUE;
+        if (BridgeAllowsVendorProbes(pInfo, USB_BRIDGE_CYPRESS) && GetIdentifyDataCypress(hDrive, pInfo)) return TRUE;
+        if (BridgeAllowsVendorProbes(pInfo, USB_BRIDGE_SUNPLUS) && GetIdentifyDataSunplus(hDrive, pInfo)) return TRUE;
+        if (BridgeAllowsVendorProbes(pInfo, USB_BRIDGE_PROLIFIC) && GetIdentifyDataProlific(hDrive, pInfo)) return TRUE;
     }
 
     return FALSE;
@@ -1458,11 +1478,9 @@ BOOL ReadAtaLogExtSAT(HANDLE hDrive, BYTE bLogAddr, WORD wPage,
     BYTE data[512];
     ZeroMemory(data, sizeof(data));
 
-    /* 1. Try READ LOG EXT (0x2F) via SAT */
-    BYTE bFeature = (BYTE)(wPage & 0xFF);
-    BYTE bLbaMid  = (BYTE)((wPage >> 8) & 0xFF);
-    if (SATSendCommand(hDrive, bFeature, 1, bLogAddr,
-                       bLbaMid, 0x00, 0x2F,
+    /* READ LOG EXT: features reserved, page in LBA mid/high, log address in LBA low. */
+    if (SATSendCommand(hDrive, 0, 1, bLogAddr,
+                       (BYTE)(wPage & 0xFF), (BYTE)((wPage >> 8) & 0xFF), 0x2F,
                        SAT_PROTO_PIO_IN, data, 512, &method)) {
         DWORD dwCopy = (dwBufSize < 512) ? dwBufSize : 512;
         memcpy(pBuf, data, dwCopy);
@@ -1499,11 +1517,21 @@ BOOL GetSMARTErrorLogSAT(HANDLE hDrive, DRIVE_INFO* pInfo)
 BOOL GetSMARTSelfTestLogSAT(HANDLE hDrive, DRIVE_INFO* pInfo)
 {
     ZeroMemory(&pInfo->selfTestLog, sizeof(pInfo->selfTestLog));
+    if (pInfo->bScanIoTimedOut)
+        return FALSE;
+    if (pInfo->bCapAtaIdentify && !pInfo->bSelfTestSupported)
+        return FALSE;
 
-    if (ReadAtaLogExtSAT(hDrive, SMART_LOG_COMP_SELF_TEST, 0,
-                         (BYTE*)&pInfo->selfTestLog, sizeof(pInfo->selfTestLog)) ||
-        ReadSMARTLogSAT(hDrive, SMART_LOG_COMP_SELF_TEST,
-                        (BYTE*)&pInfo->selfTestLog, sizeof(pInfo->selfTestLog))) {
+    BOOL bOk = FALSE;
+    if (!pInfo->bCapAtaIdentify || pInfo->bCapGpl) {
+        bOk = ReadAtaLogExtSAT(hDrive, SMART_LOG_COMP_SELF_TEST, 0,
+                               (BYTE*)&pInfo->selfTestLog, sizeof(pInfo->selfTestLog));
+    }
+    if (!bOk && !pInfo->bScanIoTimedOut) {
+        bOk = ReadSMARTLogSAT(hDrive, SMART_LOG_COMP_SELF_TEST,
+                              (BYTE*)&pInfo->selfTestLog, sizeof(pInfo->selfTestLog));
+    }
+    if (bOk) {
         pInfo->bGotSelfTestLog = TRUE;
         int idx = (pInfo->selfTestLog.bMostRecentTestIndex >= 1 && pInfo->selfTestLog.bMostRecentTestIndex <= 21)
                   ? (pInfo->selfTestLog.bMostRecentTestIndex - 1) : 0;

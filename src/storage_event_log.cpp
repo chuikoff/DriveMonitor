@@ -51,6 +51,51 @@ static BOOL MatchDeviceTarget(const wchar_t* pwszXml, const wchar_t* wszTarget)
     return FALSE;
 }
 
+static BOOL ProviderMatchesDrive(const wchar_t* wszProvider, const DRIVE_INFO* pDrive)
+{
+    if (!pDrive) return FALSE;
+    if (!wszProvider || !wszProvider[0]) {
+        /* If provider is unknown, do not attribute internal controller resets to USB drives */
+        return !pDrive->bIsUSB;
+    }
+
+    /* USB miniport drivers */
+    if (_wcsicmp(wszProvider, L"UASPStor") == 0 ||
+        _wcsicmp(wszProvider, L"USBSTOR") == 0) {
+        return pDrive->bIsUSB;
+    }
+
+    /* NVMe miniport drivers */
+    if (_wcsicmp(wszProvider, L"stornvme") == 0 ||
+        _wcsicmp(wszProvider, L"nvme") == 0 ||
+        _wcsicmp(wszProvider, L"secnvme") == 0 ||
+        _wcsnicmp(wszProvider, L"SamsungNVME", 11) == 0) {
+        return pDrive->bIsNVMe && !pDrive->bIsUSB;
+    }
+
+    /* SATA / AHCI / RAID drivers */
+    if (_wcsicmp(wszProvider, L"storahci") == 0 ||
+        _wcsnicmp(wszProvider, L"iaStor", 6) == 0 ||
+        _wcsnicmp(wszProvider, L"amd_sata", 8) == 0 ||
+        _wcsnicmp(wszProvider, L"amdsata", 7) == 0 ||
+        _wcsnicmp(wszProvider, L"mvsata", 6) == 0) {
+        return !pDrive->bIsUSB && !pDrive->bIsNVMe;
+    }
+
+    /* Generic fallback: never map internal storage resets to USB drives */
+    if (pDrive->bIsUSB)
+        return FALSE;
+
+    return TRUE;
+}
+
+static BOOL g_bFilterPreBootEvents = FALSE;
+
+void EnableStorageEventPreBootFilter(BOOL bEnable)
+{
+    g_bFilterPreBootEvents = bEnable;
+}
+
 BOOL ParseStorageEventXml(const wchar_t* pwszXml, DRIVE_INFO* pDrives, int nNumDrives)
 {
     if (!pwszXml || !pDrives || nNumDrives <= 0) return FALSE;
@@ -112,6 +157,37 @@ BOOL ParseStorageEventXml(const wchar_t* pwszXml, DRIVE_INFO* pDrives, int nNumD
     /* 4. Match to target drive(s) */
     BOOL bMatched = FALSE;
 
+    /* Check if event occurred before the current system boot session */
+    BOOL bEventIsBeforeBoot = FALSE;
+    if (g_bFilterPreBootEvents && szTime[0] != '\0') {
+        int yr = 0, mo = 0, da = 0, hr = 0, mn = 0, sc = 0;
+        if (sscanf(szTime, "%d-%d-%d %d:%d:%d", &yr, &mo, &da, &hr, &mn, &sc) == 6) {
+            SYSTEMTIME stEvt;
+            ZeroMemory(&stEvt, sizeof(stEvt));
+            stEvt.wYear = (WORD)yr;
+            stEvt.wMonth = (WORD)mo;
+            stEvt.wDay = (WORD)da;
+            stEvt.wHour = (WORD)hr;
+            stEvt.wMinute = (WORD)mn;
+            stEvt.wSecond = (WORD)sc;
+            FILETIME ftEvt, ftNow;
+            if (SystemTimeToFileTime(&stEvt, &ftEvt)) {
+                GetSystemTimeAsFileTime(&ftNow);
+                ULARGE_INTEGER uNow, uEvt;
+                uNow.LowPart = ftNow.dwLowDateTime;
+                uNow.HighPart = ftNow.dwHighDateTime;
+                uEvt.LowPart = ftEvt.dwLowDateTime;
+                uEvt.HighPart = ftEvt.dwHighDateTime;
+                if (uNow.QuadPart >= uEvt.QuadPart) {
+                    ULONGLONG ageMs = (uNow.QuadPart - uEvt.QuadPart) / 10000ULL;
+                    if (ageMs > (ULONGLONG)GetTickCount64()) {
+                        bEventIsBeforeBoot = TRUE;
+                    }
+                }
+            }
+        }
+    }
+
     /* If event is from 'disk' driver (153, 51, 7, 154), look for \Device\HarddiskX */
     const wchar_t* pHarddisk = FindCaseInsensitiveW(pwszXml, L"\\Device\\Harddisk");
     if (pHarddisk) {
@@ -121,6 +197,10 @@ BOOL ParseStorageEventXml(const wchar_t* pwszXml, DRIVE_INFO* pDrives, int nNumD
         if (pEnd != pHarddisk && nDisk >= 0) {
             for (int i = 0; i < nNumDrives; i++) {
                 if (pDrives[i].nDriveIndex == (int)nDisk) {
+                    /* Ephemeral USB drives re-enumerate across boots; do not attribute pre-boot events to USB drives */
+                    if (pDrives[i].bIsUSB && bEventIsBeforeBoot) {
+                        continue;
+                    }
                     if (pDrives[i].szDeviceTarget[0] != '\0') {
                         wchar_t wszTarget[64];
                         MultiByteToWideChar(CP_UTF8, 0, pDrives[i].szDeviceTarget, -1, wszTarget, 64);
@@ -174,7 +254,10 @@ BOOL ParseStorageEventXml(const wchar_t* pwszXml, DRIVE_INFO* pDrives, int nNumD
         long nPort = wcstol(pRaidPort, &pEnd, 10);
         if (pEnd != pRaidPort && nPort >= 0) {
             for (int i = 0; i < nNumDrives; i++) {
-                if (pDrives[i].nScsiPort == (int)nPort) {
+                if (pDrives[i].nScsiPort == (int)nPort && ProviderMatchesDrive(wszProvider, &pDrives[i])) {
+                    if (pDrives[i].bIsUSB && bEventIsBeforeBoot) {
+                        continue;
+                    }
                     DRIVE_INFO* pMatch = &pDrives[i];
                     bMatched = TRUE;
 
@@ -197,6 +280,7 @@ BOOL ParseStorageEventXml(const wchar_t* pwszXml, DRIVE_INFO* pDrives, int nNumD
 void QueryStorageEventLogs(DRIVE_INFO* pDrives, int nNumDrives, int nDays)
 {
     if (!pDrives || nNumDrives <= 0) return;
+    g_bFilterPreBootEvents = TRUE;
     if (nDays <= 0) nDays = 30;
 
     for (int i = 0; i < nNumDrives; i++) {
