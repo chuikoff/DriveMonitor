@@ -4378,10 +4378,8 @@ static LRESULT CALLBACK AboutDlgProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM
             HFONT hFontBold = UiMakeFont(15, FW_BOLD, FALSE);
             SetPropA(hDlg, PROP_ABOUT_FONT_BOLD, (HANDLE)hFontBold);
             char szAboutName[128];
-            safe_snprintf(szAboutName, "DriveMonitor %s (%s %s)",
-                DRIVEMONITOR_FILEVERSION_STR,
-                TN("сборка", "build"),
-                DRIVEMONITOR_BUILD_STR);
+            safe_snprintf(szAboutName, "DriveMonitor %s",
+                DRIVEMONITOR_FILEVERSION_STR);
             HWND hName = CreateWindowExU8(0, "STATIC",
                 szAboutName,
                 WS_CHILD | WS_VISIBLE | SS_CENTER,
