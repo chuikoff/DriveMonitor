@@ -8,7 +8,7 @@
 
 Русский и английский просмотрщик S.M.A.R.T. для Windows. Язык: меню **Язык** (запоминается).
 
-**Текущий выпуск:** [2.0](https://github.com/chuikoff/DriveMonitor/releases/tag/2.0) (сборка 87) — скачать `DriveMonitor.exe`, запустить от администратора.
+**Текущий выпуск:** [2.0](https://github.com/chuikoff/DriveMonitor/releases/tag/2.0) — скачать `DriveMonitor.exe`, запустить от администратора.
 
 Предыдущий стабильный выпуск: [1.7.23](https://github.com/chuikoff/DriveMonitor/releases/tag/1.7.23).
 
@@ -58,7 +58,7 @@ make clean
 
 DriveMonitor — Copyright (C) 2026 [chuikoff](https://github.com/chuikoff). С версии 1.7.27 это дерево распространяется под GPL-2.0-or-later.
 
-Опубликованный GPL-файл — [2.0](https://github.com/chuikoff/DriveMonitor/releases/tag/2.0) (сборка 87). Исходники этого тега: [дерево](https://github.com/chuikoff/DriveMonitor/tree/2.0), [tar.gz](https://github.com/chuikoff/DriveMonitor/archive/refs/tags/2.0.tar.gz), [zip](https://github.com/chuikoff/DriveMonitor/archive/refs/tags/2.0.zip).
+Опубликованный GPL-файл — [2.0](https://github.com/chuikoff/DriveMonitor/releases/tag/2.0). Исходники этого тега: [дерево](https://github.com/chuikoff/DriveMonitor/tree/2.0), [tar.gz](https://github.com/chuikoff/DriveMonitor/archive/refs/tags/2.0.tar.gz), [zip](https://github.com/chuikoff/DriveMonitor/archive/refs/tags/2.0.zip).
 
 Имена семейств и атрибутов известных моделей — из smartmontools `drivedb.h` (Christian Franke и соавторы, GPL-2.0-or-later), файл `third_party/smartmontools/drivedb.h`.
 
@@ -70,7 +70,7 @@ DriveMonitor — Copyright (C) 2026 [chuikoff](https://github.com/chuikoff). С 
 
 A one-shot Windows S.M.A.R.T. viewer with Russian and English UI. Language: **Language** menu (persisted).
 
-**Current release:** [2.0](https://github.com/chuikoff/DriveMonitor/releases/tag/2.0) (build 87) — download `DriveMonitor.exe` and run it as Administrator.
+**Current release:** [2.0](https://github.com/chuikoff/DriveMonitor/releases/tag/2.0) — download `DriveMonitor.exe` and run it as Administrator.
 
 Previous stable release: [1.7.23](https://github.com/chuikoff/DriveMonitor/releases/tag/1.7.23).
 
@@ -120,7 +120,7 @@ make clean
 
 DriveMonitor is Copyright (C) 2026 [chuikoff](https://github.com/chuikoff). From version 1.7.27 this tree is distributed under GPL-2.0-or-later.
 
-The published GPL executable is [2.0](https://github.com/chuikoff/DriveMonitor/releases/tag/2.0) (build 87). Source for this tag: [tree](https://github.com/chuikoff/DriveMonitor/tree/2.0), [tar.gz](https://github.com/chuikoff/DriveMonitor/archive/refs/tags/2.0.tar.gz), [zip](https://github.com/chuikoff/DriveMonitor/archive/refs/tags/2.0.zip).
+The published GPL executable is [2.0](https://github.com/chuikoff/DriveMonitor/releases/tag/2.0). Source for this tag: [tree](https://github.com/chuikoff/DriveMonitor/tree/2.0), [tar.gz](https://github.com/chuikoff/DriveMonitor/archive/refs/tags/2.0.tar.gz), [zip](https://github.com/chuikoff/DriveMonitor/archive/refs/tags/2.0.zip).
 
 Family and attribute names for known models come from smartmontools `drivedb.h` (Christian Franke and others, GPL-2.0-or-later), file `third_party/smartmontools/drivedb.h`.
 
