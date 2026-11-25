@@ -996,8 +996,8 @@ static void DoSaveDriveReport(HWND hWnd)
     GetLocalTime(&st);
 
     ReportCat(buf, kCap, &len, Tr(STR_REPORT_HD));
-    safe_snprintf(szLine, TN("**Версия:** %s (сборка %s)  \r\n", "**Version:** %s (build %s)  \r\n"),
-                  DRIVEMONITOR_FILEVERSION_STR, DRIVEMONITOR_BUILD_STR);
+    safe_snprintf(szLine, TN("**Версия:** %s  \r\n", "**Version:** %s  \r\n"),
+                  DRIVEMONITOR_FILEVERSION_STR);
     ReportCat(buf, kCap, &len, szLine);
     safe_snprintf(szLine, TN("**Дата:** %04d-%02d-%02d %02d:%02d:%02d\r\n\r\n",
                              "**Date:** %04d-%02d-%02d %02d:%02d:%02d\r\n\r\n"),
